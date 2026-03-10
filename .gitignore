@@ -5,3 +5,11 @@ demo/
 _pycache__/
 .tmp/
 *.log
+advanced/_pycache__/
+analyzer/_pycache__/
+converter/_pycache__/
+generator/_pycache__/
+converter/_pycache__/
+parser/_pycache__/
+utils/_pycache__/
+validator/_pycache__/
