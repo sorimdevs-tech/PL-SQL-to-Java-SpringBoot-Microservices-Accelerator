@@ -1,0 +1,84 @@
+{
+  "llm": {
+    "provider": "huggingface",
+    "model": "openai/gpt-oss-120b",
+    "base_url": "https://router.huggingface.co/v1",
+    "api_key": "${HUGGINGFACE_API_KEY}",
+    "temperature": 0.1,
+    "max_tokens": 4000,
+    "timeout": 120,
+    "retry_attempts": 5,
+    "retry_base_delay_seconds": 0.5,
+    "batch_size": 1,
+    "fallback": {
+      "provider": "huggingface",
+      "model": "openai/gpt-oss-20b",
+      "api_key": "${HUGGINGFACE_API_KEY}"
+    }
+  },
+  "database": {
+    "type": "oracle",
+    "connection_string": "oracle://user:pass@host:port/service",
+    "query_timeout": 30,
+    "max_connections": 10
+  },
+  "output": {
+    "project_name": "converted-app",
+    "package_name": "com.company.project",
+    "target_directory": "C:\\Users\\THIS PC\\Documents\\plsql_Acc_output",
+    "java_version": "17",
+    "spring_boot_version": "3.1.0",
+    "generate_tests": true,
+    "generate_docs": true,
+    "format_code": true
+  },
+  "validation": {
+    "enable_sql_validation": true,
+    "enable_unit_tests": true,
+    "test_containers": true,
+    "validation_timeout": 120,
+    "compare_results": true
+  },
+  "performance": {
+    "parallel_processing": true,
+    "max_workers": 4,
+    "cache_llm_responses": true,
+    "cache_ttl": 3600,
+    "memory_limit": "2GB"
+  },
+  "security": {
+    "mask_sensitive_data": true,
+    "validate_generated_code": true,
+    "restrict_llm_context": true,
+    "sanitize_inputs": true
+  },
+  "enterprise": {
+    "microservices": false,
+    "message_queue": "kafka",
+    "queue_config": {
+      "bootstrap_servers": "localhost:9092",
+      "topic_prefix": "plsql-modernization"
+    },
+    "monitoring": {
+      "enable_metrics": true,
+      "metrics_endpoint": "/actuator/metrics",
+      "log_level": "INFO"
+    }
+  },
+  "templates": {
+    "entity_template": "templates/java/entity.java.j2",
+    "repository_template": "templates/java/repository.java.j2",
+    "service_template": "templates/java/service.java.j2",
+    "controller_template": "templates/java/controller.java.j2",
+    "application_config": "templates/spring-boot/application.yml.j2",
+    "pom_template": "templates/spring-boot/pom.xml.j2"
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "file_logging": true,
+    "log_file": "./logs/modernization.log",
+    "max_log_size": "10MB",
+    "backup_count": 5
+  }
+}

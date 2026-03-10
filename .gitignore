@@ -1,0 +1,7 @@
+.env
+.env.example
+output/
+demo/
+_pycache__/
+.tmp/
+*.log
