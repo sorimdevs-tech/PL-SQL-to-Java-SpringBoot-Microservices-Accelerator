@@ -61,10 +61,10 @@ class PLSQLModernizationPipeline:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Create subdirectories
-        (output_dir / 'generated' / 'java').mkdir(parents=True, exist_ok=True)
-        (output_dir / 'generated' / 'resources').mkdir(parents=True, exist_ok=True)
+        # (output_dir / 'java').mkdir(parents=True, exist_ok=True)
+        # (output_dir / 'resources').mkdir(parents=True, exist_ok=True)
         (output_dir / 'reports').mkdir(parents=True, exist_ok=True)
-        (output_dir / 'tests').mkdir(parents=True, exist_ok=True)
+        # (output_dir / 'tests').mkdir(parents=True, exist_ok=True)
     
     async def run_pipeline(self, source_path: str, source_type: str = "file"):
         """

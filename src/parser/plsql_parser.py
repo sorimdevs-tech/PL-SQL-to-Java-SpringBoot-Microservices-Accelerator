@@ -854,7 +854,7 @@ DIV: '/';
 """
     
     # Create ANTLR directory if it doesn't exist
-    antlr_dir = Path(__file__).parent / 'generated'
+    antlr_dir = Path(__file__).parent
     antlr_dir.mkdir(exist_ok=True)
     
     # Write grammar file

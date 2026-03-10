@@ -924,7 +924,8 @@ import static org.mockito.ArgumentMatchers.any;"""
     
     def _get_test_path(self, test_type: str) -> Path:
         """Get test directory path"""
-        base_path = Path('./output/generated/test')
+        output_dir = Path(get_config_value('output.target_directory', './output'))
+        base_path = output_dir / 'src' / 'test' / 'java' / 'com' / 'company' / 'project'
         return base_path / test_type
     
     def _get_current_time(self) -> str:

@@ -5,6 +5,7 @@ Generates complete Spring Boot projects from converted Java code
 
 import os
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
@@ -46,9 +47,11 @@ class SpringBootGenerator:
         self.spring_boot_version = config.get('spring_boot_version', '3.1.0')
         self.target_directory = Path(config.get('target_directory', './output'))
         
-        # Create base project structure
-        self.base_path = self.target_directory / 'generated' / 'java'
+        # Create standard Spring Boot source layout.
+        self.base_path = self.target_directory / 'src' / 'main' / 'java'
         self.base_path.mkdir(parents=True, exist_ok=True)
+        self.resources_path = self.target_directory / 'src' / 'main' / 'resources'
+        self.test_base_path = self.target_directory / 'src' / 'test' / 'java'
         
         # Package structure paths
         self.package_path = self.base_path / self.package_name.replace('.', '/')
@@ -110,14 +113,15 @@ class SpringBootGenerator:
         (self.package_path / 'config').mkdir(parents=True, exist_ok=True)
         
         # Test directories
-        test_path = self.target_directory / 'generated' / 'test' / self.package_name.replace('.', '/')
+        test_path = self.test_base_path / self.package_name.replace('.', '/')
         (test_path / 'service').mkdir(parents=True, exist_ok=True)
         (test_path / 'repository').mkdir(parents=True, exist_ok=True)
         (test_path / 'controller').mkdir(parents=True, exist_ok=True)
+        (test_path / 'entity').mkdir(parents=True, exist_ok=True)
+        (test_path / 'integration').mkdir(parents=True, exist_ok=True)
         
         # Resources directory
-        resources_path = self.target_directory / 'generated' / 'resources'
-        resources_path.mkdir(parents=True, exist_ok=True)
+        self.resources_path.mkdir(parents=True, exist_ok=True)
         
         logger.info("Project structure created successfully")
     
@@ -129,11 +133,12 @@ class SpringBootGenerator:
         with open(pom_path, 'w', encoding='utf-8') as f:
             f.write(pom_content)
         
-        # Generate Gradle build file (optional)
-        gradle_content = self._generate_gradle_content()
-        gradle_path = self.target_directory / 'build.gradle'
-        with open(gradle_path, 'w', encoding='utf-8') as f:
-            f.write(gradle_content)
+        # Keep Gradle generation code available, but only emit build.gradle when explicitly enabled.
+        if self.config.get('generate_gradle', False):
+            gradle_content = self._generate_gradle_content()
+            gradle_path = self.target_directory / 'build.gradle'
+            with open(gradle_path, 'w', encoding='utf-8') as f:
+                f.write(gradle_content)
         
         logger.info("Build configuration files generated")
     
@@ -181,6 +186,12 @@ class SpringBootGenerator:
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
+
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.5.0</version>
+        </dependency>
         
         <!-- Database Drivers -->
         <dependency>
@@ -190,8 +201,8 @@ class SpringBootGenerator:
         </dependency>
         
         <dependency>
-            <groupId>mysql</groupId>
-            <artifactId>mysql-connector-java</artifactId>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
         </dependency>
         
@@ -260,7 +271,11 @@ class SpringBootGenerator:
 
 group = '{self.package_name}'
 version = '1.0.0'
-sourceCompatibility = '{self.java_version}'
+
+java {{
+    sourceCompatibility = JavaVersion.VERSION_{self.java_version}
+    targetCompatibility = JavaVersion.VERSION_{self.java_version}
+}}
 
 repositories {{
     mavenCentral()
@@ -270,6 +285,7 @@ dependencies {{
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.5.0'
     
     runtimeOnly 'com.oracle.database.jdbc:ojdbc8'
     runtimeOnly 'mysql:mysql-connector-java'
@@ -291,13 +307,13 @@ tasks.named('test') {{
         """Generate Spring Boot application configuration"""
         # Generate application.yml
         app_config = self._generate_application_yml()
-        config_path = self.target_directory / 'generated' / 'resources' / 'application.yml'
+        config_path = self.resources_path / 'application.yml'
         with open(config_path, 'w', encoding='utf-8') as f:
             f.write(app_config)
         
         # Generate application.properties (alternative)
         app_props = self._generate_application_properties()
-        props_path = self.target_directory / 'generated' / 'resources' / 'application.properties'
+        props_path = self.resources_path / 'application.properties'
         with open(props_path, 'w', encoding='utf-8') as f:
             f.write(app_props)
         
@@ -925,13 +941,14 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
             'directories': [],
             'configuration_files': [
                 'pom.xml',
-                'build.gradle', 
                 'application.yml',
                 'application.properties',
                 'Dockerfile',
                 '.gitignore'
             ]
         }
+        if self.config.get('generate_gradle', False):
+            summary['configuration_files'].insert(1, 'build.gradle')
         
         # Count file types
         for filename in java_files.keys():
@@ -966,12 +983,12 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
         if not entities:
             for filename, code in java_code.items():
                 class_name = self._extract_class_name(code)
-                entity_name = self._derive_entity_name(filename, class_name)
-                if not entity_name:
-                    continue
-                fallback_name = f"{entity_name}.java"
-                if fallback_name not in entities:
-                    entities[fallback_name] = self._generate_fallback_entity(entity_name)
+                for entity_name in self._derive_entity_names(filename, class_name, code):
+                    fallback_name = f"{entity_name}.java"
+                    if fallback_name in entities:
+                        continue
+                    fields = self._infer_entity_fields(code, entity_name)
+                    entities[fallback_name] = self._generate_fallback_entity(entity_name, fields)
         
         # Write entities to files
         entity_dir = self.package_path / 'entity'
@@ -992,7 +1009,7 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
         return None
     
     def _derive_entity_name(self, filename: str, class_name: Optional[str]) -> Optional[str]:
-        """Derive an entity name from class or file name."""
+        """Derive a single fallback entity name from class or file name."""
         if class_name and class_name.lower().endswith('service'):
             base = class_name[:-7]
             return base if base else None
@@ -1003,12 +1020,157 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
         if stem:
             return self._to_camel_case(stem)
         return None
+
+    def _derive_entity_names(self, filename: str, class_name: Optional[str], code: str) -> List[str]:
+        """Derive all entity names referenced by a generated service."""
+        entity_names: List[str] = []
+
+        for match in re.finditer(r'new\s+([A-Z]\w*)\s*\(', code):
+            candidate = match.group(1)
+            if candidate not in {'BusinessException', 'ProcessOrderResult'}:
+                entity_names.append(candidate)
+
+        for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
+            entity_names.append(match.group(1))
+
+        fallback_name = self._derive_entity_name(filename, class_name)
+        if fallback_name and not entity_names:
+            entity_names.append(fallback_name)
+
+        ordered: List[str] = []
+        seen = set()
+        for name in entity_names:
+            if name and name not in seen:
+                ordered.append(name)
+                seen.add(name)
+        return ordered
     
-    def _generate_fallback_entity(self, entity_name: str) -> str:
-        """Generate a minimal JPA entity when model output lacks @Entity."""
+    def _infer_entity_fields(self, code: str, entity_name: str) -> List[Dict[str, str]]:
+        """Infer entity fields from generated service code usage for a specific entity."""
+        param_types: Dict[str, str] = {}
+        local_types: Dict[str, str] = {}
+        entity_variables: set[str] = set()
+
+        # Capture method parameter types so setter arguments can map back to Java types.
+        for match in re.finditer(r'public\s+[^{;=]+\(([^)]*)\)', code):
+            params_block = match.group(1).strip()
+            if not params_block:
+                continue
+            for raw_param in params_block.split(','):
+                param = re.sub(r'@\w+(?:\([^)]*\))?\s*', '', raw_param).strip()
+                if not param:
+                    continue
+                parts = param.split()
+                if len(parts) >= 2:
+                    param_name = parts[-1]
+                    param_type = ' '.join(parts[:-1])
+                    param_types[param_name] = param_type
+
+        for match in re.finditer(r'\b([A-Z]\w*)\s+([a-zA-Z_]\w*)\s*=', code):
+            local_types[match.group(2)] = match.group(1)
+
+        for match in re.finditer(rf'\b{entity_name}\s+([a-zA-Z_]\w*)\s*=', code):
+            entity_variables.add(match.group(1))
+
+        inferred_fields: Dict[str, str] = {}
+        for match in re.finditer(r'([a-zA-Z_]\w*)\.\s*set([A-Z]\w*)\(([^;]+?)\);', code):
+            target_variable = match.group(1)
+            if entity_variables and target_variable not in entity_variables:
+                continue
+            field_name = self._lower_first(match.group(2))
+            argument = match.group(3).strip()
+            inferred_type = self._infer_java_type(argument, param_types, local_types)
+            if field_name != 'id':
+                inferred_fields[field_name] = inferred_type
+
+        for match in re.finditer(r'([a-zA-Z_]\w*)\.\s*get([A-Z]\w*)\(\)', code):
+            target_variable = match.group(1)
+            if entity_variables and target_variable not in entity_variables:
+                continue
+            field_name = self._lower_first(match.group(2))
+            if field_name != 'id' and field_name not in inferred_fields:
+                inferred_fields[field_name] = self._infer_getter_type(field_name)
+
+        preferred_order = ['customerId', 'productId', 'quantity', 'createdBy', 'status', 'createdAt', 'updatedAt']
+        ordered_fields: List[Dict[str, str]] = []
+        seen = set()
+        for field_name in preferred_order:
+            if field_name in inferred_fields:
+                ordered_fields.append({'name': field_name, 'type': inferred_fields[field_name]})
+                seen.add(field_name)
+        for field_name, field_type in inferred_fields.items():
+            if field_name not in seen:
+                ordered_fields.append({'name': field_name, 'type': field_type})
+        return ordered_fields
+
+    def _infer_getter_type(self, field_name: str) -> str:
+        """Infer type from getter-style field name when no setter provides it."""
+        if field_name.lower().endswith('id'):
+            return 'Long'
+        if field_name.lower() in {'quantity', 'stock', 'count', 'total'}:
+            return 'Integer'
+        return 'String'
+
+    def _infer_java_type(self, argument: str, param_types: Dict[str, str], local_types: Dict[str, str]) -> str:
+        """Infer a Java type from a setter argument."""
+        if argument in param_types:
+            return param_types[argument]
+        if argument in local_types:
+            return local_types[argument]
+        if 'LocalDateTime.now()' in argument:
+            return 'LocalDateTime'
+        if re.fullmatch(r'[A-Z]\w*', argument):
+            return argument
+        if any(operator in argument for operator in [' + ', ' - ', ' * ', ' / ']):
+            return 'Integer'
+        if argument.startswith('"') and argument.endswith('"'):
+            return 'String'
+        if re.fullmatch(r'\d+L', argument):
+            return 'Long'
+        if re.fullmatch(r'\d+', argument):
+            return 'Integer'
+        if argument in {'true', 'false'}:
+            return 'Boolean'
+        if '.toString()' in argument:
+            return 'String'
+        return 'String'
+
+    def _generate_fallback_entity(self, entity_name: str, fields: Optional[List[Dict[str, str]]] = None) -> str:
+        """Generate a fallback JPA entity aligned to generated service code."""
+        fields = fields or []
+        import_lines = ['import jakarta.persistence.*;']
+        if any(field['type'] == 'LocalDateTime' for field in fields):
+            import_lines.append('import java.time.LocalDateTime;')
+
+        field_blocks = []
+        accessor_blocks = []
+        for field in fields:
+            field_name = field['name']
+            field_type = field['type']
+            field_blocks.append(
+                f"""    @Column(name = "{self._to_snake_case(field_name)}")
+    private {field_type} {field_name};"""
+            )
+            accessor_blocks.append(
+                f"""    public {field_type} get{field_name[0].upper() + field_name[1:]}() {{
+        return {field_name};
+    }}
+
+    public void set{field_name[0].upper() + field_name[1:]}({field_type} {field_name}) {{
+        this.{field_name} = {field_name};
+    }}"""
+            )
+
+        fields_section = '\n\n'.join(field_blocks)
+        accessors_section = '\n\n'.join(accessor_blocks)
+        if fields_section:
+            fields_section = '\n\n' + fields_section
+        if accessors_section:
+            accessors_section = '\n\n' + accessors_section
+
         return f"""package {self.package_name}.entity;
 
-import jakarta.persistence.*;
+{chr(10).join(import_lines)}
 
 /**
  * Auto-generated fallback entity for {entity_name}.
@@ -1019,7 +1181,7 @@ public class {entity_name} {{
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
+    private Long id;{fields_section}
 
     public Long getId() {{
         return id;
@@ -1027,7 +1189,7 @@ public class {entity_name} {{
 
     public void setId(Long id) {{
         this.id = id;
-    }}
+    }}{accessors_section}
 }}
 """
     
@@ -1115,8 +1277,10 @@ public interface {entity_name}Repository extends JpaRepository<{entity_name}, Lo
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import {self.package_name}.entity.Order;
-import {self.package_name}.repository.OrderRepository;
+import java.time.LocalDateTime;
+
+import {self.package_name}.entity.*;
+import {self.package_name}.repository.*;
 import {self.package_name}.exception.BusinessException;
 """
         body = code.strip()
@@ -1129,6 +1293,18 @@ import {self.package_name}.exception.BusinessException;
 {imports}
 {body}
 """
+
+    def _lower_first(self, value: str) -> str:
+        """Lowercase the first character of a string."""
+        if not value:
+            return value
+        return value[0].lower() + value[1:]
+
+    def _to_snake_case(self, value: str) -> str:
+        """Convert camelCase or PascalCase to snake_case."""
+        if not value:
+            return value
+        return re.sub(r'(?<!^)(?=[A-Z])', '_', value).lower()
     
     def generate_controllers(self, services: Dict[str, str]) -> Dict[str, str]:
         """Generate REST controller classes"""
