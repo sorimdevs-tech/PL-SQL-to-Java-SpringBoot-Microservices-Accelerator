@@ -32,6 +32,18 @@ class ProjectStructure:
 
 class SpringBootGenerator:
     """Generates complete Spring Boot projects"""
+
+    RESERVED_ENTITY_NAMES = {
+        'Order',
+        'User',
+        'Group',
+        'Table',
+        'Column',
+        'Index',
+        'Key',
+        'Value',
+        'Constraint',
+    }
     
     def __init__(self, config: Dict[str, Any]):
         """
@@ -977,14 +989,20 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
         
         for filename, code in java_code.items():
             if '@Entity' in code or 'extends BaseEntity' in code:
-                entities[filename] = code
+                class_name = self._extract_class_name(code) or filename.replace('.java', '')
+                normalized_name = self._normalize_entity_name(class_name)
+                target_filename = f"{normalized_name}.java"
+                entities[target_filename] = self._rename_entity_type_references(code, class_name, normalized_name)
         
         # Fallback: derive simple entities from service-oriented outputs.
         if not entities:
             for filename, code in java_code.items():
+                if not self._looks_like_service_source(filename, code):
+                    continue
                 class_name = self._extract_class_name(code)
                 for entity_name in self._derive_entity_names(filename, class_name, code):
-                    fallback_name = f"{entity_name}.java"
+                    normalized_entity_name = self._normalize_entity_name(entity_name)
+                    fallback_name = f"{normalized_entity_name}.java"
                     if fallback_name in entities:
                         continue
                     fields = self._infer_entity_fields(code, entity_name)
@@ -1027,11 +1045,13 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
 
         for match in re.finditer(r'new\s+([A-Z]\w*)\s*\(', code):
             candidate = match.group(1)
-            if candidate not in {'BusinessException', 'ProcessOrderResult'}:
+            if self._is_entity_candidate_name(candidate):
                 entity_names.append(candidate)
 
         for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
-            entity_names.append(match.group(1))
+            candidate = match.group(1)
+            if self._is_entity_candidate_name(candidate):
+                entity_names.append(candidate)
 
         fallback_name = self._derive_entity_name(filename, class_name)
         if fallback_name and not entity_names:
@@ -1044,6 +1064,38 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
                 ordered.append(name)
                 seen.add(name)
         return ordered
+
+    def _normalize_entity_name(self, entity_name: str) -> str:
+        """Append Entity to reserved names that would otherwise clash or read ambiguously."""
+        if entity_name in self.RESERVED_ENTITY_NAMES:
+            return f"{entity_name}Entity"
+        return entity_name
+
+    def _rename_entity_type_references(self, code: str, source_name: str, target_name: str) -> str:
+        """Rename a Java entity type and aligned repository references."""
+        if not source_name or source_name == target_name:
+            return code
+
+        updated_code = re.sub(rf'\b{re.escape(source_name)}Repository\b', f'{target_name}Repository', code)
+        updated_code = re.sub(rf'\b{re.escape(source_name)}\b', target_name, updated_code)
+        return updated_code
+
+    def _is_entity_candidate_name(self, candidate: str) -> bool:
+        """Exclude helper/result/exception names from fallback entity generation."""
+        blocked_suffixes = ('Exception', 'Result', 'Response', 'Request', 'DTO', 'Config', 'Controller', 'Service')
+        blocked_names = {'BusinessException', 'IllegalArgumentException', 'ProcessOrderResult'}
+        return bool(candidate) and candidate not in blocked_names and not candidate.endswith(blocked_suffixes)
+
+    def _looks_like_service_source(self, filename: str, code: str) -> bool:
+        """Limit fallback entity generation to service-like Java sources."""
+        class_name = self._extract_class_name(code) or ''
+        filename_lower = filename.lower()
+        return (
+            '@Service' in code
+            or filename_lower.endswith('service.java')
+            or class_name.lower().endswith('service')
+            or 'processOrder(' in code
+        )
     
     def _infer_entity_fields(self, code: str, entity_name: str) -> List[Dict[str, str]]:
         """Infer entity fields from generated service code usage for a specific entity."""
@@ -1139,18 +1191,28 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
         """Generate a fallback JPA entity aligned to generated service code."""
         fields = fields or []
         import_lines = ['import jakarta.persistence.*;']
+        normalized_entity_name = self._normalize_entity_name(entity_name)
         if any(field['type'] == 'LocalDateTime' for field in fields):
             import_lines.append('import java.time.LocalDateTime;')
-
+        if(entity_name in self.RESERVED_ENTITY_NAMES):
+            entity_name += '_entity'
         field_blocks = []
         accessor_blocks = []
         for field in fields:
             field_name = field['name']
             field_type = field['type']
-            field_blocks.append(
-                f"""    @Column(name = "{self._to_snake_case(field_name)}")
+            if self._is_entity_reference_type(field_type):
+                field_type = self._normalize_entity_name(field_type)
+                field_blocks.append(
+                    f"""    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "{self._to_snake_case(field_name)}_id")
     private {field_type} {field_name};"""
-            )
+                )
+            else:
+                field_blocks.append(
+                    f"""    @Column(name = "{self._to_snake_case(field_name)}")
+    private {field_type} {field_name};"""
+                )
             accessor_blocks.append(
                 f"""    public {field_type} get{field_name[0].upper() + field_name[1:]}() {{
         return {field_name};
@@ -1173,11 +1235,11 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
 {chr(10).join(import_lines)}
 
 /**
- * Auto-generated fallback entity for {entity_name}.
+ * Auto-generated fallback entity for {normalized_entity_name}.
  */
 @Entity
 @Table(name = "{entity_name.lower()}")
-public class {entity_name} {{
+public class {normalized_entity_name} {{
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -1199,6 +1261,7 @@ public class {entity_name} {{
         
         for filename, code in entities.items():
             # Generate repository name
+            
             entity_name = filename.replace('.java', '')
             repo_name = f"{entity_name}Repository.java"
             
@@ -1269,25 +1332,59 @@ public interface {entity_name}Repository extends JpaRepository<{entity_name}, Lo
     
     def _normalize_service_code(self, filename: str, code: str) -> str:
         """Ensure generated service code has package/imports and @Service annotation."""
-        if 'package ' in code:
-            return code
-        
         service_name = filename.replace('.java', '')
-        imports = f"""import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+        class_name = self._extract_class_name(code) or service_name
+        entity_names = self._derive_entity_names(filename, class_name, code)
+        repository_names: List[str] = []
+        for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
+            repository_name = f"{self._normalize_entity_name(match.group(1))}Repository"
+            if repository_name not in repository_names:
+                repository_names.append(repository_name)
 
-import java.time.LocalDateTime;
+        import_lines = [
+            'import org.springframework.beans.factory.annotation.Autowired;',
+            'import org.springframework.stereotype.Service;',
+            'import org.springframework.transaction.annotation.Transactional;',
+        ]
+        if 'LoggerFactory' in code or re.search(r'\bLogger\b', code):
+            import_lines.append('import org.slf4j.Logger;')
+            import_lines.append('import org.slf4j.LoggerFactory;')
+        if 'DataAccessException' in code:
+            import_lines.append('import org.springframework.dao.DataAccessException;')
+        if 'LocalDateTime' in code:
+            import_lines.append('import java.time.LocalDateTime;')
+        for entity_name in entity_names:
+            import_lines.append(f'import {self.package_name}.entity.{self._normalize_entity_name(entity_name)};')
+        for repository_name in repository_names:
+            import_lines.append(f'import {self.package_name}.repository.{repository_name};')
+        import_lines.append(f'import {self.package_name}.exception.BusinessException;')
+        imports = '\n'.join(dict.fromkeys(import_lines))
 
-import {self.package_name}.entity.*;
-import {self.package_name}.repository.*;
-import {self.package_name}.exception.BusinessException;
-"""
         body = code.strip()
+        for entity_name in entity_names:
+            normalized_entity_name = self._normalize_entity_name(entity_name)
+            body = self._rename_entity_type_references(body, entity_name, normalized_entity_name)
         body = body.replace("OrderProcessingException", "BusinessException")
+        body = body.replace("catch (IllegalArgumentException ", "catch (java.lang.IllegalArgumentException ")
+        body = body.replace("throw new IllegalArgumentException(", "throw new java.lang.IllegalArgumentException(")
         if '@Service' not in body:
             body = body.replace(f"public class {service_name}", f"@Service\npublic class {service_name}")
-        
+            if class_name != service_name:
+                body = body.replace(f"public class {class_name}", f"@Service\npublic class {class_name}")
+        body = self._ensure_process_result_class(body)
+
+        if 'package ' in body:
+            package_match = re.match(r'(package\s+[^\n]+;\s*)', body)
+            if package_match:
+                package_line = package_match.group(1).strip()
+                remainder = body[package_match.end():].lstrip()
+                return f"""{package_line}
+
+{imports}
+
+{remainder}
+"""
+
         return f"""package {self.package_name}.service;
 
 {imports}
@@ -1300,11 +1397,57 @@ import {self.package_name}.exception.BusinessException;
             return value
         return value[0].lower() + value[1:]
 
+    def _ensure_process_result_class(self, body: str) -> str:
+        """Inject a nested ProcessOrderResult class when service code references it but does not define it."""
+        if 'ProcessOrderResult' not in body or 'class ProcessOrderResult' in body:
+            return body
+        marker = '\n}'
+        nested_class = """
+
+    public static class ProcessOrderResult {
+        private final Long orderId;
+        private final String status;
+
+        public ProcessOrderResult(Long orderId, String status) {
+            this.orderId = orderId;
+            this.status = status;
+        }
+
+        public Long getOrderId() {
+            return orderId;
+        }
+
+        public String getStatus() {
+            return status;
+        }
+    }
+"""
+        if marker in body:
+            return body[::-1].replace(marker[::-1], (nested_class + '\n}')[::-1], 1)[::-1]
+        return body + nested_class
+
     def _to_snake_case(self, value: str) -> str:
         """Convert camelCase or PascalCase to snake_case."""
         if not value:
             return value
         return re.sub(r'(?<!^)(?=[A-Z])', '_', value).lower()
+
+    def _is_entity_reference_type(self, field_type: str) -> bool:
+        """Detect when a fallback field type should be emitted as a JPA entity relationship."""
+        scalar_types = {
+            'String',
+            'Long',
+            'Integer',
+            'Boolean',
+            'Double',
+            'Float',
+            'BigDecimal',
+            'LocalDate',
+            'LocalDateTime',
+            'Instant',
+            'UUID',
+        }
+        return bool(field_type) and field_type not in scalar_types and field_type[:1].isupper()
     
     def generate_controllers(self, services: Dict[str, str]) -> Dict[str, str]:
         """Generate REST controller classes"""
@@ -1415,7 +1558,7 @@ public class {entity_name}Controller {{
     private {service_name} {service_name[0].lower() + service_name[1:]};
     
     @PostMapping("/process")
-    public ResponseEntity<{service_name}.ProcessOrderResult> processOrder(
+    public ResponseEntity<Object> processOrder(
             @RequestParam Long customerId,
             @RequestParam Long productId,
             @RequestParam Integer quantity,

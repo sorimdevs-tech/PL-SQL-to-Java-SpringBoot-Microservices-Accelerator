@@ -69,6 +69,7 @@ class OpenAIProvider(LLMProvider):
         try:
             import openai
             self.client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self.api_key = api_key
             self.model = model
             self.base_url = base_url
             self.timeout = timeout
@@ -122,6 +123,7 @@ class HuggingFaceProvider(LLMProvider):
         try:
             import openai
             self.client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self.api_key = api_key
             self.model = model
             self.base_url = base_url
             self.timeout = timeout
@@ -170,6 +172,7 @@ class AnthropicProvider(LLMProvider):
         try:
             import anthropic
             self.client = anthropic.AsyncAnthropic(api_key=api_key)
+            self.api_key = api_key
             self.model = model
             self.timeout = timeout
         except ImportError:
@@ -571,6 +574,9 @@ class LLMConversionEngine:
                 )
             except Exception as e:
                 last_error = e
+                if self._is_non_retryable_error(e):
+                    logger.warning(f"Primary provider returned non-retryable error: {e}")
+                    break
                 if attempt < self.retry_attempts:
                     delay = self.retry_base_delay * attempt
                     logger.warning(
@@ -579,6 +585,9 @@ class LLMConversionEngine:
                     await asyncio.sleep(delay)
         
         if self.fallback_provider:
+            if self._should_skip_fallback(last_error):
+                logger.warning("Skipping fallback provider because it is configured against the same exhausted quota domain.")
+                raise last_error if last_error else RuntimeError("Code generation failed with unknown error")
             logger.warning("Primary provider exhausted retries. Switching to fallback provider.")
             for attempt in range(1, self.retry_attempts + 1):
                 try:
@@ -589,6 +598,9 @@ class LLMConversionEngine:
                     )
                 except Exception as e:
                     last_error = e
+                    if self._is_non_retryable_error(e):
+                        logger.warning(f"Fallback provider returned non-retryable error: {e}")
+                        break
                     if attempt < self.retry_attempts:
                         delay = self.retry_base_delay * attempt
                         logger.warning(
@@ -597,6 +609,34 @@ class LLMConversionEngine:
                         await asyncio.sleep(delay)
         
         raise last_error if last_error else RuntimeError("Code generation failed with unknown error")
+
+    def _is_non_retryable_error(self, error: Exception) -> bool:
+        """Detect provider failures that should not consume the retry budget."""
+        message = str(error).lower()
+        non_retryable_markers = (
+            'token_quota_exceeded',
+            'tokens per day limit exceeded',
+            'insufficient_quota',
+            'quota exceeded',
+            'quota has been exceeded',
+            'invalid api key',
+            'authentication',
+            'unauthorized',
+        )
+        return any(marker in message for marker in non_retryable_markers)
+
+    def _should_skip_fallback(self, error: Optional[Exception]) -> bool:
+        """Skip fallback when it is effectively the same exhausted upstream provider."""
+        if error is None or not self.fallback_provider:
+            return False
+        if not self._is_non_retryable_error(error):
+            return False
+        if type(self.provider) is not type(self.fallback_provider):
+            return False
+
+        primary_key = getattr(self.provider, 'api_key', None)
+        fallback_key = getattr(self.fallback_provider, 'api_key', None)
+        return bool(primary_key and fallback_key and primary_key == fallback_key)
     
     async def convert(self, ast_results: Dict[str, Any], 
                      dependency_graph: Dict[str, Any]) -> Dict[str, str]:
@@ -711,6 +751,9 @@ class LLMConversionEngine:
                     
                 except Exception as e:
                     logger.error(f"Failed to convert procedure {procedure.get('name')}: {str(e)}")
+                    fallback_filename, fallback_code = self._generate_procedure_fallback(procedure, context, e)
+                    if fallback_filename and fallback_code:
+                        return fallback_filename, fallback_code
                     return None, None
         
         # Convert procedures concurrently
@@ -752,6 +795,9 @@ class LLMConversionEngine:
                     
                 except Exception as e:
                     logger.error(f"Failed to convert function {function.get('name')}: {str(e)}")
+                    fallback_filename, fallback_code = self._generate_function_fallback(function, context, e)
+                    if fallback_filename and fallback_code:
+                        return fallback_filename, fallback_code
                     return None, None
         
         # Convert functions concurrently
@@ -1004,6 +1050,295 @@ class LLMConversionEngine:
                             columns.add(col)
         
         return list(columns)
+
+    def _generate_procedure_fallback(
+        self,
+        procedure: Dict[str, Any],
+        context: Dict[str, Any],
+        error: Exception,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Generate a deterministic Spring service when LLM conversion is unavailable."""
+        try:
+            procedure_name = procedure.get('name', 'Procedure')
+            service_name = self._derive_service_name(procedure_name)
+            method_name = self._to_camel_case(procedure_name)
+            package_name = context.get('package_name', 'com.company.project')
+            in_params = [p for p in procedure.get('parameters', []) if p.get('mode', 'IN').upper() == 'IN']
+            out_params = [p for p in procedure.get('parameters', []) if p.get('mode', 'IN').upper() != 'IN']
+            entity_name = self._derive_entity_name_from_name(procedure_name)
+            entity_var = self._lower_first(entity_name)
+            repository_name = f"{entity_name}Repository"
+            repository_var = self._lower_first(repository_name)
+            result_class_name = f"{self._to_pascal_case(procedure_name)}Result"
+
+            imports = [
+                "import java.time.LocalDateTime;",
+                "import org.springframework.beans.factory.annotation.Autowired;",
+                "import org.springframework.stereotype.Service;",
+                "import org.springframework.transaction.annotation.Transactional;",
+                f"import {package_name}.entity.{entity_name};",
+                f"import {package_name}.repository.{repository_name};",
+            ]
+            method_signature = ", ".join(
+                f"{self._map_plsql_type_to_java(param.get('type'), param.get('name'), param.get('mode'))} {self._to_camel_case(param.get('name', 'param'))}"
+                for param in in_params
+            )
+            return_type = "void"
+            nested_result = ""
+            result_fields = ""
+            result_args = ""
+            if len(out_params) == 1:
+                return_type = self._map_plsql_type_to_java(
+                    out_params[0].get('type'),
+                    out_params[0].get('name'),
+                    out_params[0].get('mode'),
+                )
+                result_args = self._default_return_expression(out_params[0], entity_var)
+            elif len(out_params) > 1:
+                return_type = result_class_name
+                result_fields = self._render_result_field_assignments(out_params, entity_var)
+                result_args = ", ".join(
+                    self._default_return_expression(param, entity_var) for param in out_params
+                )
+                nested_result = self._render_result_class(result_class_name, out_params)
+
+            entity_setters = self._render_entity_setters(entity_var, in_params)
+            sql_comments = self._render_sql_comment_lines(procedure.get('statements', []))
+            method_body_lines = [
+                "        // Deterministic fallback generated after LLM conversion failure.",
+                f"        // Original error: {self._escape_java_comment(str(error))}",
+            ]
+            if sql_comments:
+                method_body_lines.append("        // Original PL/SQL SQL statements:")
+                method_body_lines.extend(f"        // {line}" for line in sql_comments)
+            method_body_lines.extend(
+                [
+                    f"        {entity_name} {entity_var} = new {entity_name}();",
+                    entity_setters,
+                    f"        {entity_var}.setCreatedAt(LocalDateTime.now());",
+                    f"        {repository_var}.save({entity_var});",
+                ]
+            )
+            if len(out_params) == 1:
+                method_body_lines.append(f"        return {result_args};")
+            elif len(out_params) > 1:
+                method_body_lines.extend(result_fields.splitlines())
+                method_body_lines.append(f"        return new {result_class_name}({result_args});")
+
+            method_body = "\n".join(line for line in method_body_lines if line)
+            java_code = f"""package {package_name}.service;
+
+{chr(10).join(imports)}
+
+@Service
+public class {service_name} {{
+
+    @Autowired
+    private {repository_name} {repository_var};
+
+    @Transactional
+    public {return_type} {method_name}({method_signature}) {{
+{method_body}
+    }}
+{nested_result}
+}}
+"""
+            return f"{service_name}.java", java_code
+        except Exception as fallback_error:
+            logger.error(f"Failed to build deterministic fallback for procedure {procedure.get('name')}: {fallback_error}")
+            return None, None
+
+    def _generate_function_fallback(
+        self,
+        function: Dict[str, Any],
+        context: Dict[str, Any],
+        error: Exception,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Generate a deterministic Spring service stub for PL/SQL functions."""
+        try:
+            function_name = function.get('name', 'Function')
+            service_name = self._derive_service_name(function_name)
+            method_name = self._to_camel_case(function_name)
+            package_name = context.get('package_name', 'com.company.project')
+            return_type = self._map_plsql_type_to_java(function.get('return_type'), function_name, 'OUT')
+            parameters = [p for p in function.get('parameters', []) if p.get('mode', 'IN').upper() == 'IN']
+            method_signature = ", ".join(
+                f"{self._map_plsql_type_to_java(param.get('type'), param.get('name'), param.get('mode'))} {self._to_camel_case(param.get('name', 'param'))}"
+                for param in parameters
+            )
+            sql_comments = self._render_sql_comment_lines(function.get('statements', []))
+            comment_lines = [
+                "        // Deterministic fallback generated after LLM conversion failure.",
+                f"        // Original error: {self._escape_java_comment(str(error))}",
+            ]
+            if sql_comments:
+                comment_lines.append("        // Original PL/SQL SQL statements:")
+                comment_lines.extend(f"        // {line}" for line in sql_comments)
+            comment_lines.append(f"        return {self._default_value_for_java_type(return_type)};")
+            java_code = f"""package {package_name}.service;
+
+import org.springframework.stereotype.Service;
+
+@Service
+public class {service_name} {{
+
+    public {return_type} {method_name}({method_signature}) {{
+{chr(10).join(comment_lines)}
+    }}
+}}
+"""
+            return f"{service_name}.java", java_code
+        except Exception as fallback_error:
+            logger.error(f"Failed to build deterministic fallback for function {function.get('name')}: {fallback_error}")
+            return None, None
+
+    def _derive_service_name(self, object_name: str) -> str:
+        """Convert a PL/SQL object name to a Spring service class name."""
+        base_name = self._to_pascal_case(object_name)
+        return base_name if base_name.endswith('Service') else f"{base_name}Service"
+
+    def _derive_entity_name_from_name(self, object_name: str) -> str:
+        """Infer a primary entity name from a procedure or function name."""
+        tokens = [token for token in re.split(r'[^A-Za-z0-9]+', object_name or '') if token]
+        if len(tokens) > 1 and tokens[0].lower() in {'process', 'create', 'update', 'delete', 'save', 'get', 'find', 'load'}:
+            tokens = tokens[1:]
+        base_name = ''.join(token.capitalize() for token in tokens) or 'Record'
+        if base_name.endswith('Service'):
+            base_name = base_name[:-7] or 'Record'
+        return base_name
+
+    def _render_entity_setters(self, entity_var: str, params: List[Dict[str, Any]]) -> str:
+        """Render entity setter calls for IN parameters."""
+        setter_lines = []
+        for param in params:
+            field_name = self._normalize_field_name(param.get('name', 'param'))
+            setter_name = field_name[:1].upper() + field_name[1:]
+            value_name = self._to_camel_case(param.get('name', 'param'))
+            setter_lines.append(f"        {entity_var}.set{setter_name}({value_name});")
+        if not setter_lines:
+            setter_lines.append(f'        {entity_var}.setStatus("GENERATED_WITH_FALLBACK");')
+        return "\n".join(setter_lines)
+
+    def _render_result_class(self, result_class_name: str, out_params: List[Dict[str, Any]]) -> str:
+        """Render a nested result class for procedures with multiple OUT parameters."""
+        fields = []
+        constructor_args = []
+        assignments = []
+        accessors = []
+        for param in out_params:
+            field_name = self._normalize_field_name(param.get('name', 'param'))
+            java_type = self._map_plsql_type_to_java(param.get('type'), param.get('name'), param.get('mode'))
+            accessor_name = field_name[:1].upper() + field_name[1:]
+            fields.append(f"    private final {java_type} {field_name};")
+            constructor_args.append(f"{java_type} {field_name}")
+            assignments.append(f"        this.{field_name} = {field_name};")
+            accessors.append(
+                f"""    public {java_type} get{accessor_name}() {{
+        return {field_name};
+    }}"""
+            )
+        return f"""
+
+    public static class {result_class_name} {{
+{chr(10).join(fields)}
+
+        public {result_class_name}({", ".join(constructor_args)}) {{
+{chr(10).join(assignments)}
+        }}
+
+{chr(10).join(accessors)}
+    }}
+"""
+
+    def _render_result_field_assignments(self, out_params: List[Dict[str, Any]], entity_var: str) -> str:
+        """Create locals before instantiating a result object."""
+        lines = []
+        for param in out_params:
+            java_type = self._map_plsql_type_to_java(param.get('type'), param.get('name'), param.get('mode'))
+            var_name = self._normalize_field_name(param.get('name', 'param'))
+            default_expr = self._default_return_expression(param, entity_var)
+            lines.append(f"        {java_type} {var_name} = {default_expr};")
+        return "\n".join(lines)
+
+    def _default_return_expression(self, param: Dict[str, Any], entity_var: str) -> str:
+        """Choose a reasonable placeholder expression for an OUT parameter."""
+        normalized_name = self._normalize_field_name(param.get('name', 'param')).lower()
+        java_type = self._map_plsql_type_to_java(param.get('type'), param.get('name'), param.get('mode'))
+        if normalized_name.endswith('status') or java_type == 'String':
+            return '"SUCCESS"'
+        if normalized_name.endswith('id') and java_type == 'Long':
+            return f"{entity_var}.getId()"
+        return self._default_value_for_java_type(java_type)
+
+    def _default_value_for_java_type(self, java_type: str) -> str:
+        """Return a Java literal or expression for a given type."""
+        defaults = {
+            'String': 'null',
+            'Long': 'null',
+            'Integer': '0',
+            'Double': '0.0',
+            'Float': '0.0f',
+            'Boolean': 'false',
+            'BigDecimal': 'java.math.BigDecimal.ZERO',
+            'LocalDateTime': 'LocalDateTime.now()',
+            'void': '',
+        }
+        return defaults.get(java_type, 'null')
+
+    def _map_plsql_type_to_java(self, plsql_type: Optional[str], field_name: Optional[str] = None, mode: Optional[str] = None) -> str:
+        """Map common PL/SQL scalar types to Java types."""
+        type_name = (plsql_type or '').upper()
+        normalized_name = (field_name or '').lower()
+        if 'VARCHAR' in type_name or 'CHAR' in type_name or 'CLOB' in type_name or normalized_name.endswith('status'):
+            return 'String'
+        if 'DATE' in type_name or 'TIMESTAMP' in type_name:
+            return 'LocalDateTime'
+        if 'BOOLEAN' in type_name:
+            return 'Boolean'
+        if 'NUMBER' in type_name:
+            if normalized_name.endswith('id'):
+                return 'Long'
+            if any(token in normalized_name for token in ('qty', 'quantity', 'count', 'total', 'amount')):
+                return 'Integer'
+            return 'Long' if (mode or '').upper() == 'OUT' else 'Integer'
+        return 'String'
+
+    def _render_sql_comment_lines(self, statements: List[Dict[str, Any]]) -> List[str]:
+        """Flatten SQL statements into comment-safe single lines."""
+        lines: List[str] = []
+        for statement in statements or []:
+            if statement.get('type') != 'sql_statement':
+                continue
+            sql_text = re.sub(r'\s+', ' ', statement.get('text', '')).strip()
+            if sql_text:
+                lines.append(self._escape_java_comment(sql_text))
+        return lines
+
+    def _to_pascal_case(self, value: str) -> str:
+        """Convert snake_case or mixed identifiers to PascalCase."""
+        parts = [part for part in re.split(r'[^A-Za-z0-9]+', value or '') if part]
+        if not parts and value:
+            parts = re.findall(r'[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z]|$)', value)
+        return ''.join(part[:1].upper() + part[1:] for part in parts) or 'Generated'
+
+    def _to_camel_case(self, value: str) -> str:
+        """Convert snake_case or mixed identifiers to camelCase."""
+        pascal = self._to_pascal_case(value)
+        return pascal[:1].lower() + pascal[1:] if pascal else 'generated'
+
+    def _lower_first(self, value: str) -> str:
+        """Lowercase the first character of a string."""
+        return value[:1].lower() + value[1:] if value else value
+
+    def _normalize_field_name(self, value: str) -> str:
+        """Normalize parameter-style names to Java field names."""
+        normalized = re.sub(r'^(p|v)_+', '', value or '', flags=re.IGNORECASE)
+        normalized = normalized.strip('_')
+        return self._to_camel_case(normalized or value or 'value')
+
+    def _escape_java_comment(self, value: str) -> str:
+        """Sanitize text embedded in Java single-line comments."""
+        return (value or '').replace('*/', '* /').replace('\r', ' ').replace('\n', ' ')
     
     def _clean_java_code(self, java_code: str) -> str:
         """

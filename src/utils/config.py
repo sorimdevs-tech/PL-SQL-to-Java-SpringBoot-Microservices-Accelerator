@@ -184,11 +184,8 @@ class ConfigManager:
         """
         # Load API keys from environment
         llm_config = config_data.get('llm', {})
-        llm_api_key = llm_config.get('api_key')
-        if isinstance(llm_api_key, str) and llm_api_key.startswith("${") and llm_api_key.endswith("}"):
-            env_key_name = llm_api_key[2:-1].strip()
-            llm_api_key = os.getenv(env_key_name)
-            llm_config['api_key'] = llm_api_key
+        llm_api_key = self._resolve_env_placeholder(llm_config.get('api_key'))
+        llm_config['api_key'] = llm_api_key
         if llm_api_key in (None, "", "your-api-key-here"):
             api_key = (
                 os.getenv('OPENAI_API_KEY')
@@ -200,6 +197,12 @@ class ConfigManager:
             if api_key:
                 llm_config['api_key'] = api_key
                 config_data['llm'] = llm_config
+
+        fallback_cfg = llm_config.get('fallback')
+        if isinstance(fallback_cfg, dict):
+            fallback_cfg['api_key'] = self._resolve_env_placeholder(fallback_cfg.get('api_key'))
+            llm_config['fallback'] = fallback_cfg
+            config_data['llm'] = llm_config
         
         # Load database connection string from environment
         db_config = config_data.get('database', {})
@@ -209,6 +212,13 @@ class ConfigManager:
             if db_connection:
                 db_config['connection_string'] = db_connection
                 config_data['database'] = db_config
+
+    def _resolve_env_placeholder(self, value: Optional[str]) -> Optional[str]:
+        """Resolve ${ENV_VAR} placeholders from the current environment."""
+        if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+            env_key_name = value[2:-1].strip()
+            return os.getenv(env_key_name)
+        return value
     
     def _setup_logging(self):
         """Setup logging based on configuration"""
