@@ -1,9 +1,11 @@
+#backend
 .env
 .env.example
 output/
 demo/
 _pycache__/
 .tmp/
+.api_jobs/
 *.log
 advanced/_pycache__/
 analyzer/_pycache__/
@@ -13,3 +15,31 @@ converter/_pycache__/
 parser/_pycache__/
 utils/_pycache__/
 validator/_pycache__/
+
+
+#frontend
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
