@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
-import { LoaderCircle } from "lucide-react"
+import { ChevronLeft, ChevronRight, LoaderCircle } from "lucide-react"
 
 import {
   getDiscoveryContainers,
@@ -45,6 +45,12 @@ interface DualListSelectorProps {
   isLoading?: boolean
   error?: string | null
   onRetry?: () => void
+  navigation?: {
+    onPrevious?: () => void
+    onNext?: () => void
+    disablePrevious?: boolean
+    disableNext?: boolean
+  }
 }
 
 const STORAGE_KEYS = {
@@ -236,6 +242,28 @@ function DualListSelector(props: DualListSelectorProps) {
             </div>
           </div>
         </div>
+        {props.navigation ? (
+          <div className="flex items-center justify-between border-t border-slate-200 pt-3">
+            <button
+              type="button"
+              onClick={props.navigation.onPrevious}
+              disabled={props.navigation.disablePrevious}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+              aria-label="Previous"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={props.navigation.onNext}
+              disabled={props.navigation.disableNext}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+              aria-label="Next"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   )
@@ -525,6 +553,12 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
           isLoading={isConnecting || isLoadingContainers}
           error={connectError || containerError}
           onRetry={() => void loadContainers()}
+          navigation={{
+            onPrevious: goPreviousStep,
+            onNext: goNextStep,
+            disablePrevious: activeSelectorStep === 1,
+            disableNext: !canProceedFromCurrentStep(),
+          }}
         />
       ) : null}
 
@@ -538,6 +572,12 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
           isLoading={isLoadingSchemas}
           error={schemaError}
           onRetry={() => void loadSchemas(selectedContainer)}
+          navigation={{
+            onPrevious: goPreviousStep,
+            onNext: goNextStep,
+            disablePrevious: activeSelectorStep === 1,
+            disableNext: !canProceedFromCurrentStep(),
+          }}
         />
       ) : null}
 
@@ -562,6 +602,12 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
           isLoading={isLoadingObjects}
           error={objectError}
           onRetry={() => void loadObjects(selectedContainer, props.selectedSchemas)}
+          navigation={{
+            onPrevious: goPreviousStep,
+            onNext: goNextStep,
+            disablePrevious: activeSelectorStep === 1,
+            disableNext: !canProceedFromCurrentStep(),
+          }}
         />
       ) : null}
 
@@ -575,19 +621,14 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
           isLoading={isLoadingPreview}
           error={previewError}
           onRetry={() => void loadProcedureDetail(props.selectedProcedures[0] ?? "")}
+          navigation={{
+            onPrevious: goPreviousStep,
+            onNext: goNextStep,
+            disablePrevious: activeSelectorStep === 1,
+            disableNext: activeSelectorStep === 4 || !canProceedFromCurrentStep(),
+          }}
         />
       ) : null}
-
-      <Card>
-        <CardContent className="flex items-center justify-between p-4">
-          <Button variant="outline" onClick={goPreviousStep} disabled={activeSelectorStep === 1}>
-            Previous
-          </Button>
-          <Button onClick={goNextStep} disabled={activeSelectorStep === 4 || !canProceedFromCurrentStep()}>
-            Next
-          </Button>
-        </CardContent>
-      </Card>
 
       {hasProcedureSelection ? (
         <Card>

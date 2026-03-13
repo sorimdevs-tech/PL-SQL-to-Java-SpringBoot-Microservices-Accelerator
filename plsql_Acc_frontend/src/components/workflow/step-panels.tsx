@@ -735,124 +735,222 @@ interface StrategyPanelProps {
 }
 
 function StrategyPanel(props: StrategyPanelProps) {
+  const [language, setLanguage] = useState<"java" | "kotlin" | "groovy">("java")
+  const [gradleFlavor, setGradleFlavor] = useState<"groovy" | "kotlin">("groovy")
+
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Spring Project Specifications</CardTitle>
-        <CardDescription>Configure project metadata and choose baseline dependencies</CardDescription>
-      </CardHeader>
-      <CardContent className="grid gap-5 lg:grid-cols-[1.15fr_1fr]">
-        <div className="space-y-4">
-          <div className="grid gap-3 md:grid-cols-3">
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Build Tool</p>
-              <select
-                className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700"
-                value={props.buildTool}
-                onChange={(event) => props.setBuildTool(event.target.value as BuildTool)}
-              >
-                <option value="mvn">Maven</option>
-                <option value="gradle">Gradle</option>
-              </select>
+    <Card className="rounded-md border border-slate-200 bg-white shadow-none">
+      <CardContent className="grid gap-6 px-6 pb-6 pt-6 lg:grid-cols-[1.2fr_1fr]">
+        <div className="space-y-6">
+          <div className="grid gap-6 md:grid-cols-2">
+            <div className="space-y-3">
+              <p className="text-sm font-semibold text-slate-900">Project</p>
+              <div className="space-y-2 text-sm text-slate-800">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="build-tool"
+                    checked={props.buildTool === "gradle" && gradleFlavor === "groovy"}
+                    onChange={() => {
+                      setGradleFlavor("groovy")
+                      props.setBuildTool("gradle")
+                    }}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  Gradle - Groovy
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="build-tool"
+                    checked={props.buildTool === "gradle" && gradleFlavor === "kotlin"}
+                    onChange={() => {
+                      setGradleFlavor("kotlin")
+                      props.setBuildTool("gradle")
+                    }}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  Gradle - Kotlin
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="build-tool"
+                    checked={props.buildTool === "mvn"}
+                    onChange={() => props.setBuildTool("mvn")}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  Maven
+                </label>
+              </div>
             </div>
 
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Spring Boot</p>
-              <select
-                className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700"
-                value={props.springBootVersion}
-                onChange={(event) => props.setSpringBootVersion(event.target.value)}
-              >
-                <option value="3.4.5">3.4.5 (Recommended)</option>
-                <option value="3.3.11">3.3.11</option>
-              </select>
-            </div>
-
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Java Version</p>
-              <select
-                className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700"
-                value={props.javaVersion}
-                onChange={(event) => props.setJavaVersion(event.target.value)}
-              >
-                <option value="17">17 (LTS)</option>
-                <option value="21">21 (LTS)</option>
-              </select>
+            <div className="space-y-3">
+              <p className="text-sm font-semibold text-slate-900">Language</p>
+              <div className="space-y-2 text-sm text-slate-800">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="language"
+                    checked={language === "java"}
+                    onChange={() => setLanguage("java")}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  Java
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="language"
+                    checked={language === "kotlin"}
+                    onChange={() => setLanguage("kotlin")}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  Kotlin
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="language"
+                    checked={language === "groovy"}
+                    onChange={() => setLanguage("groovy")}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  Groovy
+                </label>
+              </div>
             </div>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-2">
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Packaging</p>
-              <select
-                className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700"
-                value={props.packaging}
-                onChange={(event) => props.setPackaging(event.target.value as PackagingType)}
-              >
-                <option value="jar">Jar</option>
-                <option value="war">War</option>
-              </select>
-            </div>
-
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Configuration</p>
-              <select
-                className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700"
-                value={props.springConfigFormat}
-                onChange={(event) => props.setSpringConfigFormat(event.target.value as SpringConfigFormat)}
-              >
-                <option value="properties">application.properties</option>
-                <option value="yaml">application.yml</option>
-              </select>
+          <div className="space-y-3">
+            <p className="text-sm font-semibold text-slate-900">Spring Boot</p>
+            <div className="grid gap-2 text-sm text-slate-800 md:grid-cols-3">
+              {[
+                { value: "4.1.0-SNAPSHOT", label: "4.1.0 (SNAPSHOT)" },
+                { value: "4.1.0-M2", label: "4.1.0 (M2)" },
+                { value: "4.0.4-SNAPSHOT", label: "4.0.4 (SNAPSHOT)" },
+                { value: "4.0.3", label: "4.0.3" },
+                { value: "3.5.12-SNAPSHOT", label: "3.5.12 (SNAPSHOT)" },
+                { value: "3.5.11", label: "3.5.11" },
+              ].map((option) => (
+                <label key={option.value} className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="spring-boot"
+                    checked={props.springBootVersion === option.value}
+                    onChange={() => props.setSpringBootVersion(option.value)}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  {option.label}
+                </label>
+              ))}
             </div>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-2">
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Group</p>
-              <Input value={props.projectGroup} onChange={(event) => props.setProjectGroup(event.target.value)} />
+          <div className="space-y-3">
+            <p className="text-sm font-semibold text-slate-900">Project Metadata</p>
+            <div className="grid gap-4">
+              {[
+                { label: "Group", value: props.projectGroup, onChange: props.setProjectGroup },
+                { label: "Artifact", value: props.projectArtifact, onChange: props.setProjectArtifact },
+                { label: "Name", value: props.projectDisplayName, onChange: props.setProjectDisplayName },
+                { label: "Description", value: props.projectDescription, onChange: props.setProjectDescription },
+                { label: "Package name", value: props.projectPackageName, onChange: props.setProjectPackageName },
+              ].map((field) => (
+                <div key={field.label} className="grid items-center gap-3 md:grid-cols-[140px_1fr]">
+                  <p className="text-sm text-slate-700">{field.label}</p>
+                  <input
+                    value={field.value}
+                    onChange={(event) => field.onChange(event.target.value)}
+                    className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                  />
+                </div>
+              ))}
             </div>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Artifact</p>
-              <Input value={props.projectArtifact} onChange={(event) => props.setProjectArtifact(event.target.value)} />
+              <p className="text-sm font-semibold text-slate-900">Packaging</p>
+              <div className="flex items-center gap-6 text-sm text-slate-800">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="packaging"
+                    checked={props.packaging === "jar"}
+                    onChange={() => props.setPackaging("jar")}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  Jar
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="packaging"
+                    checked={props.packaging === "war"}
+                    onChange={() => props.setPackaging("war")}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  War
+                </label>
+              </div>
             </div>
+
             <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Name</p>
-              <Input value={props.projectDisplayName} onChange={(event) => props.setProjectDisplayName(event.target.value)} />
-            </div>
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Package Name</p>
-              <Input value={props.projectPackageName} onChange={(event) => props.setProjectPackageName(event.target.value)} />
+              <p className="text-sm font-semibold text-slate-900">Configuration</p>
+              <div className="flex items-center gap-6 text-sm text-slate-800">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="config"
+                    checked={props.springConfigFormat === "properties"}
+                    onChange={() => props.setSpringConfigFormat("properties")}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  Properties
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="config"
+                    checked={props.springConfigFormat === "yaml"}
+                    onChange={() => props.setSpringConfigFormat("yaml")}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  YAML
+                </label>
+              </div>
             </div>
           </div>
 
           <div className="space-y-2">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Description</p>
-            <Input value={props.projectDescription} onChange={(event) => props.setProjectDescription(event.target.value)} />
+            <p className="text-sm font-semibold text-slate-900">Java</p>
+            <div className="flex flex-wrap items-center gap-6 text-sm text-slate-800">
+              {["25", "21", "17"].map((version) => (
+                <label key={version} className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="java-version"
+                    checked={props.javaVersion === version}
+                    onChange={() => props.setJavaVersion(version)}
+                    className="h-4 w-4 accent-green-500"
+                  />
+                  {version}
+                </label>
+              ))}
+            </div>
           </div>
         </div>
 
-        <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
-          <div className="flex items-center justify-between">
+        <div className="rounded-md border border-slate-200/80 bg-white p-4">
+          <div className="flex items-center justify-between border-b border-slate-200/70 pb-3">
             <p className="text-sm font-semibold text-slate-900">Dependencies</p>
-            <p className="text-xs text-slate-500">{DEFAULT_SPRING_DEPENDENCIES.length} defaults</p>
+            
           </div>
-          <div className="mt-3 space-y-2">
-            {DEFAULT_SPRING_DEPENDENCIES.map((dependency) => (
-              <div
-                key={dependency.id}
-                className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"
-              >
-                <span>
-                  <span className="block font-medium text-slate-900">{dependency.name}</span>
-                  <span className="text-xs text-slate-500">{dependency.description}</span>
-                </span>
-              </div>
-            ))}
-            <p className="rounded-lg border border-cyan-200 bg-cyan-50 px-3 py-2 text-xs text-cyan-800">
-              These dependencies will be added automatically by our LLM Engine during Application generation.
-            </p>
-          </div>
+          <p className="mt-4 text-sm text-slate-500">No dependency selected</p>
+          <p className="mt-6 text-xs text-slate-400">
+            {DEFAULT_SPRING_DEPENDENCIES.length} defaults will be included during generation.
+          </p>
         </div>
       </CardContent>
     </Card>
@@ -903,12 +1001,50 @@ function SummaryPanel(props: SummaryPanelProps) {
     dominantDomains.push("General PL/SQL Logic")
   }
   const defaultDependencyNames = DEFAULT_SPRING_DEPENDENCIES.map((dependency) => dependency.name)
-  const dummySummary = `This conversion project originates from the ${sourceLabel} source and is prepared as project "${props.projectName}". The selected database scope contains ${props.selectedDatabases.length} database(s), ${props.selectedSchemas.length} schema(s), ${props.selectedObjects.length} objects, and ${props.selectedProcedures.length} stored procedures for migration. Based on selected procedure patterns, the main business logic focus is ${dominantDomains.length > 0 ? dominantDomains.join(", ") : "functional decomposition and service extraction"}.
+  const backendSummary = props.conversionSnapshot?.backendSummaryData as
+    | {
+        plsql_files?: number
+        procedures?: number
+        functions?: number
+        triggers?: number
+        packages?: number
+        tables_detected?: number
+        java_files_generated?: number
+        entities_generated?: number
+        repositories_generated?: number
+        services_generated?: number
+        controllers_generated?: number
+        unit_tests_generated?: number
+        integration_tests_generated?: number
+        validation_results?: number
+        validation_passed?: boolean
+      }
+    | undefined
+  const resolvedSummary = backendSummary
+    ? `This conversion used ${backendSummary.plsql_files ?? 0} PL/SQL file(s) from ${sourceLabel} and produced ${
+        backendSummary.java_files_generated ?? 0
+      } Java source file(s). The parsed scope included ${backendSummary.procedures ?? 0} procedures, ${
+        backendSummary.functions ?? 0
+      } functions, ${backendSummary.triggers ?? 0} triggers, and ${backendSummary.packages ?? 0} packages, with ${
+        backendSummary.tables_detected ?? 0
+      } table(s) detected.
 
-The conversion strategy "${props.selectedStrategy}" will generate Spring Boot components that separate business rules into service classes, persistence operations into repository layers, and operational workflows into structured API/service boundaries. The runtime target is Java ${props.javaVersion} using ${props.buildTool}, with configuration expected in ${props.springConfigFormat === "properties" ? "application.properties" : "application.yml"}. Baseline dependencies include ${defaultDependencyNames.join(", ")} and will be added by our LLM; output is expected at ${props.conversionSnapshot?.outputDirectory ?? "the configured output directory once conversion is executed"}.
+Generated outputs include ${backendSummary.entities_generated ?? 0} entities, ${
+        backendSummary.repositories_generated ?? 0
+      } repositories, ${backendSummary.services_generated ?? 0} services, and ${
+        backendSummary.controllers_generated ?? 0
+      } controllers. Tests generated: ${backendSummary.unit_tests_generated ?? 0} unit and ${
+        backendSummary.integration_tests_generated ?? 0
+      } integration tests. Validation ${
+        backendSummary.validation_passed ? "passed" : "did not pass"
+      } with ${backendSummary.validation_results ?? 0} result(s).
 
-Generated artifacts are expected to include application source classes, repositories, DTOs, and supporting build files. This summary is currently generated from frontend context and selected scope.`
-  const resolvedSummary = props.conversionSnapshot?.backendSummary?.trim() || dummySummary
+Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configuration in ${
+        props.springConfigFormat === "properties" ? "application.properties" : "application.yml"
+      }, baseline dependencies: ${defaultDependencyNames.join(", ")}. Output directory: ${
+        props.conversionSnapshot?.outputDirectory ?? "not available"
+      }.`
+    : "Run a conversion to generate a real summary from the backend."
 
   return (
     <div className="space-y-4">
@@ -916,7 +1052,7 @@ Generated artifacts are expected to include application source classes, reposito
         <CardHeader>
           <CardTitle>Project Narrative Summary</CardTitle>
           <CardDescription>
-            {props.conversionSnapshot?.backendSummary ? "From backend conversion summary" : "Frontend dummy summary (fallback)"}
+            {backendSummary ? "From backend conversion summary" : "Waiting for conversion summary"}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -1055,6 +1191,8 @@ Generated artifacts are expected to include application source classes, reposito
 
 interface PanelBodyProps {
   activeStep: number
+  hideSpringConfig: boolean
+  onConversionStart: () => void
   sourceMethod: SourceMethod
   dbHost: string
   dbPort: string
@@ -1172,28 +1310,30 @@ function PanelBody(props: PanelBodyProps) {
     case 3:
       return (
         <div className="space-y-4">
-          <StrategyPanel
-            springBootVersion={props.springBootVersion}
-            setSpringBootVersion={props.setSpringBootVersion}
-            javaVersion={props.javaVersion}
-            setJavaVersion={props.setJavaVersion}
-            buildTool={props.buildTool}
-            setBuildTool={props.setBuildTool}
-            packaging={props.packaging}
-            setPackaging={props.setPackaging}
-            springConfigFormat={props.springConfigFormat}
-            setSpringConfigFormat={props.setSpringConfigFormat}
-            projectGroup={props.projectGroup}
-            setProjectGroup={props.setProjectGroup}
-            projectArtifact={props.projectArtifact}
-            setProjectArtifact={props.setProjectArtifact}
-            projectDisplayName={props.projectDisplayName}
-            setProjectDisplayName={props.setProjectDisplayName}
-            projectDescription={props.projectDescription}
-            setProjectDescription={props.setProjectDescription}
-            projectPackageName={props.projectPackageName}
-            setProjectPackageName={props.setProjectPackageName}
-          />
+          {props.hideSpringConfig ? null : (
+            <StrategyPanel
+              springBootVersion={props.springBootVersion}
+              setSpringBootVersion={props.setSpringBootVersion}
+              javaVersion={props.javaVersion}
+              setJavaVersion={props.setJavaVersion}
+              buildTool={props.buildTool}
+              setBuildTool={props.setBuildTool}
+              packaging={props.packaging}
+              setPackaging={props.setPackaging}
+              springConfigFormat={props.springConfigFormat}
+              setSpringConfigFormat={props.setSpringConfigFormat}
+              projectGroup={props.projectGroup}
+              setProjectGroup={props.setProjectGroup}
+              projectArtifact={props.projectArtifact}
+              setProjectArtifact={props.setProjectArtifact}
+              projectDisplayName={props.projectDisplayName}
+              setProjectDisplayName={props.setProjectDisplayName}
+              projectDescription={props.projectDescription}
+              setProjectDescription={props.setProjectDescription}
+              projectPackageName={props.projectPackageName}
+              setProjectPackageName={props.setProjectPackageName}
+            />
+          )}
           <ConversionJobPanel
             sourceMethod={props.sourceMethod}
             projectName={props.projectName}
@@ -1205,6 +1345,17 @@ function PanelBody(props: PanelBodyProps) {
             dbUsername={props.dbUsername}
             dbPassword={props.dbPassword}
             dbConfigPath={props.dbConfigPath}
+            springBootVersion={props.springBootVersion}
+            javaVersion={props.javaVersion}
+            buildTool={props.buildTool}
+            packaging={props.packaging}
+            springConfigFormat={props.springConfigFormat}
+            projectGroup={props.projectGroup}
+            projectArtifact={props.projectArtifact}
+            projectDisplayName={props.projectDisplayName}
+            projectDescription={props.projectDescription}
+            projectPackageName={props.projectPackageName}
+            onConversionStart={props.onConversionStart}
             onSnapshotChange={props.onSnapshotChange}
           />
         </div>
@@ -1256,9 +1407,9 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
   const [selectedStrategy] = useState(
     strategyOptions.find((option) => option.recommendation)?.title ?? strategyOptions[0]?.title ?? "Strategy",
   )
-  const [springBootVersion, setSpringBootVersion] = useState("3.4.5")
+  const [springBootVersion, setSpringBootVersion] = useState("4.0.3")
   const [javaVersion, setJavaVersion] = useState("17")
-  const [buildTool, setBuildTool] = useState<BuildTool>("mvn")
+  const [buildTool, setBuildTool] = useState<BuildTool>("gradle")
   const [packaging, setPackaging] = useState<PackagingType>("jar")
   const [springConfigFormat, setSpringConfigFormat] = useState<SpringConfigFormat>("properties")
   const [projectGroup, setProjectGroup] = useState("com.example")
@@ -1267,6 +1418,7 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
   const [projectDescription, setProjectDescription] = useState("Demo project for Spring Boot")
   const [projectPackageName, setProjectPackageName] = useState("com.example.demo")
   const [conversionSnapshot, setConversionSnapshot] = useState<ConversionSnapshot | null>(null)
+  const [hideSpringConfig, setHideSpringConfig] = useState(false)
   const projectName =
     sourceMethod === "oracle"
       ? dbServiceName || "Generated Project"
@@ -1274,6 +1426,12 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
         ? "git-conversion-project"
         : sourceFile?.name?.split(".")[0] || "file-conversion-project"
   const step = workflowSteps[activeStep - 1]
+
+  useEffect(() => {
+    if (activeStep !== 3) {
+      setHideSpringConfig(false)
+    }
+  }, [activeStep])
 
   return (
     <section className="space-y-4">
@@ -1285,6 +1443,8 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
 
       <PanelBody
         activeStep={activeStep}
+        hideSpringConfig={hideSpringConfig}
+        onConversionStart={() => setHideSpringConfig(true)}
         sourceMethod={sourceMethod}
         setSourceMethod={setSourceMethod}
         gitRepoUrl={gitRepoUrl}

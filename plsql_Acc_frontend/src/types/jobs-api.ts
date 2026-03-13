@@ -7,6 +7,23 @@ export interface DatabaseJobRequest {
   configPath?: string
 }
 
+export interface OutputConfigOverrides {
+  project_name?: string
+  group_id?: string
+  artifact_id?: string
+  package_name?: string
+  description?: string
+  java_version?: string
+  spring_boot_version?: string
+  build_tool?: "maven" | "gradle" | "mvn"
+  packaging?: "jar" | "war"
+  config_format?: "properties" | "yaml"
+}
+
+export interface ConfigOverrides {
+  output?: OutputConfigOverrides
+}
+
 export interface JobResult {
   output_directory?: string
   generated_files?: string[]

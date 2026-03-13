@@ -1,5 +1,6 @@
 import type {
   ConversionJob,
+  ConfigOverrides,
   DatabaseJobRequest,
   FileContentResponse,
   FilesResponse,
@@ -33,7 +34,10 @@ async function parseResponse<T>(response: Response): Promise<T> {
   throw new Error(message || `Request failed with status ${response.status}`)
 }
 
-export async function createDatabaseJob(payload: DatabaseJobRequest): Promise<ConversionJob> {
+export async function createDatabaseJob(
+  payload: DatabaseJobRequest,
+  configOverrides?: ConfigOverrides,
+): Promise<ConversionJob> {
   const connectionString = buildConnectionString(payload)
 
   const response = await fetch(toApiUrl("/api/jobs/database"), {
@@ -42,16 +46,24 @@ export async function createDatabaseJob(payload: DatabaseJobRequest): Promise<Co
     body: JSON.stringify({
       connection_string: connectionString,
       config_path: payload.configPath ?? "config.json",
+      config_overrides: configOverrides,
     }),
   })
 
   return parseResponse<ConversionJob>(response)
 }
 
-export async function createFileJob(file: File, configPath = "config.json"): Promise<ConversionJob> {
+export async function createFileJob(
+  file: File,
+  configPath = "config.json",
+  configOverrides?: ConfigOverrides,
+): Promise<ConversionJob> {
   const formData = new FormData()
   formData.append("source_file", file)
   formData.append("config_path", configPath)
+  if (configOverrides) {
+    formData.append("config_overrides", JSON.stringify(configOverrides))
+  }
 
   const response = await fetch(toApiUrl("/api/jobs/file"), {
     method: "POST",
@@ -61,13 +73,18 @@ export async function createFileJob(file: File, configPath = "config.json"): Pro
   return parseResponse<ConversionJob>(response)
 }
 
-export async function createGitJob(repoUrl: string, configPath = "config.json"): Promise<ConversionJob> {
+export async function createGitJob(
+  repoUrl: string,
+  configPath = "config.json",
+  configOverrides?: ConfigOverrides,
+): Promise<ConversionJob> {
   const response = await fetch(toApiUrl("/api/jobs/git"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       repo_url: repoUrl,
       config_path: configPath,
+      config_overrides: configOverrides,
     }),
   })
 

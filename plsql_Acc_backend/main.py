@@ -31,7 +31,12 @@ logger = logging.getLogger(__name__)
 class PLSQLModernizationPipeline:
     """Main pipeline for PL/SQL to Java conversion"""
     
-    def __init__(self, config_path: str = "config.json", output_directory: Optional[str] = None):
+    def __init__(
+        self,
+        config_path: str = "config.json",
+        output_directory: Optional[str] = None,
+        config_overrides: Optional[Dict[str, Any]] = None,
+    ):
         """
         Initialize the modernization pipeline
         
@@ -46,6 +51,8 @@ class PLSQLModernizationPipeline:
             if hasattr(loaded_config, "model_dump")
             else loaded_config.dict()
         )
+        if config_overrides:
+            self._merge_config(self.config, config_overrides)
         self.config_path = config_path
         if output_directory:
             self.config.setdefault('output', {})
@@ -64,6 +71,14 @@ class PLSQLModernizationPipeline:
         
         # Setup output directories
         self.setup_output_directories()
+
+    def _merge_config(self, base: Dict[str, Any], overrides: Dict[str, Any]) -> None:
+        """Recursively merge override values into the loaded config dict."""
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(base.get(key), dict):
+                self._merge_config(base[key], value)
+            else:
+                base[key] = value
     
     def setup_output_directories(self):
         """Create necessary output directories"""

@@ -48,10 +48,16 @@ class DatabaseConfig(BaseModel):
 class OutputConfig(BaseModel):
     """Output configuration settings"""
     project_name: str = "converted-app"
+    group_id: str = "com.company"
+    artifact_id: str = "converted-app"
     package_name: str = "com.company.project"
+    description: str = "PL/SQL to Java Modernization Project"
     target_directory: str = "./output"
     java_version: str = "17"
     spring_boot_version: str = "3.1.0"
+    build_tool: str = "maven"
+    packaging: str = "jar"
+    config_format: str = "properties"
     generate_tests: bool = True
     generate_docs: bool = True
     format_code: bool = True

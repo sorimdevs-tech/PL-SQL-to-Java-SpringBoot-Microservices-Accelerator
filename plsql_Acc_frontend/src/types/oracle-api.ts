@@ -1,3 +1,5 @@
+import type { ConfigOverrides } from "./jobs-api"
+
 export interface OracleConnectionPayload {
   host: string
   port: number
@@ -13,6 +15,7 @@ export interface OracleObjectsPayload extends OracleConnectionPayload {
 
 export interface OracleConvertPayload extends OracleConnectionPayload {
   config_path: string
+  config_overrides?: ConfigOverrides
 }
 
 export interface OracleObjectItem {

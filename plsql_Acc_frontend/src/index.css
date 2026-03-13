@@ -70,3 +70,23 @@ a {
 .delay-4 {
   animation-delay: 300ms;
 }
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-60%);
+  }
+  100% {
+    transform: translateX(120%);
+  }
+}
+
+.progress-stripe {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: 60%;
+  border-radius: 9999px;
+  background: linear-gradient(90deg, rgba(52, 211, 153, 0), rgba(52, 211, 153, 0.85), rgba(52, 211, 153, 0));
+  animation: progress-slide 1.4s ease-in-out infinite;
+}

@@ -5,6 +5,7 @@ FastAPI backend for the PL/SQL modernization pipeline.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import shutil
 import tempfile
@@ -38,6 +39,7 @@ class JobRecord:
     source_type: str
     source_value: str
     config_path: str
+    config_overrides: Optional[Dict[str, Any]] = None
     status: str = "queued"
     created_at: str = field(default_factory=_utc_now)
     started_at: Optional[str] = None
@@ -51,6 +53,7 @@ class GitConversionRequest(BaseModel):
 
     repo_url: str = Field(..., min_length=1)
     config_path: str = "config.json"
+    config_overrides: Optional[Dict[str, Any]] = None
 
 
 class DatabaseConversionRequest(BaseModel):
@@ -58,6 +61,7 @@ class DatabaseConversionRequest(BaseModel):
 
     connection_string: str = Field(..., min_length=1)
     config_path: str = "config.json"
+    config_overrides: Optional[Dict[str, Any]] = None
 
 
 class FilePathConversionRequest(BaseModel):
@@ -65,6 +69,7 @@ class FilePathConversionRequest(BaseModel):
 
     source_path: str = Field(..., min_length=1)
     config_path: str = "config.json"
+    config_overrides: Optional[Dict[str, Any]] = None
 
 
 class OracleConnectionRequest(BaseModel):
@@ -90,6 +95,7 @@ class OracleConvertRequest(OracleConnectionRequest):
     """Request model for creating a conversion job from structured Oracle credentials."""
 
     config_path: str = "config.json"
+    config_overrides: Optional[Dict[str, Any]] = None
 
 
 class GitTableDiscoveryRequest(BaseModel):
@@ -149,6 +155,19 @@ def _decode_text_content(content: bytes) -> str:
         except UnicodeDecodeError:
             continue
     raise ValueError("Unable to decode text content")
+
+
+def _parse_config_overrides(raw_value: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parse config override JSON from form or query payloads."""
+    if not raw_value:
+        return None
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("config_overrides must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("config_overrides must be a JSON object")
+    return parsed
 
 
 def _normalize_filter_prefix(path_filter: str) -> str:
@@ -654,7 +673,13 @@ class JobManager:
         self.jobs: Dict[str, JobRecord] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
 
-    def create_job(self, source_type: str, source_value: str, config_path: str) -> JobRecord:
+    def create_job(
+        self,
+        source_type: str,
+        source_value: str,
+        config_path: str,
+        config_overrides: Optional[Dict[str, Any]] = None,
+    ) -> JobRecord:
         """Register a new job before execution."""
         job_id = uuid4().hex
         job = JobRecord(
@@ -662,6 +687,7 @@ class JobManager:
             source_type=source_type,
             source_value=source_value,
             config_path=config_path,
+            config_overrides=config_overrides,
         )
         self.jobs[job_id] = job
         return job
@@ -681,7 +707,14 @@ class JobManager:
         """Return the per-job output directory."""
         return self.get_job_dir(job_id) / "output"
 
-    async def run_job(self, job_id: str, source_path: str, source_type: str, config_path: str) -> None:
+    async def run_job(
+        self,
+        job_id: str,
+        source_path: str,
+        source_type: str,
+        config_path: str,
+        config_overrides: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Execute the modernization pipeline for a job."""
         job = self.get_job(job_id)
         output_dir = self.get_output_dir(job_id)
@@ -690,7 +723,11 @@ class JobManager:
         job.status = "running"
         job.started_at = _utc_now()
         try:
-            pipeline = PLSQLModernizationPipeline(config_path=config_path, output_directory=str(output_dir))
+            pipeline = PLSQLModernizationPipeline(
+                config_path=config_path,
+                output_directory=str(output_dir),
+                config_overrides=config_overrides,
+            )
             result = await pipeline.run_pipeline(source_path, source_type)
             job.status = "completed"
             job.result = result
@@ -708,6 +745,7 @@ class JobManager:
                 source_path=source_path,
                 source_type=job.source_type,
                 config_path=job.config_path,
+                config_overrides=job.config_overrides,
             )
         )
         self.tasks[job.job_id] = task
@@ -1105,9 +1143,14 @@ async def discover_tables_from_git(request: GitTableDiscoveryRequest) -> Dict[st
 async def create_file_job(
     source_file: UploadFile = File(...),
     config_path: str = Form("config.json"),
+    config_overrides: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
     """Create a job from an uploaded local SQL/PLSQL file."""
-    job = job_manager.create_job("file", source_file.filename, config_path)
+    try:
+        overrides = _parse_config_overrides(config_overrides)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job = job_manager.create_job("file", source_file.filename, config_path, overrides)
     input_dir = job_manager.get_job_dir(job.job_id) / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
     saved_path = input_dir / (source_file.filename or "uploaded.sql")
@@ -1119,7 +1162,12 @@ async def create_file_job(
 @app.post("/api/jobs/file-path")
 async def create_file_path_job(request: FilePathConversionRequest) -> Dict[str, Any]:
     """Create a job from a server-local file or directory path."""
-    job = job_manager.create_job("file", request.source_path, request.config_path)
+    job = job_manager.create_job(
+        "file",
+        request.source_path,
+        request.config_path,
+        request.config_overrides,
+    )
     job_manager.start_job(job, request.source_path)
     return job_manager.serialize_job(job)
 
@@ -1127,7 +1175,12 @@ async def create_file_path_job(request: FilePathConversionRequest) -> Dict[str, 
 @app.post("/api/jobs/git")
 async def create_git_job(request: GitConversionRequest) -> Dict[str, Any]:
     """Create a job from a git repository URL."""
-    job = job_manager.create_job("git", request.repo_url, request.config_path)
+    job = job_manager.create_job(
+        "git",
+        request.repo_url,
+        request.config_path,
+        request.config_overrides,
+    )
     job_manager.start_job(job, request.repo_url)
     return job_manager.serialize_job(job)
 
@@ -1135,7 +1188,12 @@ async def create_git_job(request: GitConversionRequest) -> Dict[str, Any]:
 @app.post("/api/jobs/database")
 async def create_database_job(request: DatabaseConversionRequest) -> Dict[str, Any]:
     """Create a job from an Oracle connection string."""
-    job = job_manager.create_job("database", request.connection_string, request.config_path)
+    job = job_manager.create_job(
+        "database",
+        request.connection_string,
+        request.config_path,
+        request.config_overrides,
+    )
     job_manager.start_job(job, request.connection_string)
     return job_manager.serialize_job(job)
 
@@ -1144,7 +1202,12 @@ async def create_database_job(request: DatabaseConversionRequest) -> Dict[str, A
 async def create_oracle_conversion_job(request: OracleConvertRequest) -> Dict[str, Any]:
     """Create a conversion job from structured Oracle connection details."""
     connection_string = _build_oracle_connection_string(request)
-    job = job_manager.create_job("database", connection_string, request.config_path)
+    job = job_manager.create_job(
+        "database",
+        connection_string,
+        request.config_path,
+        request.config_overrides,
+    )
     job_manager.start_job(job, connection_string)
     return job_manager.serialize_job(job)
 

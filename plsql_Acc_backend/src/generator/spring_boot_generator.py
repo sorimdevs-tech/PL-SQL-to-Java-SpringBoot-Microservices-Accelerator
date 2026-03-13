@@ -54,9 +54,15 @@ class SpringBootGenerator:
         """
         self.config = config
         self.project_name = config.get('project_name', 'converted-app')
+        self.group_id = config.get('group_id', 'com.company')
+        self.artifact_id = config.get('artifact_id', self.project_name)
         self.package_name = config.get('package_name', 'com.company.project')
+        self.description = config.get('description', 'PL/SQL to Java Modernization Project')
         self.java_version = config.get('java_version', '17')
         self.spring_boot_version = config.get('spring_boot_version', '3.1.0')
+        self.build_tool = self._normalize_build_tool(config.get('build_tool', 'maven'))
+        self.packaging = self._normalize_packaging(config.get('packaging', 'jar'))
+        self.config_format = self._normalize_config_format(config.get('config_format', 'properties'))
         self.target_directory = Path(config.get('target_directory', './output'))
         
         # Create standard Spring Boot source layout.
@@ -139,18 +145,16 @@ class SpringBootGenerator:
     
     def _generate_build_config(self):
         """Generate Maven POM or Gradle build file"""
-        # Generate Maven POM
-        pom_content = self._generate_pom_content()
-        pom_path = self.target_directory / 'pom.xml'
-        with open(pom_path, 'w', encoding='utf-8') as f:
-            f.write(pom_content)
-        
-        # Keep Gradle generation code available, but only emit build.gradle when explicitly enabled.
-        if self.config.get('generate_gradle', False):
+        if self.build_tool == "gradle":
             gradle_content = self._generate_gradle_content()
             gradle_path = self.target_directory / 'build.gradle'
             with open(gradle_path, 'w', encoding='utf-8') as f:
                 f.write(gradle_content)
+        else:
+            pom_content = self._generate_pom_content()
+            pom_path = self.target_directory / 'pom.xml'
+            with open(pom_path, 'w', encoding='utf-8') as f:
+                f.write(pom_content)
         
         logger.info("Build configuration files generated")
     
@@ -170,11 +174,12 @@ class SpringBootGenerator:
         <relativePath/>
     </parent>
 
-    <groupId>{self.package_name}</groupId>
-    <artifactId>{self.project_name}</artifactId>
+    <groupId>{self.group_id}</groupId>
+    <artifactId>{self.artifact_id}</artifactId>
     <version>1.0.0</version>
     <name>{self.project_name}</name>
-    <description>PL/SQL to Java Modernization Project</description>
+    <description>{self.description}</description>
+    <packaging>{self.packaging}</packaging>
 
     <properties>
         <java.version>{self.java_version}</java.version>
@@ -275,14 +280,28 @@ class SpringBootGenerator:
     
     def _generate_gradle_content(self) -> str:
         """Generate Gradle build file content"""
+        war_plugin = "    id 'war'\n" if self.packaging == "war" else ""
+        war_tasks = ""
+        if self.packaging == "war":
+            war_tasks = """
+
+bootJar {
+    enabled = false
+}
+
+bootWar {
+    enabled = true
+}
+"""
         return f"""plugins {{
     id 'org.springframework.boot' version '{self.spring_boot_version}'
     id 'io.spring.dependency-management' version '1.1.3'
     id 'java'
-}}
+{war_plugin}}}
 
-group = '{self.package_name}'
+group = '{self.group_id}'
 version = '1.0.0'
+description = '{self.description}'
 
 java {{
     sourceCompatibility = JavaVersion.VERSION_{self.java_version}
@@ -313,21 +332,21 @@ dependencies {{
 tasks.named('test') {{
     useJUnitPlatform()
 }}
+{war_tasks}
 """
     
     def _generate_application_config(self):
         """Generate Spring Boot application configuration"""
-        # Generate application.yml
-        app_config = self._generate_application_yml()
-        config_path = self.resources_path / 'application.yml'
-        with open(config_path, 'w', encoding='utf-8') as f:
-            f.write(app_config)
-        
-        # Generate application.properties (alternative)
-        app_props = self._generate_application_properties()
-        props_path = self.resources_path / 'application.properties'
-        with open(props_path, 'w', encoding='utf-8') as f:
-            f.write(app_props)
+        if self.config_format == "yaml":
+            app_config = self._generate_application_yml()
+            config_path = self.resources_path / 'application.yml'
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.write(app_config)
+        else:
+            app_props = self._generate_application_properties()
+            props_path = self.resources_path / 'application.properties'
+            with open(props_path, 'w', encoding='utf-8') as f:
+                f.write(app_props)
         
         logger.info("Application configuration files generated")
     
@@ -369,7 +388,7 @@ spring:
 # Custom Application Properties
 app:
   version: 1.0.0
-  description: PL/SQL to Java Modernization Project
+  description: {self.description}
   build-time: {self._get_current_time()}
 """
     
@@ -400,9 +419,27 @@ logging.level.org.springframework.data.jpa.repository=DEBUG
 
 # Custom Application Properties
 app.version=1.0.0
-app.description=PL/SQL to Java Modernization Project
+app.description={self.description}
 app.build-time={self._get_current_time()}
 """
+
+    def _normalize_build_tool(self, value: str) -> str:
+        if not value:
+            return "maven"
+        lowered = str(value).strip().lower()
+        if lowered in {"mvn", "maven"}:
+            return "maven"
+        if lowered in {"gradle", "gradle-groovy", "gradle-kotlin"}:
+            return "gradle"
+        return "maven"
+
+    def _normalize_packaging(self, value: str) -> str:
+        lowered = str(value or "").strip().lower()
+        return "war" if lowered == "war" else "jar"
+
+    def _normalize_config_format(self, value: str) -> str:
+        lowered = str(value or "").strip().lower()
+        return "yaml" if lowered in {"yaml", "yml"} else "properties"
     
     def _generate_java_files(self, java_code: Dict[str, str]) -> Dict[str, str]:
         """Generate Java source files"""

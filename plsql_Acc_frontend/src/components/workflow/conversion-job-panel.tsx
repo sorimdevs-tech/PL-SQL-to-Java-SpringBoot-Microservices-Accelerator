@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Download, FileText, LoaderCircle, Play, RefreshCcw } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
@@ -14,7 +14,7 @@ import {
   getJobStatus,
 } from "@/lib/jobs-api"
 import { startOracleConvert } from "@/lib/oracle-api"
-import type { ConversionJob, GeneratedFile } from "@/types/jobs-api"
+import type { ConfigOverrides, ConversionJob, GeneratedFile } from "@/types/jobs-api"
 
 type SourceMethod = "git" | "oracle" | "sqlfile"
 
@@ -24,6 +24,7 @@ export interface ConversionSnapshot {
   outputDirectory: string
   generatedFiles: string[]
   backendSummary?: string
+  backendSummaryData?: Record<string, unknown>
 }
 
 interface ConversionJobPanelProps {
@@ -37,6 +38,17 @@ interface ConversionJobPanelProps {
   dbUsername: string
   dbPassword: string
   dbConfigPath: string
+  springBootVersion: string
+  javaVersion: string
+  buildTool: "mvn" | "gradle"
+  packaging: "jar" | "war"
+  springConfigFormat: "properties" | "yaml"
+  projectGroup: string
+  projectArtifact: string
+  projectDisplayName: string
+  projectDescription: string
+  projectPackageName: string
+  onConversionStart: () => void
   onSnapshotChange: (snapshot: ConversionSnapshot | null) => void
 }
 
@@ -66,23 +78,69 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
   const [isCheckingHealth, setIsCheckingHealth] = useState(false)
   const [isBackendHealthy, setIsBackendHealthy] = useState<boolean | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [logs, setLogs] = useState<{ id: string; message: string; time: string }[]>([])
+  const [progressStage, setProgressStage] = useState<"idle" | "queued" | "running" | "completed" | "failed">("idle")
+  const lastStatusRef = useRef<string | null>(null)
+  const [conversionStarted, setConversionStarted] = useState(false)
 
   const isPolling = job?.status === "queued" || job?.status === "running"
 
   useEffect(() => {
     if (!job?.job_id) {
       onSnapshotChange(null)
+      setProgressStage("idle")
       return
     }
+    const rawSummary = job.result?.summary
+    const backendSummary =
+      typeof rawSummary === "string"
+        ? rawSummary
+        : rawSummary
+          ? JSON.stringify(rawSummary, null, 2)
+          : undefined
+    const backendSummaryData =
+      rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)
+        ? (rawSummary as Record<string, unknown>)
+        : undefined
     onSnapshotChange({
       jobId: job.job_id,
       status: job.status,
       outputDirectory:
         job.result?.output_directory ?? job.output_directory ?? "Output directory not available yet",
       generatedFiles: generatedFiles.map((file) => file.path),
-      backendSummary: job.result?.summary,
+      backendSummary,
+      backendSummaryData,
     })
   }, [generatedFiles, job, onSnapshotChange])
+
+  useEffect(() => {
+    if (!job) {
+      return
+    }
+    if (lastStatusRef.current !== job.status) {
+      const now = new Date()
+      const time = now.toLocaleTimeString()
+      const message =
+        job.status === "queued"
+          ? "Job queued. Preparing pipeline..."
+          : job.status === "running"
+            ? "Pipeline running. Generating Spring Boot project..."
+            : job.status === "completed"
+              ? "Generation complete. Output is ready."
+              : job.status === "failed"
+                ? `Job failed: ${job.error ?? "Unknown error"}`
+                : `Status update: ${job.status}`
+      setLogs((prev) => [{ id: `${job.job_id}-${job.status}-${time}`, message, time }, ...prev].slice(0, 12))
+      lastStatusRef.current = job.status
+    }
+    if (job.status === "queued" || job.status === "running") {
+      setProgressStage(job.status)
+    } else if (job.status === "completed") {
+      setProgressStage("completed")
+    } else if (job.status === "failed") {
+      setProgressStage("failed")
+    }
+  }, [job])
 
   const loadGeneratedFiles = useCallback(async (jobId: string) => {
     try {
@@ -184,18 +242,35 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
     setGeneratedFiles([])
     setSelectedFilePath("")
     setSelectedFileContent("")
-
+    setLogs([])
+    setProgressStage("queued")
+    props.onConversionStart()
+    setConversionStarted(true)
     try {
       setIsStarting(true)
       let createdJob: ConversionJob | null = null
       const configPath = props.dbConfigPath || "config.json"
+      const configOverrides: ConfigOverrides = {
+        output: {
+          project_name: props.projectDisplayName.trim() || props.projectArtifact.trim() || props.projectName,
+          group_id: props.projectGroup.trim() || "com.company",
+          artifact_id: props.projectArtifact.trim() || props.projectName,
+          package_name: props.projectPackageName.trim() || props.projectGroup.trim() || "com.company.project",
+          description: props.projectDescription.trim() || "PL/SQL to Java Modernization Project",
+          java_version: props.javaVersion,
+          spring_boot_version: props.springBootVersion,
+          build_tool: props.buildTool === "mvn" ? "maven" : "gradle",
+          packaging: props.packaging,
+          config_format: props.springConfigFormat,
+        },
+      }
 
       if (props.sourceMethod === "sqlfile") {
         if (!props.sourceFile) {
           setError("Select a local SQL file before starting conversion.")
           return
         }
-        createdJob = await createFileJob(props.sourceFile, configPath)
+        createdJob = await createFileJob(props.sourceFile, configPath, configOverrides)
       } else if (props.sourceMethod === "git") {
         if (!props.gitRepoUrl.trim()) {
           setError("Enter a valid Git repository URL.")
@@ -205,7 +280,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           setError("Backend health check failed. Ensure API server is running before starting Git conversion.")
           return
         }
-        createdJob = await createGitJob(props.gitRepoUrl.trim(), configPath)
+        createdJob = await createGitJob(props.gitRepoUrl.trim(), configPath, configOverrides)
       } else {
         const response = await startOracleConvert({
           host: props.dbHost.trim(),
@@ -214,6 +289,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           username: props.dbUsername.trim(),
           password: props.dbPassword,
           config_path: configPath,
+          config_overrides: configOverrides,
         })
 
         const maybeJob = response as Partial<ConversionJob>
@@ -230,6 +306,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Failed to start conversion.")
+      setProgressStage("failed")
     } finally {
       setIsStarting(false)
     }
@@ -260,20 +337,31 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
         ) : null}
 
         <div className="flex flex-wrap items-center gap-2">
-          <Button
-            variant="secondary"
-            onClick={startConversion}
-            disabled={isStarting || (props.sourceMethod === "git" && (isCheckingHealth || isBackendHealthy === false))}
-          >
-            {isStarting ? (
+          {isStarting ? (
+            <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/30 bg-white/10 px-4 text-sm font-semibold text-white">
               <LoaderCircle className="h-4 w-4 animate-spin" />
-            ) : (
-              <>
-                <Play className="h-4 w-4" />
-                Start Conversion
-              </>
-            )}
-          </Button>
+              Starting...
+            </div>
+          ): job?.status === "completed" ? (
+            <Badge className="inline-flex items-center gap-2 rounded-full border border-emerald-400/40 bg-emerald-500/15 px-4 py-1.5 text-sm font-semibold text-emerald-300 backdrop-blur-sm">
+              <span className="h-2 w-2 rounded-full bg-emerald-400"></span>
+              Completed
+            </Badge>
+          ) : conversionStarted && !isStarting ? (
+            <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/30 bg-white/10 px-4 text-sm font-semibold text-white">
+              <LoaderCircle className="h-4 w-4 animate-spin" />
+              Converting...
+            </div>
+           ) :(
+            <Button
+              variant="secondary"
+              onClick={startConversion}
+              disabled={props.sourceMethod === "git" && (isCheckingHealth || isBackendHealthy === false)}
+            >
+              <Play className="h-4 w-4" />
+              Start Conversion
+            </Button>
+          )}
           {job?.job_id ? (
             <Button variant="outline" onClick={() => void refreshJobStatus(job.job_id, true)} disabled={isRefreshing}>
               {isRefreshing ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
@@ -291,6 +379,24 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           ) : null}
         </div>
 
+        {progressStage !== "idle" ? (
+          <div className="rounded-xl border border-white/20 bg-white/10 p-3">
+            <div className="flex items-center justify-between text-xs text-slate-200">
+              <span>Application creation</span>
+              <span className="uppercase tracking-wide">{progressStage}</span>
+            </div>
+            <div className="relative mt-2 h-2 overflow-hidden rounded-full bg-white/20">
+              {progressStage === "completed" ? (
+                <div className="h-full w-full bg-emerald-400" />
+              ) : progressStage === "failed" ? (
+                <div className="h-full w-full bg-rose-500" />
+              ) : (
+                <div className="progress-stripe" />
+              )}
+            </div>
+          </div>
+        ) : null}
+
         {job ? (
           <div className="rounded-xl border border-white/20 bg-white/10 p-3">
             <div className="flex flex-wrap items-center gap-2">
@@ -299,6 +405,27 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
             </div>
             <p className="mt-1 text-xs text-slate-200">Source: {job.source_type}</p>
             {job.error ? <p className="mt-2 text-xs font-medium text-rose-200">{job.error}</p> : null}
+          </div>
+        ) : null}
+
+        {logs.length > 0 ? (
+          <div className="rounded-xl border border-white/20 bg-white/10 p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-200">Backend Logs</p>
+            <div className="mt-2 space-y-2">
+              {logs.map((entry, index) => (
+                <div
+                  key={entry.id}
+                  className="animate-rise rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-100 transition"
+                  style={{ animationDelay: `${index * 60}ms` }}
+                >
+                  <div className="flex items-center justify-between text-[11px] text-slate-300">
+                    <span>{entry.time}</span>
+                    <span>pipeline</span>
+                  </div>
+                  <p className="mt-1 text-sm text-slate-100">{entry.message}</p>
+                </div>
+              ))}
+            </div>
           </div>
         ) : null}
 
