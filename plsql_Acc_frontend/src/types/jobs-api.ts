@@ -18,6 +18,7 @@ export interface OutputConfigOverrides {
   build_tool?: "maven" | "gradle" | "mvn"
   packaging?: "jar" | "war"
   config_format?: "properties" | "yaml"
+  target_directory?: string
 }
 
 export interface ConfigOverrides {

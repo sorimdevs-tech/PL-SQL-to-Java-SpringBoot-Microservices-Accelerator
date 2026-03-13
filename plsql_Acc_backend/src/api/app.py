@@ -40,6 +40,7 @@ class JobRecord:
     source_value: str
     config_path: str
     config_overrides: Optional[Dict[str, Any]] = None
+    output_directory: Optional[str] = None
     status: str = "queued"
     created_at: str = field(default_factory=_utc_now)
     started_at: Optional[str] = None
@@ -54,6 +55,7 @@ class GitConversionRequest(BaseModel):
     repo_url: str = Field(..., min_length=1)
     config_path: str = "config.json"
     config_overrides: Optional[Dict[str, Any]] = None
+    output_directory: Optional[str] = None
 
 
 class DatabaseConversionRequest(BaseModel):
@@ -62,6 +64,7 @@ class DatabaseConversionRequest(BaseModel):
     connection_string: str = Field(..., min_length=1)
     config_path: str = "config.json"
     config_overrides: Optional[Dict[str, Any]] = None
+    output_directory: Optional[str] = None
 
 
 class FilePathConversionRequest(BaseModel):
@@ -70,6 +73,7 @@ class FilePathConversionRequest(BaseModel):
     source_path: str = Field(..., min_length=1)
     config_path: str = "config.json"
     config_overrides: Optional[Dict[str, Any]] = None
+    output_directory: Optional[str] = None
 
 
 class OracleConnectionRequest(BaseModel):
@@ -96,6 +100,7 @@ class OracleConvertRequest(OracleConnectionRequest):
 
     config_path: str = "config.json"
     config_overrides: Optional[Dict[str, Any]] = None
+    output_directory: Optional[str] = None
 
 
 class GitTableDiscoveryRequest(BaseModel):
@@ -104,6 +109,14 @@ class GitTableDiscoveryRequest(BaseModel):
     repo_url: str = Field(..., min_length=1)
     branch: Optional[str] = None
     path_filters: List[str] = Field(default_factory=list)
+
+
+class GitRepoTreeRequest(BaseModel):
+    """Request body for git repo tree browsing."""
+
+    repo_url: str = Field(..., min_length=1)
+    branch: Optional[str] = None
+    path: Optional[str] = None
 
 
 class DiscoveryAnalyzeRequest(BaseModel):
@@ -198,7 +211,7 @@ def _discover_tables_from_git(request: GitTableDiscoveryRequest) -> Dict[str, An
     except ImportError as exc:
         raise RuntimeError("GitPython is required for git discovery endpoint") from exc
 
-    temp_root = Path.cwd() / ".tmp"
+    temp_root = Path(tempfile.gettempdir()) / "plsql_acc_tmp"
     temp_root.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="discovery_", dir=temp_root) as temp_dir:
@@ -240,10 +253,61 @@ def _discover_tables_from_git(request: GitTableDiscoveryRequest) -> Dict[str, An
             raise SQLDiscoveryParseError("; ".join(parse_errors[:5]))
 
         tables = sorted(discovered_tables)
+    return {
+        "tables": tables,
+        "files_scanned": len(target_files),
+        "count": len(tables),
+    }
+
+
+def _list_git_tree(request: GitRepoTreeRequest) -> Dict[str, Any]:
+    """Clone a repo and return the immediate children for a path."""
+    if not _is_valid_repo_url(request.repo_url):
+        raise ValueError("Invalid repo_url. Use an HTTPS or SSH git URL.")
+
+    try:
+        import git
+    except ImportError as exc:
+        raise RuntimeError("GitPython is required for git tree endpoint") from exc
+
+    temp_root = Path(tempfile.gettempdir()) / "plsql_acc_tmp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="tree_", dir=temp_root) as temp_dir:
+        repo_dir = Path(temp_dir) / "repo"
+        clone_kwargs: Dict[str, Any] = {"depth": 1, "single_branch": True}
+        if request.branch:
+            clone_kwargs["branch"] = request.branch
+
+        try:
+            git.Repo.clone_from(request.repo_url, str(repo_dir), **clone_kwargs)
+        except git.exc.GitCommandError as exc:
+            error_text = str(exc).lower()
+            if any(token in error_text for token in ("not found", "repository", "remote branch", "pathspec")):
+                raise FileNotFoundError(f"Repository or branch not found: {request.repo_url}") from exc
+            raise RuntimeError(f"Failed to clone repository: {exc}") from exc
+
+        rel_path = (request.path or "").strip().lstrip("/").lstrip("./")
+        target = (repo_dir / rel_path).resolve() if rel_path else repo_dir
+        if not target.exists():
+            raise FileNotFoundError("Requested path not found in repository")
+        if target.is_file():
+            target = target.parent
+
+        entries = []
+        for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+            entries.append(
+                {
+                    "name": item.name,
+                    "path": item.relative_to(repo_dir).as_posix(),
+                    "type": "dir" if item.is_dir() else "file",
+                }
+            )
+
         return {
-            "tables": tables,
-            "files_scanned": len(target_files),
-            "count": len(tables),
+            "path": rel_path,
+            "entries": entries,
+            "count": len(entries),
         }
 
 
@@ -679,6 +743,7 @@ class JobManager:
         source_value: str,
         config_path: str,
         config_overrides: Optional[Dict[str, Any]] = None,
+        output_directory: Optional[str] = None,
     ) -> JobRecord:
         """Register a new job before execution."""
         job_id = uuid4().hex
@@ -688,6 +753,7 @@ class JobManager:
             source_value=source_value,
             config_path=config_path,
             config_overrides=config_overrides,
+            output_directory=output_directory,
         )
         self.jobs[job_id] = job
         return job
@@ -705,6 +771,9 @@ class JobManager:
 
     def get_output_dir(self, job_id: str) -> Path:
         """Return the per-job output directory."""
+        job = self.get_job(job_id)
+        if job.output_directory:
+            return Path(job.output_directory)
         return self.get_job_dir(job_id) / "output"
 
     async def run_job(
@@ -874,6 +943,33 @@ async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+def _pick_directory() -> Optional[str]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError("Tkinter is required for folder picker") from exc
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    selected = filedialog.askdirectory()
+    root.destroy()
+    return selected or None
+
+
+@app.get("/api/paths/pick-directory")
+async def pick_directory() -> Dict[str, Optional[str]]:
+    """Open a local folder picker on the backend host and return the selected path."""
+    try:
+        path = await asyncio.to_thread(_pick_directory)
+        return {"path": path}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/api/discovery/upload")
 async def upload_discovery_file(source_file: Optional[UploadFile] = File(None)) -> Dict[str, Any]:
     """Upload a SQL/PLSQL source file for discovery analysis."""
@@ -910,7 +1006,7 @@ def _collect_git_sql_text(request: DiscoveryAnalyzeRequest) -> str:
     except ImportError as exc:
         raise RuntimeError("GitPython is required for git discovery endpoint") from exc
 
-    temp_root = Path.cwd() / ".tmp"
+    temp_root = Path(tempfile.gettempdir()) / "plsql_acc_tmp"
     temp_root.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="discovery_", dir=temp_root) as temp_dir:
@@ -1139,18 +1235,32 @@ async def discover_tables_from_git(request: GitTableDiscoveryRequest) -> Dict[st
         raise HTTPException(status_code=500, detail=f"Internal server error: {exc}") from exc
 
 
+@app.post("/api/discovery/git/tree")
+async def list_git_tree(request: GitRepoTreeRequest) -> Dict[str, Any]:
+    """List folders/files for a git repository path."""
+    try:
+        return await asyncio.to_thread(_list_git_tree, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {exc}") from exc
+
+
 @app.post("/api/jobs/file")
 async def create_file_job(
     source_file: UploadFile = File(...),
     config_path: str = Form("config.json"),
     config_overrides: Optional[str] = Form(None),
+    output_directory: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
     """Create a job from an uploaded local SQL/PLSQL file."""
     try:
         overrides = _parse_config_overrides(config_overrides)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    job = job_manager.create_job("file", source_file.filename, config_path, overrides)
+    job = job_manager.create_job("file", source_file.filename, config_path, overrides, output_directory)
     input_dir = job_manager.get_job_dir(job.job_id) / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
     saved_path = input_dir / (source_file.filename or "uploaded.sql")
@@ -1167,6 +1277,7 @@ async def create_file_path_job(request: FilePathConversionRequest) -> Dict[str, 
         request.source_path,
         request.config_path,
         request.config_overrides,
+        request.output_directory,
     )
     job_manager.start_job(job, request.source_path)
     return job_manager.serialize_job(job)
@@ -1180,6 +1291,7 @@ async def create_git_job(request: GitConversionRequest) -> Dict[str, Any]:
         request.repo_url,
         request.config_path,
         request.config_overrides,
+        request.output_directory,
     )
     job_manager.start_job(job, request.repo_url)
     return job_manager.serialize_job(job)
@@ -1193,6 +1305,7 @@ async def create_database_job(request: DatabaseConversionRequest) -> Dict[str, A
         request.connection_string,
         request.config_path,
         request.config_overrides,
+        request.output_directory,
     )
     job_manager.start_job(job, request.connection_string)
     return job_manager.serialize_job(job)
@@ -1207,6 +1320,7 @@ async def create_oracle_conversion_job(request: OracleConvertRequest) -> Dict[st
         connection_string,
         request.config_path,
         request.config_overrides,
+        request.output_directory,
     )
     job_manager.start_job(job, connection_string)
     return job_manager.serialize_job(job)

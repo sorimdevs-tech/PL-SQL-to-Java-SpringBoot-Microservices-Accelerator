@@ -176,6 +176,65 @@ def _extract_operations_and_tables(block_text: str) -> Dict[str, Any]:
     return {"operations": sorted(operations), "tables": sorted(tables)}
 
 
+def _extract_table_aliases(block_text: str) -> Dict[str, str]:
+    aliases: Dict[str, str] = {}
+    for match in re.finditer(
+        r"\b(?:from|join)\s+([`\"\w$#\.]+)\s*(?:as\s+)?([A-Za-z_][\w$#]*)?",
+        block_text,
+        flags=re.IGNORECASE,
+    ):
+        table = _normalize_identifier(match.group(1)).upper()
+        alias = match.group(2)
+        aliases[table] = table
+        if alias:
+            aliases[alias.upper()] = table
+    return aliases
+
+
+def _extract_table_columns(block_text: str, tables: Sequence[str]) -> Dict[str, List[str]]:
+    aliases = _extract_table_aliases(block_text)
+    normalized_tables = {table.upper() for table in tables}
+    columns: Dict[str, Set[str]] = {table: set() for table in normalized_tables}
+    for match in re.finditer(r"\b([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#]*)", block_text):
+        prefix = match.group(1).upper()
+        column = match.group(2).upper()
+        table = aliases.get(prefix, prefix)
+        if table in normalized_tables:
+            columns.setdefault(table, set()).add(column)
+    return {table: sorted(values) for table, values in columns.items()}
+
+
+def _extract_table_relationships(block_text: str) -> List[Dict[str, str]]:
+    aliases = _extract_table_aliases(block_text)
+    relationships: List[Dict[str, str]] = []
+    pattern = re.compile(
+        r"\bjoin\s+([`\"\w$#\.]+)\s*(?:as\s+)?([A-Za-z_][\w$#]*)?\s+on\s+"
+        r"([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#]*)\s*=\s*"
+        r"([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#]*)",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(block_text):
+        right_table = _normalize_identifier(match.group(1)).upper()
+        right_alias = match.group(2)
+        left_alias = match.group(3).upper()
+        left_column = match.group(4).upper()
+        right_alias_ref = match.group(5).upper()
+        right_column = match.group(6).upper()
+        left_table = aliases.get(left_alias, left_alias)
+        right_table_resolved = aliases.get(right_alias_ref, right_alias_ref)
+        if right_alias:
+            aliases[right_alias.upper()] = right_table
+        relationships.append(
+            {
+                "fromTable": left_table,
+                "fromColumn": left_column,
+                "toTable": right_table_resolved,
+                "toColumn": right_column,
+            }
+        )
+    return relationships
+
+
 def _extract_local_variables(block_text: str) -> List[Dict[str, str]]:
     declaration_section = ""
     header_end = re.search(r"\b(?:is|as)\b", block_text, flags=re.IGNORECASE)
@@ -260,6 +319,8 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
         params = _extract_parameters(item.block_text)
         operations_tables = _extract_operations_and_tables(item.block_text)
         tables_used = operations_tables["tables"]
+        table_columns = _extract_table_columns(item.block_text, tables_used)
+        table_relationships = _extract_table_relationships(item.block_text)
         entry: Dict[str, Any] = {
             "procedureName": item.object_name,
             "objectType": item.object_type,
@@ -272,6 +333,12 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
             "dependencyGraph": {
                 "tablesUsed": tables_used,
                 "proceduresCalled": _extract_procedure_calls(item.block_text, item.object_name),
+            },
+            "tableDetails": {
+                "tables": [
+                    {"name": table, "columns": table_columns.get(table, [])} for table in tables_used
+                ],
+                "relationships": table_relationships,
             },
         }
         entry["conversionPreview"] = _build_conversion_preview(item.object_name, tables_used)

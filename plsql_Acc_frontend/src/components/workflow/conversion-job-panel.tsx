@@ -48,6 +48,7 @@ interface ConversionJobPanelProps {
   projectDisplayName: string
   projectDescription: string
   projectPackageName: string
+  outputDirectory: string
   onConversionStart: () => void
   onSnapshotChange: (snapshot: ConversionSnapshot | null) => void
 }
@@ -262,15 +263,17 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           build_tool: props.buildTool === "mvn" ? "maven" : "gradle",
           packaging: props.packaging,
           config_format: props.springConfigFormat,
+          target_directory: props.outputDirectory.trim() || undefined,
         },
       }
+      const outputDirectory = props.outputDirectory.trim() || undefined
 
       if (props.sourceMethod === "sqlfile") {
         if (!props.sourceFile) {
           setError("Select a local SQL file before starting conversion.")
           return
         }
-        createdJob = await createFileJob(props.sourceFile, configPath, configOverrides)
+        createdJob = await createFileJob(props.sourceFile, configPath, configOverrides, outputDirectory)
       } else if (props.sourceMethod === "git") {
         if (!props.gitRepoUrl.trim()) {
           setError("Enter a valid Git repository URL.")
@@ -280,7 +283,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           setError("Backend health check failed. Ensure API server is running before starting Git conversion.")
           return
         }
-        createdJob = await createGitJob(props.gitRepoUrl.trim(), configPath, configOverrides)
+        createdJob = await createGitJob(props.gitRepoUrl.trim(), configPath, configOverrides, outputDirectory)
       } else {
         const response = await startOracleConvert({
           host: props.dbHost.trim(),
@@ -290,6 +293,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           password: props.dbPassword,
           config_path: configPath,
           config_overrides: configOverrides,
+          output_directory: outputDirectory,
         })
 
         const maybeJob = response as Partial<ConversionJob>

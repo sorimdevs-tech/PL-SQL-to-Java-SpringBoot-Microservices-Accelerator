@@ -37,6 +37,7 @@ async function parseResponse<T>(response: Response): Promise<T> {
 export async function createDatabaseJob(
   payload: DatabaseJobRequest,
   configOverrides?: ConfigOverrides,
+  outputDirectory?: string,
 ): Promise<ConversionJob> {
   const connectionString = buildConnectionString(payload)
 
@@ -47,6 +48,7 @@ export async function createDatabaseJob(
       connection_string: connectionString,
       config_path: payload.configPath ?? "config.json",
       config_overrides: configOverrides,
+      output_directory: outputDirectory,
     }),
   })
 
@@ -57,12 +59,16 @@ export async function createFileJob(
   file: File,
   configPath = "config.json",
   configOverrides?: ConfigOverrides,
+  outputDirectory?: string,
 ): Promise<ConversionJob> {
   const formData = new FormData()
   formData.append("source_file", file)
   formData.append("config_path", configPath)
   if (configOverrides) {
     formData.append("config_overrides", JSON.stringify(configOverrides))
+  }
+  if (outputDirectory) {
+    formData.append("output_directory", outputDirectory)
   }
 
   const response = await fetch(toApiUrl("/api/jobs/file"), {
@@ -77,6 +83,7 @@ export async function createGitJob(
   repoUrl: string,
   configPath = "config.json",
   configOverrides?: ConfigOverrides,
+  outputDirectory?: string,
 ): Promise<ConversionJob> {
   const response = await fetch(toApiUrl("/api/jobs/git"), {
     method: "POST",
@@ -85,6 +92,7 @@ export async function createGitJob(
       repo_url: repoUrl,
       config_path: configPath,
       config_overrides: configOverrides,
+      output_directory: outputDirectory,
     }),
   })
 
@@ -133,4 +141,10 @@ export function getJobDownloadUrl(jobId: string): string {
 export async function getBackendHealth(): Promise<{ status: string }> {
   const response = await fetch(toApiUrl("/health"))
   return parseResponse<{ status: string }>(response)
+}
+
+export async function pickOutputDirectory(): Promise<string | null> {
+  const response = await fetch(toApiUrl("/api/paths/pick-directory"))
+  const data = await parseResponse<{ path?: string | null }>(response)
+  return data.path ?? null
 }

@@ -40,6 +40,35 @@ export interface SqlConversionPreview {
   dtos: string[]
 }
 
+export interface SqlTableDetail {
+  name: string
+  columns: string[]
+}
+
+export interface SqlTableRelationship {
+  fromTable: string
+  fromColumn: string
+  toTable: string
+  toColumn: string
+}
+
+export interface SqlTableDetails {
+  tables: SqlTableDetail[]
+  relationships: SqlTableRelationship[]
+}
+
+export interface GitTreeEntry {
+  name: string
+  path: string
+  type: "dir" | "file"
+}
+
+export interface GitRepoTreeResponse {
+  path: string
+  entries: GitTreeEntry[]
+  count?: number
+}
+
 export interface SqlDiscoveryAnalyzeResponse {
   procedureName: string
   objectType: string
@@ -54,6 +83,7 @@ export interface SqlDiscoveryAnalyzeResponse {
   complexity?: SqlComplexityMetrics
   dependencyGraph?: SqlDependencyGraph
   conversionPreview?: SqlConversionPreview
+  tableDetails?: SqlTableDetails
   objects?: SqlDiscoveryObject[]
   count?: number
   source?: string

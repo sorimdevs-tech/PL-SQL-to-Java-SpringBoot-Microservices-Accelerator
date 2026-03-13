@@ -1,5 +1,14 @@
 import { useEffect, useState } from "react"
-import { Database, FileCode2, GitBranch, LoaderCircle, RefreshCcw } from "lucide-react"
+import {
+  ChevronLeft,
+  ChevronRight,
+  Database,
+  FileCode2,
+  Folder,
+  GitBranch,
+  LoaderCircle,
+  RefreshCcw,
+} from "lucide-react"
 
 import { ConversionJobPanel, type ConversionSnapshot } from "@/components/workflow/conversion-job-panel"
 import { OracleDiscovery } from "@/components/workflow/oracle-discovery"
@@ -8,7 +17,13 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input"
 import { strategyOptions, workflowSteps } from "@/data/converter-workflow"
 import { testOracleConnection } from "@/lib/oracle-api"
-import { analyzeUploadedSqlFile, uploadSqlDiscoveryFile } from "@/lib/sql-discovery-api"
+import {
+  analyzeGitSqlSource,
+  analyzeUploadedSqlFile,
+  getGitRepoTree,
+  uploadSqlDiscoveryFile,
+} from "@/lib/sql-discovery-api"
+import { pickOutputDirectory } from "@/lib/jobs-api"
 import type { OracleConnectionPayload } from "@/types/oracle-api"
 import type { SqlDiscoveryAnalyzeResponse } from "@/types/sql-discovery-api"
 
@@ -291,8 +306,14 @@ function SqlSourceDiscovery(props: {
   setSelectedProcedures: (procedures: string[]) => void
 }) {
   const [analysis, setAnalysis] = useState<SqlDiscoveryAnalyzeResponse | null>(null)
+  const [selectedTable, setSelectedTable] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [gitStep, setGitStep] = useState<1 | 2>(1)
+  const [gitPath, setGitPath] = useState("")
+  const [gitEntries, setGitEntries] = useState<{ name: string; path: string; type: "dir" | "file" }[]>([])
+  const [gitTreeError, setGitTreeError] = useState<string | null>(null)
+  const [isLoadingTree, setIsLoadingTree] = useState(false)
 
   useEffect(() => {
     if (props.sourceMethod !== "sqlfile") {
@@ -366,10 +387,25 @@ function SqlSourceDiscovery(props: {
   ])
 
   useEffect(() => {
+    const tables = analysis?.tableDetails?.tables ?? []
+    if (!tables.length) {
+      setSelectedTable(null)
+      return
+    }
+    if (!selectedTable || !tables.some((table) => table.name === selectedTable)) {
+      setSelectedTable(tables[0].name)
+    }
+  }, [analysis, selectedTable])
+
+  useEffect(() => {
     if (props.sourceMethod !== "git") {
       return
     }
     setAnalysis(null)
+    setGitStep(1)
+    setGitPath("")
+    setGitEntries([])
+    setGitTreeError(null)
     props.setAvailableObjects([])
     props.setSelectedObjects([])
     props.setAvailableProcedures([])
@@ -378,7 +414,45 @@ function SqlSourceDiscovery(props: {
       setError("Provide a Git repository URL in Connect step to discover SQL tables.")
       return
     }
-    setError("Git SQL discovery API is not connected yet. Use SQL file mode or wire backend git discovery endpoint.")
+
+    let isCancelled = false
+
+    async function analyzeGitRepo() {
+      try {
+        setIsLoading(true)
+        const analyzed = await analyzeGitSqlSource(props.gitRepoUrl.trim())
+        if (isCancelled) {
+          return
+        }
+        setAnalysis(analyzed)
+        const objectNames = (analyzed.objects ?? []).map(
+          (item) => `${item.procedureName} (${item.objectType})`,
+        )
+        const procedureNames = (analyzed.objects ?? [])
+          .filter((item) => item.objectType.toUpperCase() === "PROCEDURE")
+          .map((item) => item.procedureName)
+        props.setAvailableObjects(objectNames)
+        props.setSelectedObjects(objectNames)
+        props.setAvailableProcedures(procedureNames)
+        props.setSelectedProcedures(procedureNames)
+        setError(null)
+      } catch (requestError) {
+        if (!isCancelled) {
+          setAnalysis(null)
+          setError(requestError instanceof Error ? requestError.message : "Failed to analyze Git repository.")
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoading(false)
+        }
+      }
+    }
+
+    void analyzeGitRepo()
+
+    return () => {
+      isCancelled = true
+    }
   }, [
     props.gitRepoUrl,
     props.setAvailableObjects,
@@ -388,9 +462,130 @@ function SqlSourceDiscovery(props: {
     props.sourceMethod,
   ])
 
+  useEffect(() => {
+    if (props.sourceMethod !== "git") {
+      return
+    }
+    if (!props.gitRepoUrl.trim()) {
+      return
+    }
+    let isCancelled = false
+    async function loadTree() {
+      try {
+        setIsLoadingTree(true)
+        const response = await getGitRepoTree(props.gitRepoUrl.trim(), undefined, gitPath || undefined)
+        if (isCancelled) {
+          return
+        }
+        setGitEntries(response.entries)
+        setGitTreeError(null)
+      } catch (requestError) {
+        if (!isCancelled) {
+          setGitTreeError(requestError instanceof Error ? requestError.message : "Failed to load repository tree.")
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingTree(false)
+        }
+      }
+    }
+    void loadTree()
+    return () => {
+      isCancelled = true
+    }
+  }, [gitPath, props.gitRepoUrl, props.sourceMethod])
+
   return (
     <div className="space-y-4">
-      {isLoading ? (
+      {props.sourceMethod === "git" ? (
+        <Card>
+          <CardContent className="flex items-center justify-between gap-3 p-4">
+            <div>
+              <p className="text-xs uppercase tracking-wide text-slate-500">Discovery Steps</p>
+              <p className="text-sm font-semibold text-slate-900">Step {gitStep} of 2</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setGitStep(1)}
+                className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition ${
+                  gitStep === 1 ? "border-cyan-400 bg-cyan-50 text-cyan-700" : "border-slate-200 text-slate-600"
+                }`}
+                aria-label="Project structure"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setGitStep(2)}
+                className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition ${
+                  gitStep === 2 ? "border-cyan-400 bg-cyan-50 text-cyan-700" : "border-slate-200 text-slate-600"
+                }`}
+                aria-label="Schema explorer"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {props.sourceMethod === "git" && gitStep === 1 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Project Folder Structure</CardTitle>
+            <CardDescription>Browse repository folders and files before discovery.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex items-center justify-between">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Path</p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setGitPath(gitPath.split("/").slice(0, -1).join("/"))}
+                disabled={!gitPath}
+              >
+                Up
+              </Button>
+            </div>
+            <div className="rounded-xl border border-slate-200 bg-white p-3">
+              <p className="text-xs text-slate-500">{gitPath || "/"}</p>
+              {gitTreeError ? <p className="mt-2 text-sm text-rose-600">{gitTreeError}</p> : null}
+              {isLoadingTree ? (
+                <p className="mt-3 inline-flex items-center gap-2 text-sm text-slate-600">
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                  Loading folders...
+                </p>
+              ) : (
+                <div className="mt-3 space-y-1">
+                  {gitEntries.map((entry) => (
+                    entry.name!==".git"&&(
+                    <button
+                      key={entry.path}
+                      onClick={() => {
+                        if (entry.type === "dir") {
+                          setGitPath(entry.path)
+                        }
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-sm text-slate-700 transition hover:bg-slate-50"
+                    >
+                      {entry.type === "dir" ? (
+                        <Folder className="h-4 w-4 text-cyan-600" />
+                      ) : (
+                        <FileCode2 className="h-4 w-4 text-slate-400" />
+                      )}
+                      <span>{entry.name}</span>
+                    </button>
+                  )))}
+                  {gitEntries.length === 0 ? <p className="text-sm text-slate-500">No files found.</p> : null}
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {isLoading && (props.sourceMethod !== "git" || gitStep === 2) ? (
         <Card>
           <CardContent className="p-4">
             <p className="inline-flex items-center gap-2 text-sm text-slate-600">
@@ -401,7 +596,7 @@ function SqlSourceDiscovery(props: {
         </Card>
       ) : null}
 
-      {error ? (
+      {error && (props.sourceMethod !== "git" || gitStep === 2) ? (
         <Card>
           <CardContent className="p-4">
             <p className="text-sm font-medium text-rose-700">{error}</p>
@@ -409,8 +604,212 @@ function SqlSourceDiscovery(props: {
         </Card>
       ) : null}
 
-      {analysis ? (
+      {analysis && (props.sourceMethod !== "git" || gitStep === 2) ? (
         <>
+          {analysis.tableDetails?.tables?.length ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>Schema Explorer</CardTitle>
+                <CardDescription>Tables, relationships, and local variables extracted from the SQL source</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-4 lg:grid-cols-[220px_1fr_260px]">
+                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Tables ({analysis.tableDetails.tables.length})</p>
+                  <div className="mt-2 space-y-1">
+                    {analysis.tableDetails.tables.map((table) => (
+                      <button
+                        key={table.name}
+                        onClick={() => setSelectedTable(table.name)}
+                        className={`flex w-full items-center justify-between rounded-lg px-2 py-1 text-left text-sm transition ${
+                          selectedTable === table.name
+                            ? "bg-cyan-50 text-cyan-900"
+                            : "text-slate-700 hover:bg-slate-50"
+                        }`}
+                      >
+                        <span>{table.name}</span>
+                        <span className="text-xs text-slate-400">{table.columns.length}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-white">
+                  <div className="absolute inset-0 bg-grid-pattern opacity-30" />
+                  <div className="relative h-full min-h-[320px] overflow-auto p-6">
+                    {(() => {
+                      const tables = analysis.tableDetails?.tables ?? []
+                      const relationships = analysis.tableDetails?.relationships ?? []
+                      const cardWidth = 220
+                      const cardHeight = 140
+                      const gapX = 80
+                      const gapY = 90
+                      const columns = 2
+                      const rows = Math.ceil(tables.length / columns)
+                      const width = columns * cardWidth + (columns - 1) * gapX + 40
+                      const height = rows * cardHeight + (rows - 1) * gapY + 40
+                      const positions = new Map<string, { x: number; y: number }>()
+                      tables.forEach((table, index) => {
+                        const col = index % columns
+                        const row = Math.floor(index / columns)
+                        positions.set(table.name, {
+                          x: 20 + col * (cardWidth + gapX),
+                          y: 20 + row * (cardHeight + gapY),
+                        })
+                      })
+
+                      return (
+                        <div className="relative" style={{ width, height }}>
+                          <svg className="absolute inset-0 h-full w-full">
+                            <defs>
+                              <marker
+                                id="arrow"
+                                viewBox="0 0 10 10"
+                                refX="9"
+                                refY="5"
+                                markerWidth="6"
+                                markerHeight="6"
+                                orient="auto-start-reverse"
+                              >
+                                <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8" />
+                              </marker>
+                            </defs>
+                            {relationships.map((rel, idx) => {
+                              const from = positions.get(rel.fromTable)
+                              const to = positions.get(rel.toTable)
+                              if (!from || !to) {
+                                return null
+                              }
+                              const startX = from.x + cardWidth
+                              const startY = from.y + cardHeight / 2
+                              const endX = to.x
+                              const endY = to.y + cardHeight / 2
+                              const midX = (startX + endX) / 2
+                              return (
+                                <path
+                                  key={`${rel.fromTable}-${rel.toTable}-${idx}`}
+                                  d={`M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`}
+                                  stroke="#94a3b8"
+                                  strokeWidth="1.5"
+                                  fill="none"
+                                  markerEnd="url(#arrow)"
+                                />
+                              )
+                            })}
+                          </svg>
+
+                          {tables.map((table) => {
+                            const pos = positions.get(table.name)
+                            if (!pos) {
+                              return null
+                            }
+                            return (
+                              <div
+                                key={table.name}
+                                className="absolute rounded-xl border border-slate-200 bg-white shadow-sm"
+                                style={{ width: cardWidth, height: cardHeight, left: pos.x, top: pos.y }}
+                              >
+                                <div className="rounded-t-xl border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
+                                  {table.name}
+                                </div>
+                                <div className="px-3 py-2 text-xs text-slate-600">
+                                  {table.columns.length > 0 ? (
+                                    <ul className="space-y-1">
+                                      {table.columns.slice(0, 6).map((col) => (
+                                        <li key={col}>{col}</li>
+                                      ))}
+                                    </ul>
+                                  ) : (
+                                    <p className="text-slate-400">No columns detected</p>
+                                  )}
+                                  {table.columns.length > 6 ? (
+                                    <p className="mt-1 text-[11px] text-slate-400">
+                                      +{table.columns.length - 6} more
+                                    </p>
+                                  ) : null}
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )
+                    })()}
+                  </div>
+                </div>
+                  <div className="rounded-xl border border-slate-200 bg-white p-3">
+                    <p className="text-xs uppercase tracking-wide text-slate-500">Local Variables</p>
+                    {(analysis.localVariables ?? []).length > 0 ? (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {(analysis.localVariables ?? []).map((variable) => (
+                          <span
+                            key={variable.name}
+                            className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
+                          >
+                            {variable.name} ({variable.type})
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-sm text-slate-400">No local variables detected</p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Table Properties</p>
+                  <div className="mt-3 space-y-3">
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-800">
+                      {selectedTable ?? "Select a table"}
+                    </div>
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Columns</p>
+                      <div className="mt-2 space-y-1 text-sm text-slate-700">
+                        {(analysis.tableDetails.tables.find((t) => t.name === selectedTable)?.columns ?? []).map(
+                          (col) => (
+                            <p key={col}>{col}</p>
+                          ),
+                        )}
+                        {selectedTable &&
+                        (analysis.tableDetails.tables.find((t) => t.name === selectedTable)?.columns?.length ?? 0) ===
+                          0 ? (
+                          <p className="text-sm text-slate-400">No columns detected</p>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Local Variables</p>
+                      <div className="mt-2 space-y-1 text-sm text-slate-700">
+                        {(analysis.localVariables ?? []).length > 0 ? (
+                          (analysis.localVariables ?? []).map((variable) => (
+                            <p key={variable.name}>
+                              {variable.name} ({variable.type})
+                            </p>
+                          ))
+                        ) : (
+                          <p className="text-sm text-slate-400">No local variables detected</p>
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Relationships</p>
+                      <div className="mt-2 space-y-1 text-sm text-slate-700">
+                        {(analysis.tableDetails.relationships ?? []).length > 0 ? (
+                          analysis.tableDetails.relationships.map((rel, index) => (
+                            <p key={`${rel.fromTable}-${rel.toTable}-${index}`}>
+                              {rel.fromTable}.{rel.fromColumn} → {rel.toTable}.{rel.toColumn}
+                            </p>
+                          ))
+                        ) : (
+                          <p className="text-sm text-slate-400">No relationships detected</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          ) : null}
+
           <Card>
             <CardHeader>
               <CardTitle>Procedure Info</CardTitle>
@@ -732,11 +1131,30 @@ interface StrategyPanelProps {
   setProjectDescription: (value: string) => void
   projectPackageName: string
   setProjectPackageName: (value: string) => void
+  outputDirectory: string
+  setOutputDirectory: (value: string) => void
 }
 
 function StrategyPanel(props: StrategyPanelProps) {
   const [language, setLanguage] = useState<"java" | "kotlin" | "groovy">("java")
   const [gradleFlavor, setGradleFlavor] = useState<"groovy" | "kotlin">("groovy")
+  const [isPickingDir, setIsPickingDir] = useState(false)
+  const [pickDirError, setPickDirError] = useState<string | null>(null)
+
+  async function handlePickDirectory() {
+    try {
+      setIsPickingDir(true)
+      setPickDirError(null)
+      const selected = await pickOutputDirectory()
+      if (selected) {
+        props.setOutputDirectory(selected)
+      }
+    } catch (error) {
+      setPickDirError(error instanceof Error ? error.message : "Failed to open folder picker.")
+    } finally {
+      setIsPickingDir(false)
+    }
+  }
 
   return (
     <Card className="rounded-md border border-slate-200 bg-white shadow-none">
@@ -866,6 +1284,26 @@ function StrategyPanel(props: StrategyPanelProps) {
                   />
                 </div>
               ))}
+              <div className="grid items-center gap-3 md:grid-cols-[140px_1fr]">
+                <p className="text-sm text-slate-700">Output directory</p>
+                <div className="flex items-center gap-3">
+                  <input
+                    value={props.outputDirectory}
+                    onChange={(event) => props.setOutputDirectory(event.target.value)}
+                    placeholder="C:\\projects\\output\\converted-app"
+                    className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={handlePickDirectory}
+                    disabled={isPickingDir}
+                    className="inline-flex h-9 items-center justify-center rounded-full border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isPickingDir ? "Picking..." : "Choose"}
+                  </button>
+                </div>
+                {pickDirError ? <p className="text-xs text-rose-600">{pickDirError}</p> : null}
+              </div>
             </div>
           </div>
 
@@ -1237,6 +1675,8 @@ interface PanelBodyProps {
   setProjectDescription: (value: string) => void
   projectPackageName: string
   setProjectPackageName: (value: string) => void
+  outputDirectory: string
+  setOutputDirectory: (value: string) => void
   gitRepoUrl: string
   projectName: string
   conversionSnapshot: ConversionSnapshot | null
@@ -1332,6 +1772,8 @@ function PanelBody(props: PanelBodyProps) {
               setProjectDescription={props.setProjectDescription}
               projectPackageName={props.projectPackageName}
               setProjectPackageName={props.setProjectPackageName}
+              outputDirectory={props.outputDirectory}
+              setOutputDirectory={props.setOutputDirectory}
             />
           )}
           <ConversionJobPanel
@@ -1355,6 +1797,7 @@ function PanelBody(props: PanelBodyProps) {
             projectDisplayName={props.projectDisplayName}
             projectDescription={props.projectDescription}
             projectPackageName={props.projectPackageName}
+            outputDirectory={props.outputDirectory}
             onConversionStart={props.onConversionStart}
             onSnapshotChange={props.onSnapshotChange}
           />
@@ -1417,6 +1860,7 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
   const [projectDisplayName, setProjectDisplayName] = useState("demo")
   const [projectDescription, setProjectDescription] = useState("Demo project for Spring Boot")
   const [projectPackageName, setProjectPackageName] = useState("com.example.demo")
+  const [outputDirectory, setOutputDirectory] = useState("")
   const [conversionSnapshot, setConversionSnapshot] = useState<ConversionSnapshot | null>(null)
   const [hideSpringConfig, setHideSpringConfig] = useState(false)
   const projectName =
@@ -1500,6 +1944,8 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
         setProjectDescription={setProjectDescription}
         projectPackageName={projectPackageName}
         setProjectPackageName={setProjectPackageName}
+        outputDirectory={outputDirectory}
+        setOutputDirectory={setOutputDirectory}
         projectName={projectName}
         conversionSnapshot={conversionSnapshot}
         onSnapshotChange={setConversionSnapshot}

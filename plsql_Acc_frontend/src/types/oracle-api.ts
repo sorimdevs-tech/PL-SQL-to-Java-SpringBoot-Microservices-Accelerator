@@ -16,6 +16,7 @@ export interface OracleObjectsPayload extends OracleConnectionPayload {
 export interface OracleConvertPayload extends OracleConnectionPayload {
   config_path: string
   config_overrides?: ConfigOverrides
+  output_directory?: string
 }
 
 export interface OracleObjectItem {

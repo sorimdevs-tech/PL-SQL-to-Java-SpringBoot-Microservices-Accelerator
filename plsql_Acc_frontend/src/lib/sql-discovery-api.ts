@@ -1,4 +1,8 @@
-import type { SqlDiscoveryAnalyzeResponse, SqlDiscoveryUploadResponse } from "@/types/sql-discovery-api"
+import type {
+  GitRepoTreeResponse,
+  SqlDiscoveryAnalyzeResponse,
+  SqlDiscoveryUploadResponse,
+} from "@/types/sql-discovery-api"
 
 const API_BASE_URL = "http://127.0.0.1:8000"
 
@@ -35,4 +39,40 @@ export async function analyzeUploadedSqlFile(fileId: string): Promise<SqlDiscove
   })
 
   return parseJsonResponse<SqlDiscoveryAnalyzeResponse>(response)
+}
+
+export async function analyzeGitSqlSource(
+  repoUrl: string,
+  branch?: string,
+  pathFilters: string[] = [],
+): Promise<SqlDiscoveryAnalyzeResponse> {
+  const response = await fetch(toApiUrl("/api/discovery/analyze"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      repo_url: repoUrl,
+      branch,
+      path_filters: pathFilters,
+    }),
+  })
+
+  return parseJsonResponse<SqlDiscoveryAnalyzeResponse>(response)
+}
+
+export async function getGitRepoTree(
+  repoUrl: string,
+  branch?: string,
+  path?: string,
+): Promise<GitRepoTreeResponse> {
+  const response = await fetch(toApiUrl("/api/discovery/git/tree"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      repo_url: repoUrl,
+      branch,
+      path,
+    }),
+  })
+
+  return parseJsonResponse<GitRepoTreeResponse>(response)
 }
