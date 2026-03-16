@@ -622,7 +622,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
           navigation={{
             onPrevious: goPreviousStep,
             onNext: goNextStep,
-            disablePrevious: activeSelectorStep === 1,
+            disablePrevious: false,
             disableNext: !canProceedFromCurrentStep(),
           }}
         />
@@ -641,7 +641,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
           navigation={{
             onPrevious: goPreviousStep,
             onNext: goNextStep,
-            disablePrevious: activeSelectorStep === 1,
+            disablePrevious: false,
             disableNext: !canProceedFromCurrentStep(),
           }}
         />
@@ -671,7 +671,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
           navigation={{
             onPrevious: goPreviousStep,
             onNext: goNextStep,
-            disablePrevious: activeSelectorStep === 1,
+            disablePrevious: false,
             disableNext: !canProceedFromCurrentStep(),
           }}
         />
@@ -690,7 +690,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
           navigation={{
             onPrevious: goPreviousStep,
             onNext: goNextStep,
-            disablePrevious: activeSelectorStep === 1,
+            disablePrevious: false,
             disableNext: activeSelectorStep === 4 || !canProceedFromCurrentStep(),
           }}
         />

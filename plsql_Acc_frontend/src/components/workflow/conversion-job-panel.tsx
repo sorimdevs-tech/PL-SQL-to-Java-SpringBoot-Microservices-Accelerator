@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { Download, FileText, LoaderCircle, Play, RefreshCcw } from "lucide-react"
+import { Download, FileText, LoaderCircle, Play } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -74,7 +74,6 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
   const [selectedFilePath, setSelectedFilePath] = useState("")
   const [selectedFileContent, setSelectedFileContent] = useState("")
   const [isStarting, setIsStarting] = useState(false)
-  const [isRefreshing, setIsRefreshing] = useState(false)
   const [isLoadingFiles, setIsLoadingFiles] = useState(false)
   const [isLoadingFileContent, setIsLoadingFileContent] = useState(false)
   const [isCheckingHealth, setIsCheckingHealth] = useState(false)
@@ -157,11 +156,8 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
     }
   }, [])
 
-  const refreshJobStatus = useCallback(async (jobId: string, showLoader = false) => {
+  const refreshJobStatus = useCallback(async (jobId: string) => {
     try {
-      if (showLoader) {
-        setIsRefreshing(true)
-      }
       const latest = await getJobStatus(jobId)
       setJob(latest)
       setError(null)
@@ -171,8 +167,6 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Failed to refresh job status.")
-    } finally {
-      setIsRefreshing(false)
     }
   }, [loadGeneratedFiles])
 

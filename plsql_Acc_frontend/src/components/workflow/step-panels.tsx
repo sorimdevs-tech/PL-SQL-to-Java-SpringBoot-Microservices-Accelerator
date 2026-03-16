@@ -26,7 +26,13 @@ import {
 } from "@/lib/sql-discovery-api"
 import { pickOutputDirectory } from "@/lib/jobs-api"
 import type { OracleConnectionPayload } from "@/types/oracle-api"
-import type { SqlDiscoveryAnalyzeResponse } from "@/types/sql-discovery-api"
+import type {
+  SqlDiscoveryAnalyzeResponse,
+  SqlDiscoveryObject,
+  SqlLocalVariable,
+  SqlTableDetail,
+  SqlTableRelationship,
+} from "@/types/sql-discovery-api"
 
 interface StepPanelsProps {
   activeStep: number
@@ -490,19 +496,20 @@ function SqlSourceDiscovery(props: {
     props.sourceMethod,
   ])
 
-  const selectedObject =
+  const selectedObject: SqlDiscoveryObject | null =
     analysis?.objects?.find(
       (item) => `${item.objectType}::${item.procedureName}` === selectedObjectKey,
     ) ?? null
-  const activeAnalysis = selectedObject ?? analysis
+  const activeAnalysis: SqlDiscoveryAnalyzeResponse | SqlDiscoveryObject | null =
+    selectedObject ?? analysis
 
   useEffect(() => {
-    const tables = activeAnalysis?.tableDetails?.tables ?? []
+    const tables: SqlTableDetail[] = activeAnalysis?.tableDetails?.tables ?? []
     if (!tables.length) {
       setSelectedTable(null)
       return
     }
-    if (!selectedTable || !tables.some((table) => table.name === selectedTable)) {
+    if (!selectedTable || !tables.some((table: SqlTableDetail) => table.name === selectedTable)) {
       setSelectedTable(tables[0].name)
     }
   }, [activeAnalysis, selectedTable])
@@ -531,6 +538,7 @@ function SqlSourceDiscovery(props: {
 
     async function analyzeGitRepo() {
       try {
+        const requestId = ++requestIdRef.current
         setIsLoading(true)
         const analyzed = await analyzeGitSqlSource(props.gitRepoUrl.trim())
         if (requestIdRef.current !== requestId) {
@@ -788,7 +796,7 @@ function SqlSourceDiscovery(props: {
                     Tables ({activeAnalysis.tableDetails.tables.length})
                   </p>
                   <div className="mt-2 space-y-1">
-                    {activeAnalysis.tableDetails.tables.map((table) => (
+                    {activeAnalysis.tableDetails.tables.map((table: SqlTableDetail) => (
                       <button
                         key={table.name}
                         onClick={() => setSelectedTable(table.name)}
@@ -812,8 +820,8 @@ function SqlSourceDiscovery(props: {
                   <div className="absolute inset-0 bg-grid-pattern opacity-30" />
                   <div className="relative h-full min-h-[320px] overflow-auto p-6">
                     {(() => {
-                      const tables = activeAnalysis.tableDetails?.tables ?? []
-                      const relationships = activeAnalysis.tableDetails?.relationships ?? []
+                      const tables: SqlTableDetail[] = activeAnalysis.tableDetails?.tables ?? []
+                      const relationships: SqlTableRelationship[] = activeAnalysis.tableDetails?.relationships ?? []
                       const cardWidth = 220
                       const cardHeight = 140
                       const gapX = 80
@@ -823,7 +831,7 @@ function SqlSourceDiscovery(props: {
                       const width = columns * cardWidth + (columns - 1) * gapX + 40
                       const height = rows * cardHeight + (rows - 1) * gapY + 40
                       const positions = new Map<string, { x: number; y: number }>()
-                      tables.forEach((table, index) => {
+                      tables.forEach((table: SqlTableDetail, index: number) => {
                         const col = index % columns
                         const row = Math.floor(index / columns)
                         positions.set(table.name, {
@@ -848,7 +856,7 @@ function SqlSourceDiscovery(props: {
                                 <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8" />
                               </marker>
                             </defs>
-                            {relationships.map((rel, idx) => {
+                            {relationships.map((rel: SqlTableRelationship, idx: number) => {
                               const from = positions.get(rel.fromTable)
                               const to = positions.get(rel.toTable)
                               if (!from || !to) {
@@ -872,7 +880,7 @@ function SqlSourceDiscovery(props: {
                             })}
                           </svg>
 
-                          {tables.map((table) => {
+                          {tables.map((table: SqlTableDetail) => {
                             const pos = positions.get(table.name)
                             if (!pos) {
                               return null
@@ -889,7 +897,7 @@ function SqlSourceDiscovery(props: {
                                 <div className="flex h-[96px] flex-col overflow-auto px-3 py-2 text-xs text-slate-600">
                                   {(table.columns ?? []).length > 0 ? (
                                     <ul className="space-y-1">
-                                      {(table.columns ?? []).slice(0, 6).map((col) => (
+                                      {(table.columns ?? []).slice(0, 6).map((col: string) => (
                                         <li key={col}>{col}</li>
                                       ))}
                                     </ul>
@@ -914,7 +922,7 @@ function SqlSourceDiscovery(props: {
                     <p className="text-xs uppercase tracking-wide text-slate-500">Local Variables</p>
                     {(activeAnalysis.localVariables ?? []).length > 0 ? (
                       <div className="mt-2 flex flex-wrap gap-2">
-                        {(activeAnalysis.localVariables ?? []).map((variable) => (
+                        {(activeAnalysis.localVariables ?? []).map((variable: SqlLocalVariable) => (
                           <span
                             key={variable.name}
                             className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
@@ -938,13 +946,13 @@ function SqlSourceDiscovery(props: {
                     <div>
                       <p className="text-xs uppercase tracking-wide text-slate-500">Columns</p>
                       <div className="mt-2 space-y-1 text-sm text-slate-700">
-                        {(activeAnalysis.tableDetails.tables.find((t) => t.name === selectedTable)?.columns ?? []).map(
-                          (col) => (
+                        {(activeAnalysis.tableDetails.tables.find((t: SqlTableDetail) => t.name === selectedTable)?.columns ?? []).map(
+                          (col: string) => (
                             <p key={col}>{col}</p>
                           ),
                         )}
                         {selectedTable &&
-                        (activeAnalysis.tableDetails.tables.find((t) => t.name === selectedTable)?.columns?.length ??
+                        (activeAnalysis.tableDetails.tables.find((t: SqlTableDetail) => t.name === selectedTable)?.columns?.length ??
                           0) === 0 ? (
                           <p className="text-sm text-slate-400">No columns detected</p>
                         ) : null}
@@ -954,7 +962,7 @@ function SqlSourceDiscovery(props: {
                       <p className="text-xs uppercase tracking-wide text-slate-500">Local Variables</p>
                       <div className="mt-2 space-y-1 text-sm text-slate-700">
                         {(activeAnalysis.localVariables ?? []).length > 0 ? (
-                          (activeAnalysis.localVariables ?? []).map((variable) => (
+                          (activeAnalysis.localVariables ?? []).map((variable: SqlLocalVariable) => (
                             <p key={variable.name}>
                               {variable.name} ({variable.type})
                             </p>
@@ -968,7 +976,7 @@ function SqlSourceDiscovery(props: {
                       <p className="text-xs uppercase tracking-wide text-slate-500">Relationships</p>
                       <div className="mt-2 space-y-1 text-sm text-slate-700">
                         {(activeAnalysis.tableDetails.relationships ?? []).length > 0 ? (
-                          activeAnalysis.tableDetails.relationships.map((rel, index) => (
+                          activeAnalysis.tableDetails.relationships.map((rel: SqlTableRelationship, index: number) => (
                             <p key={`${rel.fromTable}-${rel.toTable}-${index}`}>
                               {rel.fromTable}.{rel.fromColumn} {"->"} {rel.toTable}.{rel.toColumn}
                             </p>
@@ -1009,7 +1017,7 @@ function SqlSourceDiscovery(props: {
                 <div>
                   <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">IN</p>
                   {(activeAnalysis.parameters?.in ?? []).length > 0 ? (
-                    activeAnalysis.parameters?.in?.map((param) => (
+                    activeAnalysis.parameters?.in?.map((param: { name: string; type: string }) => (
                       <p key={`in-${param.name}`} className="text-slate-700">
                         {param.name} ({param.type})
                       </p>
@@ -1021,7 +1029,7 @@ function SqlSourceDiscovery(props: {
                 <div>
                   <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">OUT</p>
                   {(activeAnalysis.parameters?.out ?? []).length > 0 ? (
-                    activeAnalysis.parameters?.out?.map((param) => (
+                    activeAnalysis.parameters?.out?.map((param: { name: string; type: string }) => (
                       <p key={`out-${param.name}`} className="text-slate-700">
                         {param.name} ({param.type})
                       </p>
@@ -1040,7 +1048,7 @@ function SqlSourceDiscovery(props: {
               <CardContent className="text-sm">
                 {(activeAnalysis.tablesUsed ?? []).length > 0 ? (
                   <ul className="space-y-1 text-slate-700">
-                    {(activeAnalysis.tablesUsed ?? []).map((tableName) => (
+                    {(activeAnalysis.tablesUsed ?? []).map((tableName: string) => (
                       <li key={tableName}>{tableName}</li>
                     ))}
                   </ul>
@@ -1059,7 +1067,7 @@ function SqlSourceDiscovery(props: {
               <CardContent className="text-sm">
                 {(activeAnalysis.operations ?? []).length > 0 ? (
                   <ul className="space-y-1 text-slate-700">
-                    {(activeAnalysis.operations ?? []).map((operation) => (
+                    {(activeAnalysis.operations ?? []).map((operation: string) => (
                       <li key={operation}>{operation}</li>
                     ))}
                   </ul>
@@ -1097,7 +1105,7 @@ function SqlSourceDiscovery(props: {
               <CardContent className="text-sm">
                 {(activeAnalysis.exceptions ?? []).length > 0 ? (
                   <ul className="space-y-1 text-slate-700">
-                    {(activeAnalysis.exceptions ?? []).map((exceptionName) => (
+                    {(activeAnalysis.exceptions ?? []).map((exceptionName: string) => (
                       <li key={exceptionName}>{exceptionName}</li>
                     ))}
                   </ul>
@@ -1138,7 +1146,7 @@ function SqlSourceDiscovery(props: {
                   <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Tables Used</p>
                   {(activeAnalysis.dependencyGraph?.tablesUsed ?? []).length > 0 ? (
                     <ul className="space-y-1 text-slate-700">
-                      {(activeAnalysis.dependencyGraph?.tablesUsed ?? []).map((tableName) => (
+                      {(activeAnalysis.dependencyGraph?.tablesUsed ?? []).map((tableName: string) => (
                         <li key={tableName}>{tableName}</li>
                       ))}
                     </ul>
@@ -1150,7 +1158,7 @@ function SqlSourceDiscovery(props: {
                   <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Procedures Called</p>
                   {(activeAnalysis.dependencyGraph?.proceduresCalled ?? []).length > 0 ? (
                     <ul className="space-y-1 text-slate-700">
-                      {(activeAnalysis.dependencyGraph?.proceduresCalled ?? []).map((proc) => (
+                      {(activeAnalysis.dependencyGraph?.proceduresCalled ?? []).map((proc: string) => (
                         <li key={proc}>{proc}</li>
                       ))}
                     </ul>
@@ -1191,7 +1199,7 @@ function SqlSourceDiscovery(props: {
               <CardTitle>Objects</CardTitle>
             </CardHeader>
             <CardContent>
-              {(analysis.objects ?? []).length > 0 ? (
+              {(analysis?.objects ?? []).length > 0 ? (
                 <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
                   <table className="w-full text-sm">
                     <thead className="bg-slate-50 text-slate-600">
@@ -1201,7 +1209,7 @@ function SqlSourceDiscovery(props: {
                       </tr>
                     </thead>
                     <tbody>
-                      {(analysis.objects ?? []).map((item) => (
+                      {(analysis?.objects ?? []).map((item) => (
                         <tr key={`${item.objectType}-${item.procedureName}`} className="border-t border-slate-100">
                           <td className="px-3 py-2 font-medium text-slate-800">{item.procedureName}</td>
                           <td className="px-3 py-2 text-slate-700">{item.objectType}</td>

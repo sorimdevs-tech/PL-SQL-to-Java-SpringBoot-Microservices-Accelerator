@@ -18,6 +18,18 @@ export interface SqlLocalVariable {
 export interface SqlDiscoveryObject {
   procedureName: string
   objectType: string
+  parameters?: {
+    in?: SqlParameter[]
+    out?: SqlParameter[]
+  }
+  tablesUsed?: string[]
+  operations?: string[]
+  localVariables?: SqlLocalVariable[]
+  exceptions?: string[]
+  complexity?: SqlComplexityMetrics
+  dependencyGraph?: SqlDependencyGraph
+  conversionPreview?: SqlConversionPreview
+  tableDetails?: SqlTableDetails
 }
 
 export interface SqlComplexityMetrics {
