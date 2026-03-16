@@ -21,6 +21,7 @@ from src.converter.llm_engine import LLMConversionEngine
 from src.generator.spring_boot_generator import SpringBootGenerator
 from src.validator.test_generator import TestGenerator
 from src.utils.file_utils import FileExtractor
+from src.parser.sql_table_discovery import extract_create_table_columns
 from src.advanced.optimization_engine import create_optimization_engine
 from src.advanced.advanced_features import create_advanced_features
 
@@ -128,7 +129,7 @@ class PLSQLModernizationPipeline:
             
             # Stage 6: Generate entities
             logger.info("Stage 6: Generating JPA entities...")
-            entities = await self.generate_entities(java_code)
+            entities = await self.generate_entities(java_code, plsql_files)
             
             # Stage 7: Generate repositories
             logger.info("Stage 7: Generating JPA repositories...")
@@ -282,7 +283,7 @@ class PLSQLModernizationPipeline:
         """
         return await self.generator.generate_project(java_code)
     
-    async def generate_entities(self, java_code: Dict[str, str]) -> Dict[str, str]:
+    async def generate_entities(self, java_code: Dict[str, str], plsql_files: Dict[str, str]) -> Dict[str, str]:
         """
         Generate JPA entity classes
         
@@ -292,7 +293,13 @@ class PLSQLModernizationPipeline:
         Returns:
             Dict[str, str]: Generated entity files
         """
-        return self.generator.generate_entities(java_code)
+        ddl_columns: Dict[str, List[Dict[str, str]]] = {}
+        for content in (plsql_files or {}).values():
+            try:
+                ddl_columns.update(extract_create_table_columns(content))
+            except Exception:
+                continue
+        return self.generator.generate_entities(java_code, ddl_columns)
     
     async def generate_repositories(self, entities: Dict[str, str]) -> Dict[str, str]:
         """

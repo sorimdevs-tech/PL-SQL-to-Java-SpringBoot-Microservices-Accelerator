@@ -87,6 +87,60 @@ def _split_top_level_csv(content: str) -> List[str]:
     return parts
 
 
+def _extract_create_table_columns(sql_text: str) -> Dict[str, List[str]]:
+    create_pattern = re.compile(r"\bcreate\s+table\s+(?:if\s+not\s+exists\s+)?", flags=re.IGNORECASE)
+    name_pattern = re.compile(
+        r'(?:"?[\w$#]+"?|`?[\w$#]+`?)(?:\s*\.\s*(?:"?[\w$#]+"?|`?[\w$#]+`?))?',
+        flags=re.IGNORECASE,
+    )
+    ddl_columns: Dict[str, List[str]] = {}
+
+    for match in create_pattern.finditer(sql_text):
+        cursor = match.end()
+        remainder = sql_text[cursor:]
+        name_match = name_pattern.match(remainder.lstrip())
+        if not name_match:
+            continue
+        raw_name = name_match.group(0)
+        table_name = _normalize_identifier(raw_name).upper()
+        cursor += remainder.find(raw_name) + len(raw_name)
+
+        open_idx = sql_text.find("(", cursor)
+        if open_idx == -1:
+            continue
+        depth = 0
+        close_idx = None
+        for idx in range(open_idx, len(sql_text)):
+            char = sql_text[idx]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    close_idx = idx
+                    break
+        if close_idx is None:
+            continue
+
+        body = sql_text[open_idx + 1 : close_idx]
+        columns: List[str] = []
+        for item in _split_top_level_csv(body):
+            segment = " ".join(item.strip().split())
+            if not segment:
+                continue
+            lowered = segment.lower()
+            if lowered.startswith(("constraint ", "primary ", "foreign ", "unique ", "check ")):
+                continue
+            col_match = re.match(r'^["`]?([\w$#]+)["`]?\s+', segment)
+            if not col_match:
+                continue
+            columns.append(_normalize_identifier(col_match.group(1)).upper())
+
+        if columns:
+            ddl_columns[table_name] = columns
+    return ddl_columns
+
+
 def _extract_parameter_section(header_text: str) -> str:
     first_paren = header_text.find("(")
     if first_paren < 0:
@@ -151,7 +205,10 @@ def _extract_operations_and_tables(block_text: str) -> Dict[str, Any]:
     def _add_table(raw_name: str) -> None:
         if not raw_name:
             return
-        tables.add(_normalize_identifier(raw_name).upper())
+        normalized = _normalize_identifier(raw_name).upper()
+        if normalized in {"TABLE", "DUAL"}:
+            return
+        tables.add(normalized)
 
     for pattern, operation in (
         (r"\bselect\b", "SELECT"),
@@ -310,6 +367,7 @@ def _build_conversion_preview(procedure_name: str, tables_used: Sequence[str]) -
 def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
     """Analyze SQL/PLSQL text and return discovery metadata per object."""
     cleaned = remove_sql_comments(sql_text)
+    ddl_columns = _extract_create_table_columns(cleaned)
     objects = _extract_objects(cleaned)
     if not objects:
         return []
@@ -320,6 +378,11 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
         operations_tables = _extract_operations_and_tables(item.block_text)
         tables_used = operations_tables["tables"]
         table_columns = _extract_table_columns(item.block_text, tables_used)
+        for table in tables_used:
+            ddl_cols = ddl_columns.get(table.upper(), [])
+            if ddl_cols:
+                table_columns.setdefault(table, [])
+                table_columns[table] = sorted({*table_columns[table], *ddl_cols})
         table_relationships = _extract_table_relationships(item.block_text)
         entry: Dict[str, Any] = {
             "procedureName": item.object_name,

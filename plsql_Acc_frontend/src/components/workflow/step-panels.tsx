@@ -325,6 +325,7 @@ function SqlSourceDiscovery(props: {
   onLoadingChange?: (value: boolean) => void
 }) {
   const [analysis, setAnalysis] = useState<SqlDiscoveryAnalyzeResponse | null>(null)
+  const [selectedObjectKey, setSelectedObjectKey] = useState<string | null>(null)
   const [selectedTable, setSelectedTable] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -450,6 +451,11 @@ function SqlSourceDiscovery(props: {
 
         if (!isCancelled) {
           setAnalysis(analyzed)
+          const defaultObject =
+            (analyzed.objects ?? []).find((item) => item.objectType.toUpperCase() === "PROCEDURE") ??
+            (analyzed.objects ?? [])[0] ??
+            analyzed
+          setSelectedObjectKey(`${defaultObject.objectType}::${defaultObject.procedureName}`)
           props.setAvailableObjects(objectNames)
           props.setSelectedObjects(objectNames)
           props.setAvailableProcedures(procedureNames)
@@ -484,8 +490,14 @@ function SqlSourceDiscovery(props: {
     props.sourceMethod,
   ])
 
+  const selectedObject =
+    analysis?.objects?.find(
+      (item) => `${item.objectType}::${item.procedureName}` === selectedObjectKey,
+    ) ?? null
+  const activeAnalysis = selectedObject ?? analysis
+
   useEffect(() => {
-    const tables = analysis?.tableDetails?.tables ?? []
+    const tables = activeAnalysis?.tableDetails?.tables ?? []
     if (!tables.length) {
       setSelectedTable(null)
       return
@@ -493,7 +505,7 @@ function SqlSourceDiscovery(props: {
     if (!selectedTable || !tables.some((table) => table.name === selectedTable)) {
       setSelectedTable(tables[0].name)
     }
-  }, [analysis, selectedTable])
+  }, [activeAnalysis, selectedTable])
 
   useEffect(() => {
     if (props.sourceMethod !== "git") {
@@ -552,6 +564,11 @@ function SqlSourceDiscovery(props: {
           .map((item) => item.procedureName)
         if (!isCancelled) {
           setAnalysis(analyzed)
+          const defaultObject =
+            (analyzed.objects ?? []).find((item) => item.objectType.toUpperCase() === "PROCEDURE") ??
+            (analyzed.objects ?? [])[0] ??
+            analyzed
+          setSelectedObjectKey(`${defaultObject.objectType}::${defaultObject.procedureName}`)
           props.setAvailableObjects(objectNames)
           props.setSelectedObjects(objectNames)
           props.setAvailableProcedures(procedureNames)
@@ -729,9 +746,37 @@ function SqlSourceDiscovery(props: {
         </Card>
       ) : null}
 
-      {analysis && (props.sourceMethod !== "git" || gitStep === 2) ? (
+      {activeAnalysis && (props.sourceMethod !== "git" || gitStep === 2) ? (
         <>
-          {analysis.tableDetails?.tables?.length ? (
+          {(analysis?.objects ?? []).length > 1 ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>Active Object</CardTitle>
+                <CardDescription>Select which procedure/function drives the schema view.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="text-xs uppercase tracking-wide text-slate-500">Object</label>
+                  <select
+                    className="h-9 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-800 shadow-sm"
+                    value={selectedObjectKey ?? ""}
+                    onChange={(event) => setSelectedObjectKey(event.target.value)}
+                  >
+                    {(analysis?.objects ?? []).map((item) => {
+                      const key = `${item.objectType}::${item.procedureName}`
+                      return (
+                        <option key={key} value={key}>
+                          {item.procedureName} ({item.objectType})
+                        </option>
+                      )
+                    })}
+                  </select>
+                </div>
+              </CardContent>
+            </Card>
+          ) : null}
+
+          {activeAnalysis.tableDetails?.tables?.length ? (
             <Card>
               <CardHeader>
                 <CardTitle>Schema Explorer</CardTitle>
@@ -740,21 +785,23 @@ function SqlSourceDiscovery(props: {
               <CardContent className="grid gap-4 lg:grid-cols-[220px_1fr_260px]">
                 <div className="rounded-xl border border-slate-200 bg-white p-3">
                   <p className="text-xs uppercase tracking-wide text-slate-500">
-                    Tables ({analysis.tableDetails.tables.length})
+                    Tables ({activeAnalysis.tableDetails.tables.length})
                   </p>
                   <div className="mt-2 space-y-1">
-                    {analysis.tableDetails.tables.map((table) => (
+                    {activeAnalysis.tableDetails.tables.map((table) => (
                       <button
                         key={table.name}
                         onClick={() => setSelectedTable(table.name)}
-                        className={`flex w-full items-center justify-between rounded-lg px-2 py-1 text-left text-sm transition ${
+                        className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left text-sm transition ${
                           selectedTable === table.name
                             ? "bg-cyan-50 text-cyan-900"
                             : "text-slate-700 hover:bg-slate-50"
                         }`}
                       >
-                        <span>{table.name}</span>
-                        <span className="text-xs text-slate-400">{(table.columns ?? []).length}</span>
+                        <span className="flex-1 truncate">{table.name}</span>
+                        <span className="w-8 shrink-0 text-right text-xs text-slate-400">
+                          {(table.columns ?? []).length}
+                        </span>
                       </button>
                     ))}
                   </div>
@@ -765,8 +812,8 @@ function SqlSourceDiscovery(props: {
                   <div className="absolute inset-0 bg-grid-pattern opacity-30" />
                   <div className="relative h-full min-h-[320px] overflow-auto p-6">
                     {(() => {
-                      const tables = analysis.tableDetails?.tables ?? []
-                      const relationships = analysis.tableDetails?.relationships ?? []
+                      const tables = activeAnalysis.tableDetails?.tables ?? []
+                      const relationships = activeAnalysis.tableDetails?.relationships ?? []
                       const cardWidth = 220
                       const cardHeight = 140
                       const gapX = 80
@@ -833,13 +880,13 @@ function SqlSourceDiscovery(props: {
                             return (
                               <div
                                 key={table.name}
-                                className="absolute rounded-xl border border-slate-200 bg-white shadow-sm"
+                                className="absolute overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
                                 style={{ width: cardWidth, height: cardHeight, left: pos.x, top: pos.y }}
                               >
                                 <div className="rounded-t-xl border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
                                   {table.name}
                                 </div>
-                                <div className="px-3 py-2 text-xs text-slate-600">
+                                <div className="flex h-[96px] flex-col overflow-auto px-3 py-2 text-xs text-slate-600">
                                   {(table.columns ?? []).length > 0 ? (
                                     <ul className="space-y-1">
                                       {(table.columns ?? []).slice(0, 6).map((col) => (
@@ -865,9 +912,9 @@ function SqlSourceDiscovery(props: {
                 </div>
                   <div className="rounded-xl border border-slate-200 bg-white p-3">
                     <p className="text-xs uppercase tracking-wide text-slate-500">Local Variables</p>
-                    {(analysis.localVariables ?? []).length > 0 ? (
+                    {(activeAnalysis.localVariables ?? []).length > 0 ? (
                       <div className="mt-2 flex flex-wrap gap-2">
-                        {(analysis.localVariables ?? []).map((variable) => (
+                        {(activeAnalysis.localVariables ?? []).map((variable) => (
                           <span
                             key={variable.name}
                             className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
@@ -891,14 +938,14 @@ function SqlSourceDiscovery(props: {
                     <div>
                       <p className="text-xs uppercase tracking-wide text-slate-500">Columns</p>
                       <div className="mt-2 space-y-1 text-sm text-slate-700">
-                        {(analysis.tableDetails.tables.find((t) => t.name === selectedTable)?.columns ?? []).map(
+                        {(activeAnalysis.tableDetails.tables.find((t) => t.name === selectedTable)?.columns ?? []).map(
                           (col) => (
                             <p key={col}>{col}</p>
                           ),
                         )}
                         {selectedTable &&
-                        (analysis.tableDetails.tables.find((t) => t.name === selectedTable)?.columns?.length ?? 0) ===
-                          0 ? (
+                        (activeAnalysis.tableDetails.tables.find((t) => t.name === selectedTable)?.columns?.length ??
+                          0) === 0 ? (
                           <p className="text-sm text-slate-400">No columns detected</p>
                         ) : null}
                       </div>
@@ -906,8 +953,8 @@ function SqlSourceDiscovery(props: {
                     <div>
                       <p className="text-xs uppercase tracking-wide text-slate-500">Local Variables</p>
                       <div className="mt-2 space-y-1 text-sm text-slate-700">
-                        {(analysis.localVariables ?? []).length > 0 ? (
-                          (analysis.localVariables ?? []).map((variable) => (
+                        {(activeAnalysis.localVariables ?? []).length > 0 ? (
+                          (activeAnalysis.localVariables ?? []).map((variable) => (
                             <p key={variable.name}>
                               {variable.name} ({variable.type})
                             </p>
@@ -920,8 +967,8 @@ function SqlSourceDiscovery(props: {
                     <div>
                       <p className="text-xs uppercase tracking-wide text-slate-500">Relationships</p>
                       <div className="mt-2 space-y-1 text-sm text-slate-700">
-                        {(analysis.tableDetails.relationships ?? []).length > 0 ? (
-                          analysis.tableDetails.relationships.map((rel, index) => (
+                        {(activeAnalysis.tableDetails.relationships ?? []).length > 0 ? (
+                          activeAnalysis.tableDetails.relationships.map((rel, index) => (
                             <p key={`${rel.fromTable}-${rel.toTable}-${index}`}>
                               {rel.fromTable}.{rel.fromColumn} {"->"} {rel.toTable}.{rel.toColumn}
                             </p>
@@ -944,11 +991,11 @@ function SqlSourceDiscovery(props: {
             <CardContent className="grid gap-3 md:grid-cols-2">
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
                 <p className="text-xs uppercase tracking-wide text-slate-500">Procedure Name</p>
-                <p className="text-sm font-semibold text-slate-800">{analysis.procedureName || "N/A"}</p>
+                <p className="text-sm font-semibold text-slate-800">{activeAnalysis.procedureName || "N/A"}</p>
               </div>
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
                 <p className="text-xs uppercase tracking-wide text-slate-500">Object Type</p>
-                <p className="text-sm font-semibold text-slate-800">{analysis.objectType || "N/A"}</p>
+                <p className="text-sm font-semibold text-slate-800">{activeAnalysis.objectType || "N/A"}</p>
               </div>
             </CardContent>
           </Card>
@@ -961,8 +1008,8 @@ function SqlSourceDiscovery(props: {
               <CardContent className="space-y-3 text-sm">
                 <div>
                   <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">IN</p>
-                  {(analysis.parameters?.in ?? []).length > 0 ? (
-                    analysis.parameters?.in?.map((param) => (
+                  {(activeAnalysis.parameters?.in ?? []).length > 0 ? (
+                    activeAnalysis.parameters?.in?.map((param) => (
                       <p key={`in-${param.name}`} className="text-slate-700">
                         {param.name} ({param.type})
                       </p>
@@ -973,8 +1020,8 @@ function SqlSourceDiscovery(props: {
                 </div>
                 <div>
                   <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">OUT</p>
-                  {(analysis.parameters?.out ?? []).length > 0 ? (
-                    analysis.parameters?.out?.map((param) => (
+                  {(activeAnalysis.parameters?.out ?? []).length > 0 ? (
+                    activeAnalysis.parameters?.out?.map((param) => (
                       <p key={`out-${param.name}`} className="text-slate-700">
                         {param.name} ({param.type})
                       </p>
@@ -991,9 +1038,9 @@ function SqlSourceDiscovery(props: {
                 <CardTitle>Tables</CardTitle>
               </CardHeader>
               <CardContent className="text-sm">
-                {(analysis.tablesUsed ?? []).length > 0 ? (
+                {(activeAnalysis.tablesUsed ?? []).length > 0 ? (
                   <ul className="space-y-1 text-slate-700">
-                    {(analysis.tablesUsed ?? []).map((tableName) => (
+                    {(activeAnalysis.tablesUsed ?? []).map((tableName) => (
                       <li key={tableName}>{tableName}</li>
                     ))}
                   </ul>
@@ -1010,9 +1057,9 @@ function SqlSourceDiscovery(props: {
                 <CardTitle>Operations</CardTitle>
               </CardHeader>
               <CardContent className="text-sm">
-                {(analysis.operations ?? []).length > 0 ? (
+                {(activeAnalysis.operations ?? []).length > 0 ? (
                   <ul className="space-y-1 text-slate-700">
-                    {(analysis.operations ?? []).map((operation) => (
+                    {(activeAnalysis.operations ?? []).map((operation) => (
                       <li key={operation}>{operation}</li>
                     ))}
                   </ul>
@@ -1027,9 +1074,9 @@ function SqlSourceDiscovery(props: {
                 <CardTitle>Local Variables</CardTitle>
               </CardHeader>
               <CardContent className="text-sm">
-                {(analysis.localVariables ?? []).length > 0 ? (
+                {(activeAnalysis.localVariables ?? []).length > 0 ? (
                   <ul className="space-y-1 text-slate-700">
-                    {(analysis.localVariables ?? []).map((variable) => (
+                    {(activeAnalysis.localVariables ?? []).map((variable) => (
                       <li key={variable.name}>
                         {variable.name} ({variable.type})
                       </li>
@@ -1048,9 +1095,9 @@ function SqlSourceDiscovery(props: {
                 <CardTitle>Exceptions</CardTitle>
               </CardHeader>
               <CardContent className="text-sm">
-                {(analysis.exceptions ?? []).length > 0 ? (
+                {(activeAnalysis.exceptions ?? []).length > 0 ? (
                   <ul className="space-y-1 text-slate-700">
-                    {(analysis.exceptions ?? []).map((exceptionName) => (
+                    {(activeAnalysis.exceptions ?? []).map((exceptionName) => (
                       <li key={exceptionName}>{exceptionName}</li>
                     ))}
                   </ul>
@@ -1066,16 +1113,16 @@ function SqlSourceDiscovery(props: {
               </CardHeader>
               <CardContent className="grid gap-2 text-sm md:grid-cols-2">
                 <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                  LOC: {analysis.complexity?.linesOfCode ?? 0}
+                  LOC: {activeAnalysis.complexity?.linesOfCode ?? 0}
                 </p>
                 <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                  Queries: {analysis.complexity?.numberOfQueries ?? 0}
+                  Queries: {activeAnalysis.complexity?.numberOfQueries ?? 0}
                 </p>
                 <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                  Conditions: {analysis.complexity?.numberOfConditions ?? 0}
+                  Conditions: {activeAnalysis.complexity?.numberOfConditions ?? 0}
                 </p>
                 <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                  Loops: {analysis.complexity?.numberOfLoops ?? 0}
+                  Loops: {activeAnalysis.complexity?.numberOfLoops ?? 0}
                 </p>
               </CardContent>
             </Card>
@@ -1089,9 +1136,9 @@ function SqlSourceDiscovery(props: {
               <CardContent className="space-y-3 text-sm">
                 <div>
                   <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Tables Used</p>
-                  {(analysis.dependencyGraph?.tablesUsed ?? []).length > 0 ? (
+                  {(activeAnalysis.dependencyGraph?.tablesUsed ?? []).length > 0 ? (
                     <ul className="space-y-1 text-slate-700">
-                      {(analysis.dependencyGraph?.tablesUsed ?? []).map((tableName) => (
+                      {(activeAnalysis.dependencyGraph?.tablesUsed ?? []).map((tableName) => (
                         <li key={tableName}>{tableName}</li>
                       ))}
                     </ul>
@@ -1101,9 +1148,9 @@ function SqlSourceDiscovery(props: {
                 </div>
                 <div>
                   <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Procedures Called</p>
-                  {(analysis.dependencyGraph?.proceduresCalled ?? []).length > 0 ? (
+                  {(activeAnalysis.dependencyGraph?.proceduresCalled ?? []).length > 0 ? (
                     <ul className="space-y-1 text-slate-700">
-                      {(analysis.dependencyGraph?.proceduresCalled ?? []).map((proc) => (
+                      {(activeAnalysis.dependencyGraph?.proceduresCalled ?? []).map((proc) => (
                         <li key={proc}>{proc}</li>
                       ))}
                     </ul>
@@ -1120,11 +1167,11 @@ function SqlSourceDiscovery(props: {
               </CardHeader>
               <CardContent className="space-y-3 text-sm">
                 {[
-                  { label: "Entities", values: analysis.conversionPreview?.entities ?? [] },
-                  { label: "Repositories", values: analysis.conversionPreview?.repositories ?? [] },
-                  { label: "Services", values: analysis.conversionPreview?.services ?? [] },
-                  { label: "Controllers", values: analysis.conversionPreview?.controllers ?? [] },
-                  { label: "DTOs", values: analysis.conversionPreview?.dtos ?? [] },
+                  { label: "Entities", values: activeAnalysis.conversionPreview?.entities ?? [] },
+                  { label: "Repositories", values: activeAnalysis.conversionPreview?.repositories ?? [] },
+                  { label: "Services", values: activeAnalysis.conversionPreview?.services ?? [] },
+                  { label: "Controllers", values: activeAnalysis.conversionPreview?.controllers ?? [] },
+                  { label: "DTOs", values: activeAnalysis.conversionPreview?.dtos ?? [] },
                 ].map((item) => (
                   <div key={item.label}>
                     <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">{item.label}</p>

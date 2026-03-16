@@ -274,6 +274,15 @@ Context:
 - Dependencies: {dependencies}
 - Tables involved: {tables}
 
+Output Rules (STRICT):
+- Output exactly ONE Java class.
+- Package must be: {package_name}.service
+- Include ALL required imports (no missing symbols).
+- Do NOT define repository interfaces, entities, DTOs, controllers, configs, or nested classes.
+- Assume repositories/entities already exist and only reference them.
+- Use jakarta.* (not javax.*).
+- No markdown, no explanations, code only.
+
 Generate the complete Java service class with all necessary imports and annotations.
 """
     
@@ -298,6 +307,15 @@ Requirements:
 Context:
 - Dependencies: {dependencies}
 - Tables involved: {tables}
+
+Output Rules (STRICT):
+- Output exactly ONE Java class.
+- Package must be: {package_name}.service
+- Include ALL required imports (no missing symbols).
+- Do NOT define repository interfaces, entities, DTOs, controllers, configs, or nested classes.
+- Assume repositories/entities already exist and only reference them.
+- Use jakarta.* (not javax.*).
+- No markdown, no explanations, code only.
 
 Generate the complete Java service class with all necessary imports and annotations.
 """
@@ -326,6 +344,15 @@ Context:
 - Trigger event: {trigger_event}
 - Table: {table}
 
+Output Rules (STRICT):
+- Output exactly ONE Java class.
+- Package must be: {package_name}.service
+- Include ALL required imports (no missing symbols).
+- Do NOT define repository interfaces, entities, DTOs, controllers, configs, or nested classes.
+- Assume repositories/entities already exist and only reference them.
+- Use jakarta.* (not javax.*).
+- No markdown, no explanations, code only.
+
 Generate the complete Java class with all necessary imports and annotations.
 """
     
@@ -352,7 +379,16 @@ Context:
 - Package functions: {functions}
 - Dependencies: {dependencies}
 
-Generate the complete Java classes with all necessary imports and annotations.
+Output Rules (STRICT):
+- Output exactly ONE Java class (service-style wrapper for the package).
+- Package must be: {package_name}.service
+- Include ALL required imports (no missing symbols).
+- Do NOT define repository interfaces, entities, DTOs, controllers, configs, or nested classes.
+- Assume repositories/entities already exist and only reference them.
+- Use jakarta.* (not javax.*).
+- No markdown, no explanations, code only.
+
+Generate the complete Java class with all necessary imports and annotations.
 """
     
     def _get_sql_template(self) -> str:
@@ -375,6 +411,16 @@ Context:
 - Entity: {entity}
 - Table: {table}
 - Columns: {columns}
+
+Output Rules (STRICT):
+- Output exactly ONE Java interface.
+- Package must be: {package_name}.repository
+- Include ALL required imports (JpaRepository, Query, Param, Modifying, Transactional, List/Optional, LocalDateTime if used).
+- Add @Repository annotation.
+- Use entity type: {entity}
+- Do NOT define entities, services, controllers, configs, or extra helper classes.
+- Use jakarta.* (not javax.*).
+- No markdown, no explanations, code only.
 
 Generate the complete JPA repository interface with all necessary imports and annotations.
 """
@@ -400,6 +446,15 @@ Context:
 - Table name: {table_name}
 - Primary key: {primary_key}
 - Relationships: {relationships}
+
+Output Rules (STRICT):
+- Output exactly ONE Java class.
+- Package must be: {package_name}.entity
+- Include ALL required imports (jakarta.persistence.*, java.time.* if needed).
+- Use @Entity and @Table(name = "...") when table name is known.
+- Do NOT define repositories, services, controllers, configs, or extra classes.
+- Use jakarta.* (not javax.*).
+- No markdown, no explanations, code only.
 
 Generate the complete JPA entity class with all necessary imports and annotations.
 """
@@ -1015,6 +1070,7 @@ class LLMConversionEngine:
         if not sql_text:
             return []
         tables = set()
+        blocked = {"TABLE", "DUAL"}
         patterns = [
             r"\bfrom\s+([a-zA-Z_][a-zA-Z0-9_$#.]*)",
             r"\bjoin\s+([a-zA-Z_][a-zA-Z0-9_$#.]*)",
@@ -1026,7 +1082,7 @@ class LLMConversionEngine:
         for pattern in patterns:
             for match in re.finditer(pattern, sql_text, flags=re.IGNORECASE):
                 table_name = match.group(1).split('.')[-1]
-                if table_name:
+                if table_name and table_name.upper() not in blocked:
                     tables.add(table_name)
         return list(tables)
     
