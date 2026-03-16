@@ -19,6 +19,7 @@ export interface OutputConfigOverrides {
   packaging?: "jar" | "war"
   config_format?: "properties" | "yaml"
   target_directory?: string
+  dependencies?: string[]
 }
 
 export interface ConfigOverrides {

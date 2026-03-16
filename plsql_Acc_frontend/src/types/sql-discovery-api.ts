@@ -69,6 +69,21 @@ export interface GitRepoTreeResponse {
   count?: number
 }
 
+export interface DependencySuggestionRequest {
+  procedure_name?: string
+  object_type?: string
+  tables_used?: string[]
+  operations?: string[]
+  parameters_in?: { name: string; type: string }[]
+  parameters_out?: { name: string; type: string }[]
+  local_variables?: { name: string; type: string }[]
+  exceptions?: string[]
+}
+
+export interface DependencySuggestionResponse {
+  suggestions: { name: string; reason: string; coordinate?: string }[]
+}
+
 export interface SqlDiscoveryAnalyzeResponse {
   procedureName: string
   objectType: string

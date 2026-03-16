@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   ChevronLeft,
   ChevronRight,
@@ -20,6 +20,7 @@ import { testOracleConnection } from "@/lib/oracle-api"
 import {
   analyzeGitSqlSource,
   analyzeUploadedSqlFile,
+  getDependencySuggestions,
   getGitRepoTree,
   uploadSqlDiscoveryFile,
 } from "@/lib/sql-discovery-api"
@@ -46,6 +47,18 @@ const DEFAULT_SPRING_DEPENDENCIES = [
   { id: "lombok", name: "Lombok", description: "Boilerplate reduction for model and DTO classes." },
   { id: "oracle-driver", name: "Oracle Driver", description: "Oracle JDBC runtime driver support." },
 ]
+
+type DependencyInsight = {
+  id: string
+  name: string
+  reason: string
+}
+
+type SuggestedDependency = {
+  name: string
+  reason: string
+  coordinate?: string
+}
 
 interface ConnectPanelProps {
   sourceMethod: SourceMethod
@@ -294,6 +307,9 @@ interface DiscoveryPanelProps {
   setAvailableProcedures: (procedures: string[]) => void
   selectedProcedures: string[]
   setSelectedProcedures: (procedures: string[]) => void
+  setAnalyzedDependencies: (deps: DependencyInsight[]) => void
+  setSuggestedDependencies: (deps: SuggestedDependency[]) => void
+  onDiscoveryLoadingChange?: (value: boolean) => void
 }
 
 function SqlSourceDiscovery(props: {
@@ -304,6 +320,9 @@ function SqlSourceDiscovery(props: {
   setSelectedObjects: (objects: string[]) => void
   setAvailableProcedures: (procedures: string[]) => void
   setSelectedProcedures: (procedures: string[]) => void
+  setAnalyzedDependencies: (deps: DependencyInsight[]) => void
+  setSuggestedDependencies: (deps: SuggestedDependency[]) => void
+  onLoadingChange?: (value: boolean) => void
 }) {
   const [analysis, setAnalysis] = useState<SqlDiscoveryAnalyzeResponse | null>(null)
   const [selectedTable, setSelectedTable] = useState<string | null>(null)
@@ -314,6 +333,58 @@ function SqlSourceDiscovery(props: {
   const [gitEntries, setGitEntries] = useState<{ name: string; path: string; type: "dir" | "file" }[]>([])
   const [gitTreeError, setGitTreeError] = useState<string | null>(null)
   const [isLoadingTree, setIsLoadingTree] = useState(false)
+  const requestIdRef = useRef(0)
+
+  useEffect(() => {
+    props.onLoadingChange?.(isLoading && (props.sourceMethod !== "git" || gitStep === 2))
+  }, [gitStep, isLoading, props.onLoadingChange, props.sourceMethod])
+
+  function deriveDependencies(value: SqlDiscoveryAnalyzeResponse): DependencyInsight[] {
+    const dependencies: DependencyInsight[] = []
+    const operations = (value.operations ?? []).map((op) => op.toUpperCase())
+    const tables = value.tablesUsed ?? []
+    const inParams = value.parameters?.in ?? []
+    const outParams = value.parameters?.out ?? []
+
+    if (tables.length > 0) {
+      dependencies.push({
+        id: "data-jpa",
+        name: "Spring Data JPA",
+        reason: "Tables detected in SQL statements; JPA repositories will be generated.",
+      })
+      dependencies.push({
+        id: "oracle-driver",
+        name: "Oracle Driver",
+        reason: "SQL tables detected; JDBC driver is required for runtime access.",
+      })
+    }
+
+    if (operations.length > 0) {
+      dependencies.push({
+        id: "web",
+        name: "Spring Web",
+        reason: "Operations detected; REST endpoints will be exposed for generated services.",
+      })
+    }
+
+    if (inParams.length > 0 || outParams.length > 0) {
+      dependencies.push({
+        id: "validation",
+        name: "Validation",
+        reason: "Procedure parameters detected; request validation will be added.",
+      })
+    }
+
+    if (value.exceptions && value.exceptions.length > 0) {
+      dependencies.push({
+        id: "actuator",
+        name: "Actuator",
+        reason: "Exception handling detected; health/monitoring endpoints recommended.",
+      })
+    }
+
+    return dependencies
+  }
 
   useEffect(() => {
     if (props.sourceMethod !== "sqlfile") {
@@ -321,6 +392,8 @@ function SqlSourceDiscovery(props: {
     }
     if (!props.sourceFile) {
       setAnalysis(null)
+      props.setAnalyzedDependencies([])
+      props.setSuggestedDependencies([])
       props.setAvailableObjects([])
       props.setSelectedObjects([])
       props.setAvailableProcedures([])
@@ -330,6 +403,7 @@ function SqlSourceDiscovery(props: {
     }
 
     let isCancelled = false
+    const requestId = ++requestIdRef.current
     const selectedFile = props.sourceFile
 
     async function analyzeFile() {
@@ -339,15 +413,34 @@ function SqlSourceDiscovery(props: {
       try {
         setIsLoading(true)
         const uploadResponse = await uploadSqlDiscoveryFile(selectedFile)
-        if (isCancelled) {
+        if (requestIdRef.current !== requestId) {
           return
         }
         const analyzed = await analyzeUploadedSqlFile(uploadResponse.file_id)
-        if (isCancelled) {
+        if (requestIdRef.current !== requestId) {
           return
         }
 
-        setAnalysis(analyzed)
+        props.setAnalyzedDependencies(deriveDependencies(analyzed))
+        try {
+          const suggestionResponse = await getDependencySuggestions({
+            procedure_name: analyzed.procedureName,
+            object_type: analyzed.objectType,
+            tables_used: analyzed.tablesUsed,
+            operations: analyzed.operations,
+            parameters_in: analyzed.parameters?.in,
+            parameters_out: analyzed.parameters?.out,
+            local_variables: analyzed.localVariables,
+            exceptions: analyzed.exceptions,
+          })
+          if (requestIdRef.current === requestId) {
+            props.setSuggestedDependencies(suggestionResponse.suggestions ?? [])
+          }
+        } catch {
+          if (requestIdRef.current === requestId) {
+            props.setSuggestedDependencies([])
+          }
+        }
         const objectNames = (analyzed.objects ?? []).map(
           (item) => `${item.procedureName} (${item.objectType})`,
         )
@@ -355,14 +448,19 @@ function SqlSourceDiscovery(props: {
           .filter((item) => item.objectType.toUpperCase() === "PROCEDURE")
           .map((item) => item.procedureName)
 
-        props.setAvailableObjects(objectNames)
-        props.setSelectedObjects(objectNames)
-        props.setAvailableProcedures(procedureNames)
-        props.setSelectedProcedures(procedureNames)
-        setError(null)
+        if (!isCancelled) {
+          setAnalysis(analyzed)
+          props.setAvailableObjects(objectNames)
+          props.setSelectedObjects(objectNames)
+          props.setAvailableProcedures(procedureNames)
+          props.setSelectedProcedures(procedureNames)
+          setError(null)
+        }
       } catch (requestError) {
         if (!isCancelled) {
           setAnalysis(null)
+          props.setAnalyzedDependencies([])
+          props.setSuggestedDependencies([])
           setError(requestError instanceof Error ? requestError.message : "Failed to analyze SQL file.")
         }
       } finally {
@@ -412,6 +510,8 @@ function SqlSourceDiscovery(props: {
     props.setSelectedProcedures([])
     if (!props.gitRepoUrl.trim()) {
       setError("Provide a Git repository URL in Connect step to discover SQL tables.")
+      props.setAnalyzedDependencies([])
+      props.setSuggestedDependencies([])
       return
     }
 
@@ -421,24 +521,48 @@ function SqlSourceDiscovery(props: {
       try {
         setIsLoading(true)
         const analyzed = await analyzeGitSqlSource(props.gitRepoUrl.trim())
-        if (isCancelled) {
+        if (requestIdRef.current !== requestId) {
           return
         }
-        setAnalysis(analyzed)
+        props.setAnalyzedDependencies(deriveDependencies(analyzed))
+        try {
+          const suggestionResponse = await getDependencySuggestions({
+            procedure_name: analyzed.procedureName,
+            object_type: analyzed.objectType,
+            tables_used: analyzed.tablesUsed,
+            operations: analyzed.operations,
+            parameters_in: analyzed.parameters?.in,
+            parameters_out: analyzed.parameters?.out,
+            local_variables: analyzed.localVariables,
+            exceptions: analyzed.exceptions,
+          })
+          if (requestIdRef.current === requestId) {
+            props.setSuggestedDependencies(suggestionResponse.suggestions ?? [])
+          }
+        } catch {
+          if (requestIdRef.current === requestId) {
+            props.setSuggestedDependencies([])
+          }
+        }
         const objectNames = (analyzed.objects ?? []).map(
           (item) => `${item.procedureName} (${item.objectType})`,
         )
         const procedureNames = (analyzed.objects ?? [])
           .filter((item) => item.objectType.toUpperCase() === "PROCEDURE")
           .map((item) => item.procedureName)
-        props.setAvailableObjects(objectNames)
-        props.setSelectedObjects(objectNames)
-        props.setAvailableProcedures(procedureNames)
-        props.setSelectedProcedures(procedureNames)
-        setError(null)
+        if (!isCancelled) {
+          setAnalysis(analyzed)
+          props.setAvailableObjects(objectNames)
+          props.setSelectedObjects(objectNames)
+          props.setAvailableProcedures(procedureNames)
+          props.setSelectedProcedures(procedureNames)
+          setError(null)
+        }
       } catch (requestError) {
         if (!isCancelled) {
           setAnalysis(null)
+          props.setAnalyzedDependencies([])
+          props.setSuggestedDependencies([])
           setError(requestError instanceof Error ? requestError.message : "Failed to analyze Git repository.")
         }
       } finally {
@@ -558,25 +682,26 @@ function SqlSourceDiscovery(props: {
                 </p>
               ) : (
                 <div className="mt-3 space-y-1">
-                  {gitEntries.map((entry) => (
-                    entry.name!==".git"&&(
-                    <button
-                      key={entry.path}
-                      onClick={() => {
-                        if (entry.type === "dir") {
-                          setGitPath(entry.path)
-                        }
-                      }}
-                      className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-sm text-slate-700 transition hover:bg-slate-50"
-                    >
-                      {entry.type === "dir" ? (
-                        <Folder className="h-4 w-4 text-cyan-600" />
-                      ) : (
-                        <FileCode2 className="h-4 w-4 text-slate-400" />
-                      )}
-                      <span>{entry.name}</span>
-                    </button>
-                  )))}
+                  {gitEntries.map((entry) =>
+                    entry.name !== ".git" ? (
+                      <button
+                        key={entry.path}
+                        onClick={() => {
+                          if (entry.type === "dir") {
+                            setGitPath(entry.path)
+                          }
+                        }}
+                        className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-sm text-slate-700 transition hover:bg-slate-50"
+                      >
+                        {entry.type === "dir" ? (
+                          <Folder className="h-4 w-4 text-cyan-600" />
+                        ) : (
+                          <FileCode2 className="h-4 w-4 text-slate-400" />
+                        )}
+                        <span>{entry.name}</span>
+                      </button>
+                    ) : null,
+                  )}
                   {gitEntries.length === 0 ? <p className="text-sm text-slate-500">No files found.</p> : null}
                 </div>
               )}
@@ -614,7 +739,9 @@ function SqlSourceDiscovery(props: {
               </CardHeader>
               <CardContent className="grid gap-4 lg:grid-cols-[220px_1fr_260px]">
                 <div className="rounded-xl border border-slate-200 bg-white p-3">
-                  <p className="text-xs uppercase tracking-wide text-slate-500">Tables ({analysis.tableDetails.tables.length})</p>
+                  <p className="text-xs uppercase tracking-wide text-slate-500">
+                    Tables ({analysis.tableDetails.tables.length})
+                  </p>
                   <div className="mt-2 space-y-1">
                     {analysis.tableDetails.tables.map((table) => (
                       <button
@@ -627,7 +754,7 @@ function SqlSourceDiscovery(props: {
                         }`}
                       >
                         <span>{table.name}</span>
-                        <span className="text-xs text-slate-400">{table.columns.length}</span>
+                        <span className="text-xs text-slate-400">{(table.columns ?? []).length}</span>
                       </button>
                     ))}
                   </div>
@@ -713,18 +840,18 @@ function SqlSourceDiscovery(props: {
                                   {table.name}
                                 </div>
                                 <div className="px-3 py-2 text-xs text-slate-600">
-                                  {table.columns.length > 0 ? (
+                                  {(table.columns ?? []).length > 0 ? (
                                     <ul className="space-y-1">
-                                      {table.columns.slice(0, 6).map((col) => (
+                                      {(table.columns ?? []).slice(0, 6).map((col) => (
                                         <li key={col}>{col}</li>
                                       ))}
                                     </ul>
                                   ) : (
                                     <p className="text-slate-400">No columns detected</p>
                                   )}
-                                  {table.columns.length > 6 ? (
+                                  {(table.columns ?? []).length > 6 ? (
                                     <p className="mt-1 text-[11px] text-slate-400">
-                                      +{table.columns.length - 6} more
+                                      +{(table.columns ?? []).length - 6} more
                                     </p>
                                   ) : null}
                                 </div>
@@ -796,7 +923,7 @@ function SqlSourceDiscovery(props: {
                         {(analysis.tableDetails.relationships ?? []).length > 0 ? (
                           analysis.tableDetails.relationships.map((rel, index) => (
                             <p key={`${rel.fromTable}-${rel.toTable}-${index}`}>
-                              {rel.fromTable}.{rel.fromColumn} → {rel.toTable}.{rel.toColumn}
+                              {rel.fromTable}.{rel.fromColumn} {"->"} {rel.toTable}.{rel.toColumn}
                             </p>
                           ))
                         ) : (
@@ -1058,6 +1185,9 @@ function DiscoveryPanel(props: DiscoveryPanelProps) {
         setSelectedObjects={props.setSelectedObjects}
         setAvailableProcedures={props.setAvailableProcedures}
         setSelectedProcedures={props.setSelectedProcedures}
+        setAnalyzedDependencies={props.setAnalyzedDependencies}
+        setSuggestedDependencies={props.setSuggestedDependencies}
+        onLoadingChange={props.onDiscoveryLoadingChange}
       />
     )
   }
@@ -1083,8 +1213,8 @@ function DiscoveryPanel(props: DiscoveryPanelProps) {
     )
   }
 
-  return (
-    <OracleDiscovery
+    return (
+      <OracleDiscovery
       host={props.dbHost}
       port={props.dbPort}
       serviceName={props.dbServiceName}
@@ -1104,11 +1234,13 @@ function DiscoveryPanel(props: DiscoveryPanelProps) {
       setSelectedObjects={props.setSelectedObjects}
       availableProcedures={props.availableProcedures}
       setAvailableProcedures={props.setAvailableProcedures}
-      selectedProcedures={props.selectedProcedures}
-      setSelectedProcedures={props.setSelectedProcedures}
-    />
-  )
-}
+        selectedProcedures={props.selectedProcedures}
+        setSelectedProcedures={props.setSelectedProcedures}
+        setAnalyzedDependencies={props.setAnalyzedDependencies}
+        setSuggestedDependencies={props.setSuggestedDependencies}
+      />
+    )
+  }
 
 interface StrategyPanelProps {
   springBootVersion: string
@@ -1133,6 +1265,10 @@ interface StrategyPanelProps {
   setProjectPackageName: (value: string) => void
   outputDirectory: string
   setOutputDirectory: (value: string) => void
+  analyzedDependencies: DependencyInsight[]
+  suggestedDependencies: SuggestedDependency[]
+  selectedOptionalDependencies: string[]
+  setSelectedOptionalDependencies: (deps: string[]) => void
 }
 
 function StrategyPanel(props: StrategyPanelProps) {
@@ -1140,6 +1276,49 @@ function StrategyPanel(props: StrategyPanelProps) {
   const [gradleFlavor, setGradleFlavor] = useState<"groovy" | "kotlin">("groovy")
   const [isPickingDir, setIsPickingDir] = useState(false)
   const [pickDirError, setPickDirError] = useState<string | null>(null)
+
+  function resolveSuggestedId(name: string): string | null {
+    const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+    if (!normalized) {
+      return null
+    }
+    if (normalized.includes("lombok")) return "lombok"
+    if (normalized.includes("security")) return "spring-boot-starter-security"
+    if (normalized.includes("cache")) return "spring-boot-starter-cache"
+    if (normalized.includes("batch")) return "spring-boot-starter-batch"
+    if (normalized.includes("mail")) return "spring-boot-starter-mail"
+    if (normalized.includes("webflux")) return "spring-boot-starter-webflux"
+    if (normalized.includes("redis")) return "spring-boot-starter-data-redis"
+    if (normalized.includes("mongo")) return "spring-boot-starter-data-mongodb"
+    if (normalized.includes("amqp") || normalized.includes("rabbit")) return "spring-boot-starter-amqp"
+    if (normalized.includes("quartz") || normalized.includes("scheduler")) return "spring-boot-starter-quartz"
+    if (normalized.includes("actuator")) return "spring-boot-starter-actuator"
+    if (normalized.includes("validation")) return "spring-boot-starter-validation"
+    if (normalized.includes("data jpa") || normalized.includes("jpa")) return "spring-boot-starter-data-jpa"
+    if (normalized.includes("web")) return "spring-boot-starter-web"
+    return null
+  }
+
+  const optionalSet = new Set(props.selectedOptionalDependencies)
+  const labelById = new Map(
+    props.suggestedDependencies
+      .map((dep) => {
+        const resolved = dep.coordinate ?? resolveSuggestedId(dep.name)
+        return resolved ? ([resolved, dep.name] as const) : null
+      })
+      .filter((item): item is readonly [string, string] => item !== null),
+  )
+
+  function addOptionalDependency(id: string) {
+    if (optionalSet.has(id)) {
+      return
+    }
+    props.setSelectedOptionalDependencies([...props.selectedOptionalDependencies, id])
+  }
+
+  function removeOptionalDependency(id: string) {
+    props.setSelectedOptionalDependencies(props.selectedOptionalDependencies.filter((dep) => dep !== id))
+  }
 
   async function handlePickDirectory() {
     try {
@@ -1383,11 +1562,83 @@ function StrategyPanel(props: StrategyPanelProps) {
         <div className="rounded-md border border-slate-200/80 bg-white p-4">
           <div className="flex items-center justify-between border-b border-slate-200/70 pb-3">
             <p className="text-sm font-semibold text-slate-900">Dependencies</p>
-            
+            <button
+              type="button"
+              className="rounded border border-slate-900 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-900"
+            >
+              Add dependencies... <span className="ml-2 text-[11px] font-semibold">CTRL + B</span>
+            </button>
           </div>
-          <p className="mt-4 text-sm text-slate-500">No dependency selected</p>
+          {props.analyzedDependencies.length > 0 ? (
+            <div className="mt-4 space-y-3 text-sm text-slate-700">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Required</p>
+              {props.analyzedDependencies.map((dependency) => (
+                <div key={dependency.id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                  <p className="font-semibold text-slate-900">{dependency.name}</p>
+                  <p className="text-xs text-slate-500">{dependency.reason}</p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-4 text-sm text-slate-500">No dependencies inferred yet.</p>
+          )}
+          <div className="mt-4 space-y-3 text-sm text-slate-700">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Suggested (LLM)</p>
+            {props.suggestedDependencies.length > 0 ? (
+              props.suggestedDependencies.map((dependency) => {
+                const resolvedId = dependency.coordinate ?? resolveSuggestedId(dependency.name)
+                const isAdded = resolvedId ? optionalSet.has(resolvedId) : false
+                return (
+                  <div key={dependency.name} className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="font-semibold text-slate-900">{dependency.name}</p>
+                        <p className="text-xs text-slate-500">{dependency.reason}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => resolvedId && addOptionalDependency(resolvedId)}
+                        disabled={!resolvedId || isAdded}
+                        className={`rounded px-3 py-1 text-xs font-semibold ${
+                          isAdded
+                            ? "bg-slate-100 text-slate-500"
+                            : resolvedId
+                              ? "bg-cyan-600 text-white"
+                              : "bg-slate-200 text-slate-400"
+                        }`}
+                      >
+                        {isAdded ? "Added" : resolvedId ? "Add" : "Unavailable"}
+                      </button>
+                    </div>
+                  </div>
+                )
+              })
+            ) : (
+              <p className="text-xs text-slate-500">
+                No LLM suggestions available yet. Run discovery with the backend online and an LLM configured to see recommendations.
+              </p>
+            )}
+          </div>
+          {props.selectedOptionalDependencies.length > 0 ? (
+            <div className="mt-4">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Included (Optional)</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {props.selectedOptionalDependencies.map((dep) => (
+                  <button
+                    key={dep}
+                    type="button"
+                    onClick={() => removeOptionalDependency(dep)}
+                    className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
+                  >
+                    {labelById.get(dep) ?? dep}
+                    <span className="text-slate-400">×</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <p className="mt-6 text-xs text-slate-400">
-            {DEFAULT_SPRING_DEPENDENCIES.length} defaults will be included during generation.
+            {DEFAULT_SPRING_DEPENDENCIES.length} baseline dependencies remain available for generation.
           </p>
         </div>
       </CardContent>
@@ -1421,6 +1672,23 @@ function SummaryPanel(props: SummaryPanelProps) {
       : props.sourceMethod === "git"
         ? `Git repository (${props.gitRepoUrl || "Not provided"})`
         : `Local file (${props.sourceFileName || "Not selected"})`
+  const isOracleSource = props.sourceMethod === "oracle"
+  const sourceDetailsTitle = isOracleSource ? "DB & Output Details" : "Source & Output Details"
+  const sourceDetailsDescription = isOracleSource
+    ? "Database context and generated project paths"
+    : "Source context and generated project paths"
+  const sourceTypeLabel =
+    props.sourceMethod === "git"
+      ? "Git repository"
+      : props.sourceMethod === "sqlfile"
+        ? "Local SQL file"
+        : "Oracle database"
+  const sourceLocationLabel =
+    props.sourceMethod === "git"
+      ? props.gitRepoUrl || "Not provided"
+      : props.sourceMethod === "sqlfile"
+        ? props.sourceFileName || "Not selected"
+        : `${props.dbHost}:${props.dbPort}/${props.dbServiceName}`
   const normalizedProcedures = props.selectedProcedures.map((name) => name.toLowerCase())
   const dominantDomains = []
   if (normalizedProcedures.some((name) => name.includes("validate") || name.includes("check"))) {
@@ -1554,34 +1822,63 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
 
       <Card>
         <CardHeader>
-          <CardTitle>DB & Output Details</CardTitle>
-          <CardDescription>Database context and generated project paths</CardDescription>
+          <CardTitle>{sourceDetailsTitle}</CardTitle>
+          <CardDescription>{sourceDetailsDescription}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">DB Connection</p>
-            <p className="text-sm font-semibold text-slate-800">
-              {props.dbHost}:{props.dbPort}/{props.dbServiceName}
-            </p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Databases in Scope</p>
-            <p className="text-sm font-semibold text-slate-800">
-              {props.selectedDatabases.length > 0 ? props.selectedDatabases.join(", ") : "No database selected"}
-            </p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Schemas in Scope</p>
-            <p className="text-sm font-semibold text-slate-800">
-              {props.selectedSchemas.length > 0 ? props.selectedSchemas.join(", ") : "No schema selected"}
-            </p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Objects in Scope</p>
-            <p className="text-sm font-semibold text-slate-800">
-              {props.selectedObjects.length > 0 ? `${props.selectedObjects.length} selected` : "No objects selected"}
-            </p>
-          </div>
+          {isOracleSource ? (
+            <>
+              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">DB Connection</p>
+                <p className="text-sm font-semibold text-slate-800">
+                  {props.dbHost}:{props.dbPort}/{props.dbServiceName}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Databases in Scope</p>
+                <p className="text-sm font-semibold text-slate-800">
+                  {props.selectedDatabases.length > 0 ? props.selectedDatabases.join(", ") : "No database selected"}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Schemas in Scope</p>
+                <p className="text-sm font-semibold text-slate-800">
+                  {props.selectedSchemas.length > 0 ? props.selectedSchemas.join(", ") : "No schema selected"}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Objects in Scope</p>
+                <p className="text-sm font-semibold text-slate-800">
+                  {props.selectedObjects.length > 0 ? `${props.selectedObjects.length} selected` : "No objects selected"}
+                </p>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Source Type</p>
+                <p className="text-sm font-semibold text-slate-800">{sourceTypeLabel}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Source Location</p>
+                <p className="text-sm font-semibold text-slate-800">{sourceLocationLabel}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Objects in Scope</p>
+                <p className="text-sm font-semibold text-slate-800">
+                  {props.selectedObjects.length > 0 ? `${props.selectedObjects.length} selected` : "No objects selected"}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Procedures in Scope</p>
+                <p className="text-sm font-semibold text-slate-800">
+                  {props.selectedProcedures.length > 0
+                    ? `${props.selectedProcedures.length} selected`
+                    : "No procedures selected"}
+                </p>
+              </div>
+            </>
+          )}
           <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Java Version</p>
             <p className="text-sm font-semibold text-slate-800">{props.javaVersion}</p>
@@ -1654,6 +1951,9 @@ interface PanelBodyProps {
   setAvailableProcedures: (procedures: string[]) => void
   selectedProcedures: string[]
   setSelectedProcedures: (procedures: string[]) => void
+  setAnalyzedDependencies: (deps: DependencyInsight[]) => void
+  setSuggestedDependencies: (deps: SuggestedDependency[]) => void
+  onDiscoveryLoadingChange?: (value: boolean) => void
   selectedStrategy: string
   springBootVersion: string
   setSpringBootVersion: (value: string) => void
@@ -1677,6 +1977,10 @@ interface PanelBodyProps {
   setProjectPackageName: (value: string) => void
   outputDirectory: string
   setOutputDirectory: (value: string) => void
+  analyzedDependencies: DependencyInsight[]
+  suggestedDependencies: SuggestedDependency[]
+  selectedOptionalDependencies: string[]
+  setSelectedOptionalDependencies: (deps: string[]) => void
   gitRepoUrl: string
   projectName: string
   conversionSnapshot: ConversionSnapshot | null
@@ -1745,6 +2049,9 @@ function PanelBody(props: PanelBodyProps) {
           setAvailableProcedures={props.setAvailableProcedures}
           selectedProcedures={props.selectedProcedures}
           setSelectedProcedures={props.setSelectedProcedures}
+          setAnalyzedDependencies={props.setAnalyzedDependencies}
+          setSuggestedDependencies={props.setSuggestedDependencies}
+          onDiscoveryLoadingChange={props.onDiscoveryLoadingChange}
         />
       )
     case 3:
@@ -1774,6 +2081,10 @@ function PanelBody(props: PanelBodyProps) {
               setProjectPackageName={props.setProjectPackageName}
               outputDirectory={props.outputDirectory}
               setOutputDirectory={props.setOutputDirectory}
+              analyzedDependencies={props.analyzedDependencies}
+              suggestedDependencies={props.suggestedDependencies}
+              selectedOptionalDependencies={props.selectedOptionalDependencies}
+              setSelectedOptionalDependencies={props.setSelectedOptionalDependencies}
             />
           )}
           <ConversionJobPanel
@@ -1798,6 +2109,7 @@ function PanelBody(props: PanelBodyProps) {
             projectDescription={props.projectDescription}
             projectPackageName={props.projectPackageName}
             outputDirectory={props.outputDirectory}
+            optionalDependencies={props.selectedOptionalDependencies}
             onConversionStart={props.onConversionStart}
             onSnapshotChange={props.onSnapshotChange}
           />
@@ -1830,6 +2142,7 @@ function PanelBody(props: PanelBodyProps) {
 }
 
 export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) {
+  const [isDiscoveryLoading, setIsDiscoveryLoading] = useState(false)
   const [sourceMethod, setSourceMethod] = useState<SourceMethod>("oracle")
   const [gitRepoUrl, setGitRepoUrl] = useState("")
   const [dbHost, setDbHost] = useState("localhost")
@@ -1861,8 +2174,17 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
   const [projectDescription, setProjectDescription] = useState("Demo project for Spring Boot")
   const [projectPackageName, setProjectPackageName] = useState("com.example.demo")
   const [outputDirectory, setOutputDirectory] = useState("")
+  const [analyzedDependencies, setAnalyzedDependencies] = useState<DependencyInsight[]>([])
+  const [suggestedDependencies, setSuggestedDependencies] = useState<SuggestedDependency[]>([])
+  const [selectedOptionalDependencies, setSelectedOptionalDependencies] = useState<string[]>([])
   const [conversionSnapshot, setConversionSnapshot] = useState<ConversionSnapshot | null>(null)
   const [hideSpringConfig, setHideSpringConfig] = useState(false)
+
+  useEffect(() => {
+    if (activeStep !== 2) {
+      setIsDiscoveryLoading(false)
+    }
+  }, [activeStep])
   const projectName =
     sourceMethod === "oracle"
       ? dbServiceName || "Generated Project"
@@ -1923,6 +2245,9 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
         setAvailableProcedures={setAvailableProcedures}
         selectedProcedures={selectedProcedures}
         setSelectedProcedures={setSelectedProcedures}
+        setAnalyzedDependencies={setAnalyzedDependencies}
+        setSuggestedDependencies={setSuggestedDependencies}
+        onDiscoveryLoadingChange={setIsDiscoveryLoading}
         selectedStrategy={selectedStrategy}
         springBootVersion={springBootVersion}
         setSpringBootVersion={setSpringBootVersion}
@@ -1946,6 +2271,10 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
         setProjectPackageName={setProjectPackageName}
         outputDirectory={outputDirectory}
         setOutputDirectory={setOutputDirectory}
+        analyzedDependencies={analyzedDependencies}
+        suggestedDependencies={suggestedDependencies}
+        selectedOptionalDependencies={selectedOptionalDependencies}
+        setSelectedOptionalDependencies={setSelectedOptionalDependencies}
         projectName={projectName}
         conversionSnapshot={conversionSnapshot}
         onSnapshotChange={setConversionSnapshot}
@@ -1955,7 +2284,11 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
         <Button variant="outline" onClick={onPrevious} disabled={activeStep === 1}>
           Previous
         </Button>
-        <Button onClick={onNext} disabled={activeStep === workflowSteps.length}>
+        <Button
+          onClick={onNext}
+          disabled={activeStep === workflowSteps.length || (activeStep === 2 && isDiscoveryLoading)}
+        >
+          {activeStep === 2 && isDiscoveryLoading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : null}
           Next step
         </Button>
       </div>

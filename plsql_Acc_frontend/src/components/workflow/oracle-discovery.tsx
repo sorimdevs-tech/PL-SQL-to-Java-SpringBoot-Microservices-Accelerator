@@ -10,6 +10,7 @@ import {
 } from "@/api/discoveryClient"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { getDependencySuggestions } from "@/lib/sql-discovery-api"
 import type { DiscoveryAnalyzeResponse, DiscoveryObject, OracleTestConnectionRequest } from "@/types/discovery"
 
 interface OracleDiscoveryProps {
@@ -34,6 +35,8 @@ interface OracleDiscoveryProps {
   setAvailableProcedures: (procedures: string[]) => void
   selectedProcedures: string[]
   setSelectedProcedures: (procedures: string[]) => void
+  setAnalyzedDependencies: (deps: { id: string; name: string; reason: string }[]) => void
+  setSuggestedDependencies: (deps: { name: string; reason: string }[]) => void
 }
 
 interface DualListSelectorProps {
@@ -464,6 +467,69 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
     void loadProcedureDetail(props.selectedProcedures[0] ?? "")
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.selectedProcedures])
+
+  useEffect(() => {
+    if (!analysis) {
+      props.setSuggestedDependencies([])
+      return
+    }
+    const operations = (analysis.operations ?? []).map((op) => op.toUpperCase())
+    const tables = analysis.tablesUsed ?? []
+    const inParams = analysis.parameters?.in ?? []
+    const outParams = analysis.parameters?.out ?? []
+    const dependencies = []
+    if (tables.length > 0) {
+      dependencies.push({
+        id: "data-jpa",
+        name: "Spring Data JPA",
+        reason: "Tables detected in SQL statements; JPA repositories will be generated.",
+      })
+      dependencies.push({
+        id: "oracle-driver",
+        name: "Oracle Driver",
+        reason: "SQL tables detected; JDBC driver is required for runtime access.",
+      })
+    }
+    if (operations.length > 0) {
+      dependencies.push({
+        id: "web",
+        name: "Spring Web",
+        reason: "Operations detected; REST endpoints will be exposed for generated services.",
+      })
+    }
+    if (inParams.length > 0 || outParams.length > 0) {
+      dependencies.push({
+        id: "validation",
+        name: "Validation",
+        reason: "Procedure parameters detected; request validation will be added.",
+      })
+    }
+    if (analysis.exceptions && analysis.exceptions.length > 0) {
+      dependencies.push({
+        id: "actuator",
+        name: "Actuator",
+        reason: "Exception handling detected; health/monitoring endpoints recommended.",
+      })
+    }
+    props.setAnalyzedDependencies(dependencies)
+    void (async () => {
+      try {
+        const suggestionResponse = await getDependencySuggestions({
+          procedure_name: analysis.procedureName,
+          object_type: analysis.objectType,
+          tables_used: analysis.tablesUsed,
+          operations: analysis.operations,
+          parameters_in: analysis.parameters?.in,
+          parameters_out: analysis.parameters?.out,
+          local_variables: analysis.localVariables,
+          exceptions: analysis.exceptions,
+        })
+        props.setSuggestedDependencies(suggestionResponse.suggestions ?? [])
+      } catch {
+        props.setSuggestedDependencies([])
+      }
+    })()
+  }, [analysis, props.setAnalyzedDependencies, props.setSuggestedDependencies])
 
   useEffect(() => {
     const maxReachableStep: 1 | 2 | 3 | 4 =

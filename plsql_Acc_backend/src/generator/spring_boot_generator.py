@@ -44,6 +44,101 @@ class SpringBootGenerator:
         'Value',
         'Constraint',
     }
+
+    EXTRA_DEPENDENCY_COORDINATES = {
+        "spring-retry": {
+            "group": "org.springframework.retry",
+            "artifact": "spring-retry",
+            "gradle": "implementation",
+        },
+        "mapstruct": {
+            "group": "org.mapstruct",
+            "artifact": "mapstruct",
+            "gradle": "implementation",
+        },
+        "flyway-core": {
+            "group": "org.flywaydb",
+            "artifact": "flyway-core",
+            "gradle": "implementation",
+        },
+        "micrometer-registry-prometheus": {
+            "group": "io.micrometer",
+            "artifact": "micrometer-registry-prometheus",
+            "gradle": "runtimeOnly",
+        },
+        "spring-boot-starter-security": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-security",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-cache": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-cache",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-batch": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-batch",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-mail": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-mail",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-webflux": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-webflux",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-data-redis": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-data-redis",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-data-mongodb": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-data-mongodb",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-amqp": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-amqp",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-quartz": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-quartz",
+            "gradle": "implementation",
+        },
+        "spring-boot-starter-actuator": {
+            "group": "org.springframework.boot",
+            "artifact": "spring-boot-starter-actuator",
+            "gradle": "implementation",
+        },
+        "lombok": {
+            "group": "org.projectlombok",
+            "artifact": "lombok",
+            "gradle": "compileOnly",
+            "annotationProcessor": True,
+            "scope": "provided",
+            "optional": True,
+        },
+    }
+
+    BASE_DEPENDENCY_IDS = {
+        "spring-boot-starter-web",
+        "spring-boot-starter-data-jpa",
+        "spring-boot-starter-validation",
+        "springdoc-openapi-starter-webmvc-ui",
+        "ojdbc8",
+        "mysql-connector-j",
+        "postgresql",
+        "spring-boot-starter-test",
+        "testcontainers",
+        "junit-jupiter",
+        "spring-boot-devtools",
+    }
     
     def __init__(self, config: Dict[str, Any]):
         """
@@ -64,6 +159,7 @@ class SpringBootGenerator:
         self.packaging = self._normalize_packaging(config.get('packaging', 'jar'))
         self.config_format = self._normalize_config_format(config.get('config_format', 'properties'))
         self.target_directory = Path(config.get('target_directory', './output'))
+        self.extra_dependencies = self._normalize_extra_dependencies(config.get('dependencies', []))
         
         # Create standard Spring Boot source layout.
         self.base_path = self.target_directory / 'src' / 'main' / 'java'
@@ -75,6 +171,82 @@ class SpringBootGenerator:
         self.package_path = self.base_path / self.package_name.replace('.', '/')
         
         logger.info(f"Spring Boot Generator initialized for project: {self.project_name}")
+
+    def _normalize_extra_dependencies(self, dependencies: List[str]) -> List[str]:
+        normalized: List[str] = []
+        for dep in dependencies or []:
+            if not dep:
+                continue
+            dep_id = str(dep).strip()
+            if not dep_id or dep_id in self.BASE_DEPENDENCY_IDS:
+                continue
+            if ":" in dep_id:
+                if dep_id not in normalized:
+                    normalized.append(dep_id)
+                continue
+            if dep_id in self.EXTRA_DEPENDENCY_COORDINATES and dep_id not in normalized:
+                normalized.append(dep_id)
+        return normalized
+
+    def _render_extra_maven_dependencies(self) -> str:
+        if not self.extra_dependencies:
+            return ""
+        blocks: List[str] = []
+        for dep_id in self.extra_dependencies:
+            info = self.EXTRA_DEPENDENCY_COORDINATES.get(dep_id)
+            if not info:
+                coordinate_parts = dep_id.split(":")
+                if len(coordinate_parts) >= 2:
+                    group_id = coordinate_parts[0]
+                    artifact_id = coordinate_parts[1]
+                    lines = [
+                        "<dependency>",
+                        f"    <groupId>{group_id}</groupId>",
+                        f"    <artifactId>{artifact_id}</artifactId>",
+                        "</dependency>",
+                    ]
+                    blocks.append("\n        ".join(lines))
+                continue
+            scope = info.get("scope")
+            optional = info.get("optional")
+            lines = [
+                "<dependency>",
+                f"    <groupId>{info['group']}</groupId>",
+                f"    <artifactId>{info['artifact']}</artifactId>",
+            ]
+            if scope:
+                lines.append(f"    <scope>{scope}</scope>")
+            if optional:
+                lines.append("    <optional>true</optional>")
+            lines.append("</dependency>")
+            blocks.append("\n        ".join(lines))
+        if not blocks:
+            return ""
+        return "\n        " + "\n        ".join(blocks)
+
+    def _render_extra_gradle_dependencies(self) -> str:
+        if not self.extra_dependencies:
+            return ""
+        lines: List[str] = []
+        for dep_id in self.extra_dependencies:
+            info = self.EXTRA_DEPENDENCY_COORDINATES.get(dep_id)
+            if not info:
+                coordinate_parts = dep_id.split(":")
+                if len(coordinate_parts) >= 2:
+                    coordinate = f"{coordinate_parts[0]}:{coordinate_parts[1]}"
+                    lines.append(f"implementation '{coordinate}'")
+                continue
+            coordinate = f"{info['group']}:{info['artifact']}"
+            if dep_id == "lombok":
+                lines.append(f"compileOnly '{coordinate}'")
+                if info.get("annotationProcessor"):
+                    lines.append(f"annotationProcessor '{coordinate}'")
+                continue
+            config = info.get("gradle", "implementation")
+            lines.append(f"{config} '{coordinate}'")
+        if not lines:
+            return ""
+        return "\n    " + "\n    ".join(lines)
     
     async def generate_project(self, java_code: Dict[str, str]) -> Dict[str, Any]:
         """
@@ -255,6 +427,7 @@ class SpringBootGenerator:
             <scope>runtime</scope>
             <optional>true</optional>
         </dependency>
+        {self._render_extra_maven_dependencies()}
     </dependencies>
 
     <build>
@@ -327,6 +500,7 @@ dependencies {{
     testImplementation 'org.testcontainers:junit-jupiter'
     
     developmentOnly 'org.springframework.boot:spring-boot-devtools'
+{self._render_extra_gradle_dependencies()}
 }}
 
 tasks.named('test') {{

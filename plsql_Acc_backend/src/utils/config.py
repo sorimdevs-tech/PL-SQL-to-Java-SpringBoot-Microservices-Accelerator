@@ -61,6 +61,7 @@ class OutputConfig(BaseModel):
     generate_tests: bool = True
     generate_docs: bool = True
     format_code: bool = True
+    dependencies: list[str] = []
 
 
 class ValidationConfig(BaseModel):

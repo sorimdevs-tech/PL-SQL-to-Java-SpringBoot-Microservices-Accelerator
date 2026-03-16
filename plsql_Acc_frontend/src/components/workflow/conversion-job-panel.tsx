@@ -49,6 +49,7 @@ interface ConversionJobPanelProps {
   projectDescription: string
   projectPackageName: string
   outputDirectory: string
+  optionalDependencies: string[]
   onConversionStart: () => void
   onSnapshotChange: (snapshot: ConversionSnapshot | null) => void
 }
@@ -264,6 +265,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           packaging: props.packaging,
           config_format: props.springConfigFormat,
           target_directory: props.outputDirectory.trim() || undefined,
+          dependencies: props.optionalDependencies.length ? props.optionalDependencies : undefined,
         },
       }
       const outputDirectory = props.outputDirectory.trim() || undefined
@@ -366,12 +368,12 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
               Start Conversion
             </Button>
           )}
-          {job?.job_id ? (
+          {/* {job?.job_id ? (
             <Button variant="outline" onClick={() => void refreshJobStatus(job.job_id, true)} disabled={isRefreshing}>
               {isRefreshing ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
               Refresh Status
             </Button>
-          ) : null}
+          ) : null} */}
           {job?.job_id && job.status === "completed" ? (
             <a
               href={getJobDownloadUrl(job.job_id)}

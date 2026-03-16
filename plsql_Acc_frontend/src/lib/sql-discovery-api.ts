@@ -1,4 +1,6 @@
 import type {
+  DependencySuggestionRequest,
+  DependencySuggestionResponse,
   GitRepoTreeResponse,
   SqlDiscoveryAnalyzeResponse,
   SqlDiscoveryUploadResponse,
@@ -75,4 +77,16 @@ export async function getGitRepoTree(
   })
 
   return parseJsonResponse<GitRepoTreeResponse>(response)
+}
+
+export async function getDependencySuggestions(
+  payload: DependencySuggestionRequest,
+): Promise<DependencySuggestionResponse> {
+  const response = await fetch(toApiUrl("/api/discovery/dependency-suggestions"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+
+  return parseJsonResponse<DependencySuggestionResponse>(response)
 }

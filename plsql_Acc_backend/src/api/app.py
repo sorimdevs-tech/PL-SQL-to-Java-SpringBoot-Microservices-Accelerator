@@ -22,7 +22,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from main import PLSQLModernizationPipeline
+from src.converter.llm_engine import LLMConversionEngine
 from src.parser.discovery_analyzer import analyze_sql_source
+from src.utils.config import load_config
 from src.parser.sql_table_discovery import SQLDiscoveryParseError, extract_create_table_names
 
 
@@ -126,6 +128,19 @@ class DiscoveryAnalyzeRequest(BaseModel):
     repo_url: Optional[str] = None
     branch: Optional[str] = None
     path_filters: List[str] = Field(default_factory=list)
+
+
+class DependencySuggestionRequest(BaseModel):
+    """Request body for dependency suggestion."""
+
+    procedure_name: Optional[str] = None
+    object_type: Optional[str] = None
+    tables_used: List[str] = Field(default_factory=list)
+    operations: List[str] = Field(default_factory=list)
+    parameters_in: List[Dict[str, str]] = Field(default_factory=list)
+    parameters_out: List[Dict[str, str]] = Field(default_factory=list)
+    local_variables: List[Dict[str, str]] = Field(default_factory=list)
+    exceptions: List[str] = Field(default_factory=list)
 
 
 DISCOVERY_FILE_EXTENSIONS = {".sql", ".pks", ".pkb", ".pls", ".prc", ".fnc"}
@@ -1246,6 +1261,34 @@ async def list_git_tree(request: GitRepoTreeRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Internal server error: {exc}") from exc
+
+
+@app.post("/api/discovery/dependency-suggestions")
+async def dependency_suggestions(request: DependencySuggestionRequest) -> Dict[str, Any]:
+    """Return optional dependency suggestions from the LLM."""
+    try:
+        config = load_config("config.json")
+        llm_cfg = config.llm.model_dump() if hasattr(config.llm, "model_dump") else config.llm.dict()
+        llm = LLMConversionEngine(llm_cfg)
+        suggestions = await llm.suggest_dependencies(
+            {
+                "procedureName": request.procedure_name,
+                "objectType": request.object_type,
+                "tablesUsed": request.tables_used,
+                "operations": request.operations,
+                "parameters": {
+                    "in": request.parameters_in,
+                    "out": request.parameters_out,
+                },
+                "localVariables": request.local_variables,
+                "exceptions": request.exceptions,
+            }
+        )
+        return {"suggestions": suggestions}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Suggestion failed: {exc}") from exc
 
 
 @app.post("/api/jobs/file")

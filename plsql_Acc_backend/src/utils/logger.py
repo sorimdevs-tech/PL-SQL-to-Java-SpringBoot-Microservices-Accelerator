@@ -5,22 +5,36 @@ Logging utilities for PL/SQL Modernization Platform
 import logging
 import sys
 from typing import Optional
-from rich.logging import RichHandler
-from rich.console import Console
-from rich.theme import Theme
+
+try:
+    from rich.logging import RichHandler
+    from rich.console import Console
+    from rich.theme import Theme
+    _RICH_AVAILABLE = True
+except ModuleNotFoundError:
+    RichHandler = None
+    Console = None
+    Theme = None
+    _RICH_AVAILABLE = False
 
 
 # Custom theme for rich logging
-CUSTOM_THEME = Theme({
-    "info": "dim cyan",
-    "warning": "magenta",
-    "error": "bold red",
-    "success": "bold green",
-    "debug": "dim blue",
-})
+CUSTOM_THEME = (
+    Theme(
+        {
+            "info": "dim cyan",
+            "warning": "magenta",
+            "error": "bold red",
+            "success": "bold green",
+            "debug": "dim blue",
+        }
+    )
+    if _RICH_AVAILABLE
+    else None
+)
 
 
-def setup_logging(level: int = logging.INFO, use_rich: bool = True, 
+def setup_logging(level: int = logging.INFO, use_rich: bool = True,
                  log_file: Optional[str] = None):
     """
     Setup logging configuration for the platform
@@ -43,7 +57,7 @@ def setup_logging(level: int = logging.INFO, use_rich: bool = True,
     logger.handlers.clear()
     
     # Console handler with rich formatting
-    if use_rich:
+    if use_rich and _RICH_AVAILABLE:
         console = Console(theme=CUSTOM_THEME)
         console_handler = RichHandler(
             console=console,
@@ -88,6 +102,8 @@ def setup_logging(level: int = logging.INFO, use_rich: bool = True,
     logging.getLogger('httpx').setLevel(logging.WARNING)
     
     # Log platform startup
+    if use_rich and not _RICH_AVAILABLE:
+        logger.info("Rich is not installed; falling back to standard console logging.")
     logger.info("PL/SQL Modernization Platform logging initialized")
     logger.debug(f"Logging level set to: {logging.getLevelName(level)}")
 
@@ -103,7 +119,7 @@ class ProgressLogger:
             logger_name (str): Name of the logger
         """
         self.logger = logging.getLogger(logger_name)
-        self.console = Console(theme=CUSTOM_THEME)
+        self.console = Console(theme=CUSTOM_THEME) if _RICH_AVAILABLE else None
     
     def start_stage(self, stage_name: str, description: str = ""):
         """

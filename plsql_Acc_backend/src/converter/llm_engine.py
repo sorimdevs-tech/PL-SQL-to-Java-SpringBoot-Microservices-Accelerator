@@ -1387,6 +1387,182 @@ public class {service_name} {{
             'concurrent_requests': self.max_concurrent_requests
         }
 
+    async def suggest_dependencies(self, context: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Suggest optional dependencies based on discovery context."""
+        prompt = (
+            "You are a senior Java Spring Boot architect. "
+            "Given the PL/SQL discovery context below, recommend OPTIONAL dependencies that are helpful "
+            "but not strictly required. Return JSON only as an array of objects with keys "
+            "`name`, `reason` (short, one sentence), and `coordinate` where coordinate is the Maven "
+            "groupId:artifactId string. Do not include required defaults like Spring Web, "
+            "Spring Data JPA, or JDBC drivers unless the reason is compelling.\n\n"
+            f"Context JSON:\n{json.dumps(context, ensure_ascii=True, indent=2)}"
+        )
+        fallback_prompt = (
+            "Return ONLY a JSON array. Each item must include "
+            "`name`, `reason`, and `coordinate` (groupId:artifactId). "
+            "No prose, no markdown.\n\n"
+            f"Context JSON:\n{json.dumps(context, ensure_ascii=True)}"
+        )
+        try:
+            raw = await self.provider.generate_code(prompt, max_tokens=400, temperature=0.2)
+        except Exception as exc:
+            logger.error(f"Dependency suggestion failed: {exc}")
+            return []
+        try:
+            if not raw:
+                logger.warning("Dependency suggestion response was empty. Retrying with fallback prompt.")
+                try:
+                    raw = await self.provider.generate_code(fallback_prompt, max_tokens=400, temperature=0.0)
+                except Exception as exc:
+                    logger.error(f"Dependency suggestion fallback failed: {exc}")
+                    return []
+            if not raw:
+                logger.warning("Dependency suggestion response was empty after fallback.")
+                return []
+            suggestions = self._parse_dependency_suggestions(raw)
+            if not suggestions:
+                preview = raw.strip().replace("\n", " ")
+                logger.warning(
+                    "Dependency suggestion parse returned empty. Raw preview: %s",
+                    preview[:800],
+                )
+            return suggestions
+        except Exception as exc:
+            logger.exception("Dependency suggestion parsing failed")
+            return []
+
+    def _parse_dependency_suggestions(self, raw: str) -> List[Dict[str, str]]:
+        """Parse a JSON array of dependency suggestions from model output."""
+        if not raw:
+            return []
+        text = raw.strip()
+        fence_match = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            text = fence_match.group(1).strip()
+        # Try raw decode from the first JSON token in the string.
+        decoder = json.JSONDecoder()
+        parsed = None
+        for token in ("[", "{"):
+            start = text.find(token)
+            if start == -1:
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(text[start:])
+                break
+            except Exception:
+                parsed = None
+                continue
+        if parsed is None:
+            return self._parse_dependency_suggestions_fallback(text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("suggestions"), list):
+            parsed = parsed.get("suggestions")
+        if not isinstance(parsed, list):
+            return self._parse_dependency_suggestions_fallback(text)
+        suggestions: List[Dict[str, str]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            reason = item.get("reason")
+            coordinate = (
+                item.get("coordinate")
+                or item.get("mavenCoordinate")
+                or item.get("maven_coordinate")
+                or item.get("dependency")
+            )
+            if isinstance(name, str) and isinstance(reason, str):
+                payload = {"name": name.strip(), "reason": reason.strip()}
+                if isinstance(coordinate, str) and coordinate.strip():
+                    payload["coordinate"] = coordinate.strip()
+                suggestions.append(payload)
+        return suggestions
+
+    def _parse_dependency_suggestions_fallback(self, text: str) -> List[Dict[str, str]]:
+        """Fallback parsing when JSON is malformed or truncated."""
+        suggestions: List[Dict[str, str]] = []
+
+        def _coerce_str(value: str) -> str:
+            try:
+                return json.loads(f"\"{value}\"")
+            except Exception:
+                return value
+
+        for match in re.finditer(r"\{[^{}]*\}", text, flags=re.DOTALL):
+            block = match.group(0)
+            obj = None
+            try:
+                obj = json.loads(block)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                name = obj.get("name")
+                reason = obj.get("reason")
+                coordinate = (
+                    obj.get("coordinate")
+                    or obj.get("mavenCoordinate")
+                    or obj.get("maven_coordinate")
+                    or obj.get("dependency")
+                )
+                if isinstance(name, str) and isinstance(reason, str):
+                    payload = {"name": name.strip(), "reason": reason.strip()}
+                    if isinstance(coordinate, str) and coordinate.strip():
+                        payload["coordinate"] = coordinate.strip()
+                    suggestions.append(payload)
+                continue
+
+            name_match = re.search(r'"name"\s*:\s*"(?P<name>[^"]+)"', block)
+            reason_match = re.search(r'"reason"\s*:\s*"(?P<reason>[^"]+)"', block)
+            coord_match = re.search(
+                r'"(?:coordinate|mavenCoordinate|maven_coordinate|dependency)"\s*:\s*"(?P<coord>[^"]+)"',
+                block,
+            )
+            if name_match and reason_match:
+                payload = {
+                    "name": _coerce_str(name_match.group("name")).strip(),
+                    "reason": _coerce_str(reason_match.group("reason")).strip(),
+                }
+                if coord_match:
+                    payload["coordinate"] = _coerce_str(coord_match.group("coord")).strip()
+                suggestions.append(payload)
+
+        if suggestions:
+            return suggestions
+
+        # Loose extraction for truncated JSON (no closing brace)
+        loose_pattern = re.compile(
+            r'"name"\s*:\s*"(?P<name>[^"]+)"(?:(?!\"name\").)*?"reason"\s*:\s*"(?P<reason>[^"]+)"'
+            r'(?:(?!\"name\").)*?"(?:coordinate|mavenCoordinate|maven_coordinate|dependency)"\s*:\s*"(?P<coord>[^"]+)"?',
+            flags=re.DOTALL,
+        )
+        for match in loose_pattern.finditer(text):
+            payload = {
+                "name": _coerce_str(match.group("name")).strip(),
+                "reason": _coerce_str(match.group("reason")).strip(),
+            }
+            coord = match.groupdict().get("coord")
+            if coord:
+                payload["coordinate"] = _coerce_str(coord).strip()
+            suggestions.append(payload)
+
+        if suggestions:
+            return suggestions
+
+        # Last resort: pairwise name/reason (no coordinate)
+        name_reason_pattern = re.compile(
+            r'"name"\s*:\s*"(?P<name>[^"]+)"(?:(?!\"name\").){0,600}?"reason"\s*:\s*"(?P<reason>[^"]+)"',
+            flags=re.DOTALL,
+        )
+        for match in name_reason_pattern.finditer(text):
+            suggestions.append(
+                {
+                    "name": _coerce_str(match.group("name")).strip(),
+                    "reason": _coerce_str(match.group("reason")).strip(),
+                }
+            )
+
+        return suggestions
+
 
 def create_llm_engine(config: Dict[str, Any]) -> LLMConversionEngine:
     """Create and return a configured LLM conversion engine"""
