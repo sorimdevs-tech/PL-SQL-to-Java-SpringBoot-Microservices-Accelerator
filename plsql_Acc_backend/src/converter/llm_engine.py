@@ -3,6 +3,8 @@ LLM Conversion Engine for PL/SQL Modernization Platform
 Converts PL/SQL AST to Java code using Large Language Models
 """
 
+# from email import errors
+from email import errors
 import os
 import json
 import asyncio
@@ -250,6 +252,8 @@ class PromptTemplate:
         format_context.setdefault('package_name', 'com.company.project')
         format_context.setdefault('dependencies', [])
         format_context.setdefault('tables', [])
+        format_context.setdefault('entity_names', [])
+        format_context.setdefault('repository_names', [])
         format_context['plsql_code'] = self._format_plsql_ast(plsql_ast)
         return template.format(**format_context)
     
@@ -273,17 +277,121 @@ Requirements:
 Context:
 - Dependencies: {dependencies}
 - Tables involved: {tables}
+- Allowed Entities: {entity_names}
+- Allowed Repositories: {repository_names}
 
-Output Rules (STRICT):
-- Output exactly ONE Java class.
-- Package must be: {package_name}.service
-- Include ALL required imports (no missing symbols).
-- Do NOT define repository interfaces, entities, DTOs, controllers, configs, or nested classes.
-- Assume repositories/entities already exist and only reference them.
-- Use jakarta.* (not javax.*).
-- No markdown, no explanations, code only.
+Output Rules (STRICT - COMPILATION SAFE MODE):
+
+You MUST ensure the generated code compiles WITHOUT ANY MODIFICATION.
+
+Hard Constraints:
+1. Every method must have:
+   - Correct return type (never mismatch with usage)
+   - All required parameters (no empty methods unless justified)
+
+2. NEVER generate:
+   - Methods without parameters if logic requires input
+   - void return if a value is returned or expected
+   - Missing @RequestBody for POST APIs
+   - Service methods without parameters if controller sends data
+
+3. Layer Consistency Rules:
+   - If Controller calls service with parameter → Service MUST accept it
+   - If Service returns entity → Controller MUST expect same type
+   - Types must match EXACTLY across layers
+
+4. Spring Boot Rules:
+   - Controller methods MUST include @RequestBody for POST
+   - Service methods MUST include @Transactional if DB operation
+   - Repository save() must return entity
+
+5. Imports:
+   - ALL used classes MUST be imported
+   - No missing imports allowed
+
+6. Compilation Simulation:
+   Before output:
+   - Check method signatures match usage
+   - Check return types match
+   - Check no undefined variables/classes
+   - If any issue → FIX before output
+
+7. If unsure:
+   - Prefer working minimal implementation over incomplete logic
+
+8. Output:
+   - ONLY Java code
+   - NO explanations
+
+9. Return Type Rule (CRITICAL):
+- If service method returns void → controller MUST NOT return it inside ResponseEntity
+- Instead:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- If controller returns ResponseEntity<T> → service MUST return T
+
+10. Entity Safety Rule:
+- NEVER use a setter unless field exists in entity
+- If unsure → DO NOT SET FIELD
+
+11. Controller Safety Rule:
+- NEVER directly return service method inside ResponseEntity.ok(...)
+- Always:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- Allowed Entity Fields:
+{entity_fields}
+STRICT:
+- Use ONLY these fields
+- DO NOT invent fields like status, createdAt unless they exist in the entity
+
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
 
 Generate the complete Java service class with all necessary imports and annotations.
+
+========================
+🚨 CRITICAL OUTPUT STRUCTURE RULE (MANDATORY)
+========================
+
+You MUST generate a COMPLETE Java file.
+
+The output MUST ALWAYS include:
+
+1. package declaration at the top
+2. all required import statements
+3. exactly one FULL class or interface definition
+
+Structure must be:
+
+package xxx;
+
+import ...;
+
+public class OR interface ClassName {
+    // complete implementation
+}
+
+❌ STRICTLY FORBIDDEN:
+- partial code snippets
+- only methods without class
+- only annotations
+- missing package
+- missing imports
+- multiple unrelated classes
+
+If the output is not a COMPLETE Java class/interface → REGENERATE internally before returning.
+
 """
     
     def _get_function_template(self) -> str:
@@ -307,17 +415,119 @@ Requirements:
 Context:
 - Dependencies: {dependencies}
 - Tables involved: {tables}
+- Allowed Entities: {entity_names}
+- Allowed Repositories: {repository_names}
 
-Output Rules (STRICT):
-- Output exactly ONE Java class.
-- Package must be: {package_name}.service
-- Include ALL required imports (no missing symbols).
-- Do NOT define repository interfaces, entities, DTOs, controllers, configs, or nested classes.
-- Assume repositories/entities already exist and only reference them.
-- Use jakarta.* (not javax.*).
-- No markdown, no explanations, code only.
+Output Rules (STRICT - COMPILATION SAFE MODE):
+
+You MUST ensure the generated code compiles WITHOUT ANY MODIFICATION.
+
+Hard Constraints:
+1. Every method must have:
+   - Correct return type (never mismatch with usage)
+   - All required parameters (no empty methods unless justified)
+
+2. NEVER generate:
+   - Methods without parameters if logic requires input
+   - void return if a value is returned or expected
+   - Missing @RequestBody for POST APIs
+   - Service methods without parameters if controller sends data
+
+3. Layer Consistency Rules:
+   - If Controller calls service with parameter → Service MUST accept it
+   - If Service returns entity → Controller MUST expect same type
+   - Types must match EXACTLY across layers
+
+4. Spring Boot Rules:
+   - Controller methods MUST include @RequestBody for POST
+   - Service methods MUST include @Transactional if DB operation
+   - Repository save() must return entity
+
+5. Imports:
+   - ALL used classes MUST be imported
+   - No missing imports allowed
+
+6. Compilation Simulation:
+   Before output:
+   - Check method signatures match usage
+   - Check return types match
+   - Check no undefined variables/classes
+   - If any issue → FIX before output
+
+7. If unsure:
+   - Prefer working minimal implementation over incomplete logic
+
+8. Output:
+   - ONLY Java code
+   - NO explanations
+
+9. Return Type Rule (CRITICAL):
+- If service method returns void → controller MUST NOT return it inside ResponseEntity
+- Instead:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- If controller returns ResponseEntity<T> → service MUST return T
+
+10. Entity Safety Rule:
+- NEVER use a setter unless field exists in entity
+- If unsure → DO NOT SET FIELD
+
+11. Controller Safety Rule:
+- NEVER directly return service method inside ResponseEntity.ok(...)
+- Always:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- Allowed Entity Fields:
+{entity_fields}
+STRICT:
+- Use ONLY these fields
+- DO NOT invent fields like status, createdAt unless they exist in the entity
+
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
 
 Generate the complete Java service class with all necessary imports and annotations.
+========================
+🚨 CRITICAL OUTPUT STRUCTURE RULE (MANDATORY)
+========================
+
+You MUST generate a COMPLETE Java file.
+
+The output MUST ALWAYS include:
+
+1. package declaration at the top
+2. all required import statements
+3. exactly one FULL class or interface definition
+
+Structure must be:
+
+package xxx;
+
+import ...;
+
+public class OR interface ClassName {
+    // complete implementation
+}
+
+❌ STRICTLY FORBIDDEN:
+- partial code snippets
+- only methods without class
+- only annotations
+- missing package
+- missing imports
+- multiple unrelated classes
+
+If the output is not a COMPLETE Java class/interface → REGENERATE internally before returning.
 """
     
     def _get_trigger_template(self) -> str:
@@ -343,17 +553,119 @@ Context:
 - Trigger timing: {trigger_timing}
 - Trigger event: {trigger_event}
 - Table: {table}
+- Allowed Entities: {entity_names}
+- Allowed Repositories: {repository_names}
 
-Output Rules (STRICT):
-- Output exactly ONE Java class.
-- Package must be: {package_name}.service
-- Include ALL required imports (no missing symbols).
-- Do NOT define repository interfaces, entities, DTOs, controllers, configs, or nested classes.
-- Assume repositories/entities already exist and only reference them.
-- Use jakarta.* (not javax.*).
-- No markdown, no explanations, code only.
+Output Rules (STRICT - COMPILATION SAFE MODE):
+
+You MUST ensure the generated code compiles WITHOUT ANY MODIFICATION.
+
+Hard Constraints:
+1. Every method must have:
+   - Correct return type (never mismatch with usage)
+   - All required parameters (no empty methods unless justified)
+
+2. NEVER generate:
+   - Methods without parameters if logic requires input
+   - void return if a value is returned or expected
+   - Missing @RequestBody for POST APIs
+   - Service methods without parameters if controller sends data
+
+3. Layer Consistency Rules:
+   - If Controller calls service with parameter → Service MUST accept it
+   - If Service returns entity → Controller MUST expect same type
+   - Types must match EXACTLY across layers
+
+4. Spring Boot Rules:
+   - Controller methods MUST include @RequestBody for POST
+   - Service methods MUST include @Transactional if DB operation
+   - Repository save() must return entity
+
+5. Imports:
+   - ALL used classes MUST be imported
+   - No missing imports allowed
+
+6. Compilation Simulation:
+   Before output:
+   - Check method signatures match usage
+   - Check return types match
+   - Check no undefined variables/classes
+   - If any issue → FIX before output
+
+7. If unsure:
+   - Prefer working minimal implementation over incomplete logic
+
+8. Output:
+   - ONLY Java code
+   - NO explanations
+
+9. Return Type Rule (CRITICAL):
+- If service method returns void → controller MUST NOT return it inside ResponseEntity
+- Instead:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- If controller returns ResponseEntity<T> → service MUST return T
+
+10. Entity Safety Rule:
+- NEVER use a setter unless field exists in entity
+- If unsure → DO NOT SET FIELD
+
+11. Controller Safety Rule:
+- NEVER directly return service method inside ResponseEntity.ok(...)
+- Always:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- Allowed Entity Fields:
+{entity_fields}
+STRICT:
+- Use ONLY these fields
+- DO NOT invent fields like status, createdAt unless they exist in the entity
+
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
 
 Generate the complete Java class with all necessary imports and annotations.
+========================
+🚨 CRITICAL OUTPUT STRUCTURE RULE (MANDATORY)
+========================
+
+You MUST generate a COMPLETE Java file.
+
+The output MUST ALWAYS include:
+
+1. package declaration at the top
+2. all required import statements
+3. exactly one FULL class or interface definition
+
+Structure must be:
+
+package xxx;
+
+import ...;
+
+public class OR interface ClassName {
+    // complete implementation
+}
+
+❌ STRICTLY FORBIDDEN:
+- partial code snippets
+- only methods without class
+- only annotations
+- missing package
+- missing imports
+- multiple unrelated classes
+
+If the output is not a COMPLETE Java class/interface → REGENERATE internally before returning.
 """
     
     def _get_package_template(self) -> str:
@@ -378,17 +690,120 @@ Context:
 - Package procedures: {procedures}
 - Package functions: {functions}
 - Dependencies: {dependencies}
+- Allowed Entities: {entity_names}
+- Allowed Repositories: {repository_names}
 
-Output Rules (STRICT):
-- Output exactly ONE Java class (service-style wrapper for the package).
-- Package must be: {package_name}.service
-- Include ALL required imports (no missing symbols).
-- Do NOT define repository interfaces, entities, DTOs, controllers, configs, or nested classes.
-- Assume repositories/entities already exist and only reference them.
-- Use jakarta.* (not javax.*).
-- No markdown, no explanations, code only.
+Output Rules (STRICT - COMPILATION SAFE MODE):
+
+You MUST ensure the generated code compiles WITHOUT ANY MODIFICATION.
+
+Hard Constraints:
+1. Every method must have:
+   - Correct return type (never mismatch with usage)
+   - All required parameters (no empty methods unless justified)
+
+2. NEVER generate:
+   - Methods without parameters if logic requires input
+   - void return if a value is returned or expected
+   - Missing @RequestBody for POST APIs
+   - Service methods without parameters if controller sends data
+
+3. Layer Consistency Rules:
+   - If Controller calls service with parameter → Service MUST accept it
+   - If Service returns entity → Controller MUST expect same type
+   - Types must match EXACTLY across layers
+
+4. Spring Boot Rules:
+   - Controller methods MUST include @RequestBody for POST
+   - Service methods MUST include @Transactional if DB operation
+   - Repository save() must return entity
+
+5. Imports:
+   - ALL used classes MUST be imported
+   - No missing imports allowed
+
+6. Compilation Simulation:
+   Before output:
+   - Check method signatures match usage
+   - Check return types match
+   - Check no undefined variables/classes
+   - If any issue → FIX before output
+
+7. If unsure:
+   - Prefer working minimal implementation over incomplete logic
+
+8. Output:
+   - ONLY Java code
+   - NO explanations
+
+9. Return Type Rule (CRITICAL):
+- If service method returns void → controller MUST NOT return it inside ResponseEntity
+- Instead:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- If controller returns ResponseEntity<T> → service MUST return T
+
+10. Entity Safety Rule:
+- NEVER use a setter unless field exists in entity
+- If unsure → DO NOT SET FIELD
+
+11. Controller Safety Rule:
+- NEVER directly return service method inside ResponseEntity.ok(...)
+- Always:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- Allowed Entity Fields:
+{entity_fields}
+
+STRICT:
+- Use ONLY fields that exist in entity
+- DO NOT create fields like status, createdAt unless present
+
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
 
 Generate the complete Java class with all necessary imports and annotations.
+========================
+🚨 CRITICAL OUTPUT STRUCTURE RULE (MANDATORY)
+========================
+
+You MUST generate a COMPLETE Java file.
+
+The output MUST ALWAYS include:
+
+1. package declaration at the top
+2. all required import statements
+3. exactly one FULL class or interface definition
+
+Structure must be:
+
+package xxx;
+
+import ...;
+
+public class OR interface ClassName {
+    // complete implementation
+}
+
+❌ STRICTLY FORBIDDEN:
+- partial code snippets
+- only methods without class
+- only annotations
+- missing package
+- missing imports
+- multiple unrelated classes
+
+If the output is not a COMPLETE Java class/interface → REGENERATE internally before returning.
 """
     
     def _get_sql_template(self) -> str:
@@ -412,17 +827,117 @@ Context:
 - Table: {table}
 - Columns: {columns}
 
-Output Rules (STRICT):
-- Output exactly ONE Java interface.
-- Package must be: {package_name}.repository
-- Include ALL required imports (JpaRepository, Query, Param, Modifying, Transactional, List/Optional, LocalDateTime if used).
-- Add @Repository annotation.
-- Use entity type: {entity}
-- Do NOT define entities, services, controllers, configs, or extra helper classes.
-- Use jakarta.* (not javax.*).
-- No markdown, no explanations, code only.
+Output Rules (STRICT - COMPILATION SAFE MODE):
+
+You MUST ensure the generated code compiles WITHOUT ANY MODIFICATION.
+
+Hard Constraints:
+1. Every method must have:
+   - Correct return type (never mismatch with usage)
+   - All required parameters (no empty methods unless justified)
+
+2. NEVER generate:
+   - Methods without parameters if logic requires input
+   - void return if a value is returned or expected
+   - Missing @RequestBody for POST APIs
+   - Service methods without parameters if controller sends data
+
+3. Layer Consistency Rules:
+   - If Controller calls service with parameter → Service MUST accept it
+   - If Service returns entity → Controller MUST expect same type
+   - Types must match EXACTLY across layers
+
+4. Spring Boot Rules:
+   - Controller methods MUST include @RequestBody for POST
+   - Service methods MUST include @Transactional if DB operation
+   - Repository save() must return entity
+
+5. Imports:
+   - ALL used classes MUST be imported
+   - No missing imports allowed
+
+6. Compilation Simulation:
+   Before output:
+   - Check method signatures match usage
+   - Check return types match
+   - Check no undefined variables/classes
+   - If any issue → FIX before output
+
+7. If unsure:
+   - Prefer working minimal implementation over incomplete logic
+
+8. Output:
+   - ONLY Java code
+   - NO explanations
+
+9. Return Type Rule (CRITICAL):
+- If service method returns void → controller MUST NOT return it inside ResponseEntity
+- Instead:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- If controller returns ResponseEntity<T> → service MUST return T
+
+10. Entity Safety Rule:
+- NEVER use a setter unless field exists in entity
+- If unsure → DO NOT SET FIELD
+
+11. Controller Safety Rule:
+- NEVER directly return service method inside ResponseEntity.ok(...)
+- Always:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+- Allowed Entity Fields:
+{entity_fields}
+
+STRICT:
+- Use ONLY fields that exist in entity
+- DO NOT create fields like status, createdAt unless present
+
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
 
 Generate the complete JPA repository interface with all necessary imports and annotations.
+========================
+🚨 CRITICAL OUTPUT STRUCTURE RULE (MANDATORY)
+========================
+
+You MUST generate a COMPLETE Java file.
+
+The output MUST ALWAYS include:
+
+1. package declaration at the top
+2. all required import statements
+3. exactly one FULL class or interface definition
+
+Structure must be:
+
+package xxx;
+
+import ...;
+
+public class OR interface ClassName {
+    // complete implementation
+}
+
+❌ STRICTLY FORBIDDEN:
+- partial code snippets
+- only methods without class
+- only annotations
+- missing package
+- missing imports
+- multiple unrelated classes
+
+If the output is not a COMPLETE Java class/interface → REGENERATE internally before returning.
 """
     
     def _get_entity_template(self) -> str:
@@ -446,6 +961,17 @@ Context:
 - Table name: {table_name}
 - Primary key: {primary_key}
 - Relationships: {relationships}
+
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
 
 Output Rules (STRICT):
 - Output exactly ONE Java class.
@@ -616,6 +1142,43 @@ class LLMConversionEngine:
             logger.warning(f"Failed to initialize fallback provider: {e}")
             return None
 
+    def _extract_entity_fields_from_files(self, base_path: str, package_name: str) -> Dict[str, List[str]]:
+        """
+        Dynamically extract entity fields from generated JPA entity classes
+        """
+        entity_fields = {}
+
+        entity_folder = os.path.join(base_path, "src", "main", "java", *package_name.split("."), "entity")
+
+        if not os.path.exists(entity_folder):
+            logger.warning(f"Entity folder not found: {entity_folder}")
+            return entity_fields
+
+        for file in os.listdir(entity_folder):
+            if not file.endswith(".java"):
+                continue
+
+            entity_name = file.replace(".java", "")
+            file_path = os.path.join(entity_folder, file)
+
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                # Extract fields like: private String name;
+                matches = re.findall(
+                            r'private\s+(?!static)(?:[\w<>?,\s]+)\s+(\w+);',
+                            content
+                        )
+
+                if matches:
+                    entity_fields[entity_name] = matches
+
+            except Exception as e:
+                logger.warning(f"Failed to parse entity {entity_name}: {e}")
+
+        return entity_fields
+
     async def _generate_with_retries(self, prompt: str) -> str:
         """Generate text with retries and optional fallback provider."""
         last_error: Optional[Exception] = None
@@ -760,6 +1323,30 @@ class LLMConversionEngine:
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'model_info': self.provider.get_model_info()
         }
+
+        output_base = self.config.get("output", {}).get("base_path", "")
+        package_name = context['package_name']
+
+        entity_fields = self._extract_entity_fields_from_files(output_base, package_name)
+
+        context['entity_fields'] = entity_fields
+
+        # Derive allowed entity/repository names from discovered tables.
+        tables = context.get('tables') or []
+        entity_names: List[str] = []
+        repository_names: List[str] = []
+        for table in tables:
+            if not table:
+                continue
+            entity_base = self._to_pascal_case(str(table))
+            entity_name = f"{entity_base}Entity"
+            repo_name = f"{entity_base}Repository"
+            if entity_name not in entity_names:
+                entity_names.append(entity_name)
+            if repo_name not in repository_names:
+                repository_names.append(repo_name)
+        context['entity_names'] = entity_names
+        context['repository_names'] = repository_names
         
         # Extract additional context from AST
         context['procedures'] = [p.get('name') for p in ast_results.get('procedures', [])]
@@ -794,13 +1381,65 @@ class LLMConversionEngine:
                     
                     # Generate Java code
                     java_code = await self._generate_with_retries(prompt)
-                    
-                    # Clean up the generated code
+
                     cleaned_code = self._clean_java_code(java_code)
-                    
-                    # Generate filename
+
+                    errors = self._validate_java_code(cleaned_code)
+
+                    retry_count = 0
+                    max_retries = 2
+
+                    while errors and retry_count < max_retries:
+                        logger.warning(f"[FIXING ERROR - {procedure.get('name')}] Attempt {retry_count+1}: {errors}")
+
+                        fix_prompt = f"""
+You are a senior Java Spring Boot expert.
+
+Fix the following Java code so that it compiles.
+
+Errors:
+{errors}
+
+Code:
+{cleaned_code}
+
+STRICT RULES:
+- Use ONLY these entities: {context.get("entity_names", [])}
+- Use ONLY these repositories: {context.get("repository_names", [])}
+- Fix ALL missing imports
+- Fix type mismatches (String vs Long etc.)
+- Ensure controller-service consistency
+- Ensure valid Spring Boot structure
+- If service method returns void:
+    DO NOT use it inside ResponseEntity.ok(...)
+    - Ensure method parameters match usage
+- Ensure repository.save() return type is handled correctly
+- DO NOT invent fields not in entity_fields
+- If entity_fields is empty → skip setters completely
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
+
+Return ONLY corrected FULL Java code.
+
+                    """
+
+                        fixed_code = await self._generate_with_retries(fix_prompt)
+                        cleaned_code = self._clean_java_code(fixed_code)
+
+                        errors = self._validate_java_code(cleaned_code)
+                        retry_count += 1
+                    if errors:
+                        logger.error(f"[FINAL FAILED - {procedure.get('name')}] {errors}")
+                        cleaned_code = self._force_fix_controller(cleaned_code)
                     filename = f"{procedure.get('name', 'Procedure')}.java"
-                    
                     return filename, cleaned_code
                     
                 except Exception as e:
@@ -838,13 +1477,65 @@ class LLMConversionEngine:
                     
                     # Generate Java code
                     java_code = await self._generate_with_retries(prompt)
-                    
-                    # Clean up the generated code
+
                     cleaned_code = self._clean_java_code(java_code)
-                    
-                    # Generate filename
+
+                    errors = self._validate_java_code(cleaned_code)
+
+                    retry_count = 0
+                    max_retries = 2
+
+                    while errors and retry_count < max_retries:
+                        logger.warning(f"[FIXING ERROR - {function.get('name')}] Attempt {retry_count+1}: {errors}")
+
+                        fix_prompt = f"""
+You are a senior Java Spring Boot expert.
+
+Fix the following Java code so that it compiles.
+
+Errors:
+{errors}
+
+Code:
+{cleaned_code}
+
+STRICT RULES:
+- Use ONLY these entities: {context.get("entity_names", [])}
+- Use ONLY these repositories: {context.get("repository_names", [])}
+- Fix ALL missing imports
+- Fix type mismatches (String vs Long etc.)
+- Ensure controller-service consistency
+- Ensure valid Spring Boot structure
+If service method returns void:
+    - DO NOT use it inside ResponseEntity.ok(...)
+    - Call service separately
+    - Return ResponseEntity.ok("Success")
+    - Ensure method parameters match usage
+- Ensure repository.save() return type is handled correctly
+- DO NOT invent fields not in entity_fields
+- If entity_fields is empty → skip setters completely
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
+
+Return ONLY corrected FULL Java code.
+                    """
+
+                        fixed_code = await self._generate_with_retries(fix_prompt)
+                        cleaned_code = self._clean_java_code(fixed_code)
+
+                        errors = self._validate_java_code(cleaned_code)
+                        retry_count += 1
+                    if errors:
+                        logger.error(f"[FINAL FAILED - {function.get('name')}] {errors}")
                     filename = f"{function.get('name', 'Function')}.java"
-                    
                     return filename, cleaned_code
                     
                 except Exception as e:
@@ -890,13 +1581,63 @@ class LLMConversionEngine:
                     
                     # Generate Java code
                     java_code = await self._generate_with_retries(prompt)
-                    
-                    # Clean up the generated code
+
                     cleaned_code = self._clean_java_code(java_code)
-                    
-                    # Generate filename
+
+                    errors = self._validate_java_code(cleaned_code)
+
+                    retry_count = 0
+                    max_retries = 2
+
+                    while errors and retry_count < max_retries:
+                        logger.warning(f"[FIXING ERROR - {trigger.get('name')}] Attempt {retry_count+1}: {errors}")
+
+                        fix_prompt = f"""
+You are a senior Java Spring Boot expert.
+
+Fix the following Java code so that it compiles.
+
+Errors:
+{errors}
+
+Code:
+{cleaned_code}
+
+STRICT RULES:
+- Use ONLY these entities: {context.get("entity_names", [])}
+- Use ONLY these repositories: {context.get("repository_names", [])}
+- Fix ALL missing imports
+- Fix type mismatches (String vs Long etc.)
+- Ensure controller-service consistency
+- Ensure valid Spring Boot structure
+- If service method returns void:
+    DO NOT use it inside ResponseEntity.ok(...)
+    - Ensure method parameters match usage
+- Ensure repository.save() return type is handled correctly
+- DO NOT invent fields not in entity_fields
+- If entity_fields is empty → skip setters completely
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
+
+Return ONLY corrected FULL Java code.
+                    """
+
+                        fixed_code = await self._generate_with_retries(fix_prompt)
+                        cleaned_code = self._clean_java_code(fixed_code)
+
+                        errors = self._validate_java_code(cleaned_code)
+                        retry_count += 1
+                    if errors:
+                        logger.error(f"[FINAL FAILED - {trigger.get('name')}] {errors}")
                     filename = f"{trigger.get('name', 'Trigger')}Handler.java"
-                    
                     return filename, cleaned_code
                     
                 except Exception as e:
@@ -938,13 +1679,63 @@ class LLMConversionEngine:
                     
                     # Generate Java code
                     java_code = await self._generate_with_retries(prompt)
-                    
-                    # Clean up the generated code
+
                     cleaned_code = self._clean_java_code(java_code)
-                    
-                    # Generate filename
+
+                    errors = self._validate_java_code(cleaned_code)
+
+                    retry_count = 0
+                    max_retries = 2
+
+                    while errors and retry_count < max_retries:
+                        logger.warning(f"[FIXING ERROR - {package.get('name')}] Attempt {retry_count+1}: {errors}")
+
+                        fix_prompt = f"""
+You are a senior Java Spring Boot expert.
+
+Fix the following Java code so that it compiles.
+
+Errors:
+{errors}
+
+Code:
+{cleaned_code}
+
+STRICT RULES:
+- Use ONLY these entities: {context.get("entity_names", [])}
+- Use ONLY these repositories: {context.get("repository_names", [])}
+- Fix ALL missing imports
+- Fix type mismatches (String vs Long etc.)
+- Ensure controller-service consistency
+- Ensure valid Spring Boot structure
+- If service method returns void:
+    DO NOT use it inside ResponseEntity.ok(...)
+    - Ensure method parameters match usage
+- Ensure repository.save() return type is handled correctly
+- DO NOT invent fields not in entity_fields
+- If entity_fields is empty → skip setters completely
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
+
+Return ONLY corrected FULL Java code.
+                    """
+
+                        fixed_code = await self._generate_with_retries(fix_prompt)
+                        cleaned_code = self._clean_java_code(fixed_code)
+
+                        errors = self._validate_java_code(cleaned_code)
+                        retry_count += 1
+                    if errors:
+                        logger.error(f"[FINAL FAILED - {package.get('name')}] {errors}")
                     filename = f"{package.get('name', 'Package')}.java"
-                    
                     return filename, cleaned_code
                     
                 except Exception as e:
@@ -999,13 +1790,63 @@ class LLMConversionEngine:
                     
                     # Generate Java code
                     java_code = await self._generate_with_retries(prompt)
-                    
-                    # Clean up the generated code
+
                     cleaned_code = self._clean_java_code(java_code)
-                    
-                    # Generate filename
+
+                    errors = self._validate_java_code(cleaned_code)
+
+                    retry_count = 0
+                    max_retries = 2
+
+                    while errors and retry_count < max_retries:
+                        logger.warning(f"[FIXING ERROR - {table_name}] Attempt {retry_count+1}: {errors}")
+
+                        fix_prompt = f"""
+You are a senior Java Spring Boot expert.
+
+Fix the following Java code so that it compiles.
+
+Errors:
+{errors}
+
+Code:
+{cleaned_code}
+
+STRICT RULES:
+- Use ONLY these entities: {context.get("entity_names", [])}
+- Use ONLY these repositories: {context.get("repository_names", [])}
+- Fix ALL missing imports
+- Fix type mismatches (String vs Long etc.)
+- Ensure controller-service consistency
+- Ensure valid Spring Boot structure
+- If service method returns void:
+    DO NOT use it inside ResponseEntity.ok(...)
+    - Ensure method parameters match usage
+- Ensure repository.save() return type is handled correctly
+- DO NOT invent fields not in entity_fields
+- If entity_fields is empty → skip setters completely
+Controller Implementation Rule (MANDATORY):
+
+- NEVER write:
+    return ResponseEntity.ok(service.method());
+
+- ALWAYS write:
+    service.method();
+    return ResponseEntity.ok("Success");
+
+This rule is STRICT and must NEVER be violated.
+
+Return ONLY corrected FULL Java code.
+                    """
+
+                        fixed_code = await self._generate_with_retries(fix_prompt)
+                        cleaned_code = self._clean_java_code(fixed_code)
+
+                        errors = self._validate_java_code(cleaned_code)
+                        retry_count += 1
+                    if errors:
+                        logger.error(f"[FINAL FAILED - {table_name}] {errors}")
                     filename = f"{table_name}Repository.java"
-                    
                     return filename, cleaned_code
                     
                 except Exception as e:
@@ -1157,7 +1998,7 @@ class LLMConversionEngine:
                 )
                 nested_result = self._render_result_class(result_class_name, out_params)
 
-            entity_setters = self._render_entity_setters(entity_var, in_params)
+            entity_setters = self._render_entity_setters(entity_var, in_params, entity_name, context)
             sql_comments = self._render_sql_comment_lines(procedure.get('statements', []))
             method_body_lines = [
                 "        // Deterministic fallback generated after LLM conversion failure.",
@@ -1170,7 +2011,7 @@ class LLMConversionEngine:
                 [
                     f"        {entity_name} {entity_var} = new {entity_name}();",
                     entity_setters,
-                    f"        {entity_var}.setCreatedAt(LocalDateTime.now());",
+                    f"        // Timestamp skipped (field may not exist)",
                     f"        {repository_var}.save({entity_var});",
                 ]
             )
@@ -1262,16 +2103,44 @@ public class {service_name} {{
             base_name = base_name[:-7] or 'Record'
         return base_name
 
-    def _render_entity_setters(self, entity_var: str, params: List[Dict[str, Any]]) -> str:
-        """Render entity setter calls for IN parameters."""
+    def _render_entity_setters(self, entity_var: str, params: List[Dict[str, Any]], entity_name: str, context: Dict[str, Any]) -> str:
+        entity_map = context.get("entity_fields", {})
+
+        allowed_fields = entity_map.get(entity_name, [])
+
+        if not allowed_fields:
+            allowed_fields = entity_map.get(f"{entity_name}Entity", [])
+
+        if not allowed_fields:
+            for key in entity_map:
+                if entity_name.lower() in key.lower():
+                    allowed_fields = entity_map[key]
+                    break
+
+        if not allowed_fields:
+            # fallback: pick ANY entity with fields
+            if entity_map:
+                allowed_fields = list(entity_map.values())[0]
+
+        if not allowed_fields:
+            return "        // No matching entity fields found"
+
         setter_lines = []
+
         for param in params:
             field_name = self._normalize_field_name(param.get('name', 'param'))
+
+            if field_name not in allowed_fields:
+                continue
+
             setter_name = field_name[:1].upper() + field_name[1:]
             value_name = self._to_camel_case(param.get('name', 'param'))
+
             setter_lines.append(f"        {entity_var}.set{setter_name}({value_name});")
+
         if not setter_lines:
-            setter_lines.append(f'        {entity_var}.setStatus("GENERATED_WITH_FALLBACK");')
+            return "        // No matching entity fields found"
+
         return "\n".join(setter_lines)
 
     def _render_result_class(self, result_class_name: str, out_params: List[Dict[str, Any]]) -> str:
@@ -1396,44 +2265,52 @@ public class {service_name} {{
         return (value or '').replace('*/', '* /').replace('\r', ' ').replace('\n', ' ')
     
     def _clean_java_code(self, java_code: str) -> str:
-        """
-        Clean up generated Java code
-        
-        Args:
-            java_code (str): Raw Java code from LLM
-            
-        Returns:
-            str: Cleaned Java code
-        """
         if not java_code:
             return ""
-        
+
         text = java_code.strip()
-        
-        # Prefer fenced code content when present.
+
+        # Extract from ```java ``` blocks
         fence_match = re.search(r"```(?:java)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
         if fence_match:
             text = fence_match.group(1).strip()
-        
+
+        # Trim everything before package (if exists)
+        package_index = text.find("package ")
+        if package_index != -1:
+            text = text[package_index:]
+
         lines = text.splitlines()
-        start_idx = None
-        
-        # Start from first obvious Java declaration.
+
+        # Extract package & imports
+        package_lines = [l.strip() for l in lines if l.strip().startswith("package ")]
+        import_lines = [l.strip() for l in lines if l.strip().startswith("import ")]
+
+        # Remove duplicates (important 🔥)
+        package_lines = list(dict.fromkeys(package_lines))
+        import_lines = list(dict.fromkeys(import_lines))
+
+        # Find start of class/interface
         decl_pattern = re.compile(r"^\s*(public\s+)?(class|interface|enum|record)\s+\w+")
+        start_idx = None
+
         for i, line in enumerate(lines):
             if decl_pattern.search(line):
                 start_idx = i
                 break
-        
+
+        # If class found → rebuild clean structure
         if start_idx is not None:
-            return "\n".join(lines[start_idx:]).strip()
-        
-        # Fallback: keep full text if it already looks like Java source.
-        java_markers = ("package ", "import ", "@", "class ", "interface ", "enum ", "record ")
-        if any(marker in text for marker in java_markers):
-            return text
-        
+            body = lines[start_idx:]
+            return "\n".join(package_lines + import_lines + body).strip()
+
+        # Fallback: return cleaned text
         return text
+    
+    # errors = self._validate_java_code(cleaned_code)
+
+    # if errors:
+    #     logger.warning(f"Validation errors detected: {errors}")
     
     def get_conversion_stats(self) -> Dict[str, Any]:
         """Get conversion statistics"""
@@ -1618,8 +2495,85 @@ public class {service_name} {{
             )
 
         return suggestions
+    
+    def _validate_java_code(self, code: str) -> List[str]:
+        errors = []
+
+        if not code or not code.strip():
+            errors.append("Empty code generated")
+            return errors
+
+        # Rule 1: Controller without @RequestBody for POST
+        if "@PostMapping" in code:
+            if re.search(r'@PostMapping[\s\S]*public\s+\w+\s+\w+\(\s*\)', code):
+                errors.append("POST method missing @RequestBody or parameters")
+
+        # Rule 2: Void mismatch detection (Controller ↔ Service)
+        # Case: method returns void but ResponseEntity used
+        # Detect controller calling service method
+        match = re.search(r'ResponseEntity\.ok\s*\(\s*(\w+)\.(\w+)\(', code)
+
+        if match:
+            service_var = match.group(1)
+            method_name = match.group(2)
+
+            # If ANY void method exists → assume mismatch risk
+            if re.search(rf'public\s+void\s+{method_name}\s*\(', code):
+                errors.append(f"Service method '{method_name}' returns void but used inside ResponseEntity")
+
+        # Case: ResponseEntity expects value but service may return void
+        if re.search(r'ResponseEntity<\w+>\s+\w+\s*\(', code):
+            if re.search(r'ResponseEntity\.ok\s*\(\s*\w+\s*\(\s*\)\s*\)', code):
+                if re.search(r'public\s+void\s+\w+\s*\(', code):
+                    errors.append("Possible void return mismatch between layers")
+
+        # Rule 3: Empty methods
+        if re.search(r'public\s+\w+\s+\w+\s*\([^)]*\)\s*\{\s*\}', code):
+            errors.append("Empty method detected")
+
+        # # Detect unknown setter methods
+        # if re.search(r'\.set\w+\(', code):
+        #     # if field not in known entity fields
+        #     errors.append("Unknown entity field used")
+
+        # Rule 4: Missing class definition
+        if not re.search(r'\bclass\s+\w+', code):
+            errors.append("No class definition found")
+
+        # Rule 5: Missing imports (basic check)
+        if "@RestController" in code and "import org.springframework.web.bind.annotation" not in code:
+            errors.append("Missing Spring Web imports")
+
+        # Rule 6: Missing @Service or @RestController (basic sanity)
+        if "class " in code and any(x in code for x in ["Controller", "Service", "Repository"]):
+            if not any(x in code for x in ["@Service", "@RestController", "@Repository"]):
+                errors.append("Spring stereotype annotation missing")
+        
+        # Rule: Prevent direct service return in controller
+        if re.search(r'return\s+ResponseEntity\.ok\s*\(\s*\w+\.\w+\(', code):
+                errors.append("CRITICAL: Controller returning service call directly")
+
+        return errors
+
+    def _force_fix_controller(self, code: str) -> str:
+        """
+        Hard-fix controller return issues without relying on LLM
+        """
+        # Fix: return ResponseEntity.ok(service.method())
+        pattern = re.compile(r'return\s+ResponseEntity\.ok\s*\(\s*(\w+)\.(\w+)\((.*?)\)\s*\);')
+
+        def replacer(match):
+            service = match.group(1)
+            method = match.group(2)
+            params = match.group(3)
+
+            return f"{service}.{method}({params});\n        return ResponseEntity.ok(\"Success\");"
+
+        return pattern.sub(replacer, code)
+
 
 
 def create_llm_engine(config: Dict[str, Any]) -> LLMConversionEngine:
     """Create and return a configured LLM conversion engine"""
     return LLMConversionEngine(config)
+

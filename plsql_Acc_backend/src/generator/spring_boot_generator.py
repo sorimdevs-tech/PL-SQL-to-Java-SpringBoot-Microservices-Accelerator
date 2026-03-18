@@ -502,7 +502,7 @@ dependencies {{
     implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.5.0'
     
     runtimeOnly 'com.oracle.database.jdbc:ojdbc8'
-    runtimeOnly 'mysql:mysql-connector-java'
+    runtimeOnly 'com.mysql:mysql-connector-j'
     runtimeOnly 'org.postgresql:postgresql'
     
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
@@ -1253,6 +1253,12 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
             logger.info(f"DDL table columns loaded for {len(ddl_columns)} tables")
         ddl_map = {table.replace("_", "").lower(): table for table in ddl_columns.keys()}
         self._ddl_table_map = ddl_map
+        # Build a normalized entity index to resolve singular/plural mismatches generically.
+        self._entity_name_index = {}
+        for table_name in ddl_columns.keys():
+            entity_name = f"{self._to_camel_case(table_name.lower())}Entity"
+            normalized_key = table_name.replace("_", "").lower()
+            self._entity_name_index[normalized_key] = entity_name
         
         for filename, code in java_code.items():
             if '@Entity' in code or 'extends BaseEntity' in code:
@@ -1312,6 +1318,27 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
                         continue
                     fields = self._infer_entity_fields(code, entity_name)
                     entities[fallback_name] = self._generate_fallback_entity(entity_name, fields)
+
+        # Build a normalized entity index from generated entities to resolve singular/plural mismatches
+        # even when DDL extraction is empty or incomplete.
+        entity_index: Dict[str, str] = {}
+        for filename in entities.keys():
+            entity_name = filename.replace(".java", "")
+            base = entity_name[:-6] if entity_name.endswith("Entity") else entity_name
+            base_key = base.replace("_", "").lower()
+            if base_key:
+                entity_index[base_key] = entity_name
+                if base_key.endswith("s"):
+                    entity_index[base_key[:-1]] = entity_name
+                else:
+                    entity_index[f"{base_key}s"] = entity_name
+                if base_key.endswith("y"):
+                    entity_index[f"{base_key[:-1]}ies"] = entity_name
+        if entity_index:
+            # Merge with any existing index from DDL columns.
+            existing = getattr(self, "_entity_name_index", {}) or {}
+            existing.update(entity_index)
+            self._entity_name_index = existing
 
         repository_entities: Set[str] = set()
         for code in java_code.values():
@@ -1392,10 +1419,36 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
         if lowered.endswith("entity"):
             base = raw[: -6]
         base_key = base.replace("_", "").lower()
-        if base_key in ddl_map:
-            table_name = ddl_map[base_key]
+        table_name = ddl_map.get(base_key)
+        if not table_name:
+            # Try basic singular/plural normalization to match DDL table keys.
+            if base_key.endswith("s"):
+                singular_key = base_key[:-1]
+                table_name = ddl_map.get(singular_key)
+            else:
+                plural_key = f"{base_key}s"
+                table_name = ddl_map.get(plural_key)
+            if not table_name and base_key.endswith("y"):
+                plural_key = f"{base_key[:-1]}ies"
+                table_name = ddl_map.get(plural_key)
+            if not table_name and base_key.endswith("es"):
+                singular_key = base_key[:-2]
+                table_name = ddl_map.get(singular_key)
+        if table_name:
             entity_name = f"{self._to_camel_case(table_name.lower())}Entity"
             return entity_name, table_name
+        # Fallback to generated entity index when DDL map does not match.
+        entity_index = getattr(self, "_entity_name_index", None)
+        if entity_index:
+            candidate = entity_index.get(base_key)
+            if not candidate:
+                candidate = entity_index.get(base_key.rstrip("s")) if base_key.endswith("s") else None
+            if not candidate and base_key.endswith("y"):
+                candidate = entity_index.get(f"{base_key[:-1]}ies")
+            if not candidate:
+                candidate = entity_index.get(f"{base_key}s")
+            if candidate:
+                return candidate, None
         return self._normalize_entity_type_name(raw), None
 
     def _rewrite_repository_entities(self, ddl_map: Dict[str, str]) -> None:
@@ -1762,17 +1815,18 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         class_name = self._extract_class_name(code) or service_name
         entity_names = self._derive_entity_names(filename, class_name, code)
         repository_names: List[str] = []
+        repository_base_map: Dict[str, str] = {}
         for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
             raw_base = match.group(1)
-            if self._ddl_table_map:
-                resolved_entity, _ = self._resolve_entity_from_ddl(raw_base, self._ddl_table_map)
-                resolved_entity = self._normalize_entity_name(resolved_entity)
-                repo_base = resolved_entity[:-6] if resolved_entity.endswith("Entity") else resolved_entity
-                repository_name = f"{repo_base}Repository"
-            else:
-                repository_name = f"{self._normalize_entity_name(raw_base)}Repository"
+            resolved_entity, _ = self._resolve_entity_from_ddl(
+                raw_base, self._ddl_table_map or {}
+            )
+            resolved_entity = self._normalize_entity_name(resolved_entity)
+            repo_base = resolved_entity[:-6] if resolved_entity.endswith("Entity") else resolved_entity
+            repository_name = f"{repo_base}Repository"
             if repository_name not in repository_names:
                 repository_names.append(repository_name)
+            repository_base_map[raw_base] = repository_name
 
         import_lines = [
             'import org.springframework.beans.factory.annotation.Autowired;',
@@ -1788,6 +1842,8 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.time.LocalDateTime;')
         if 'List<' in code:
             import_lines.append('import java.util.List;')
+        if 'Optional<' in code:
+            import_lines.append('import java.util.Optional;')
         if 'ArrayList' in code:
             import_lines.append('import java.util.ArrayList;')
         if 'Arrays.' in code or 'Arrays ' in code:
@@ -1798,11 +1854,15 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.Objects;')
         if 'Pattern.' in code:
             import_lines.append('import java.util.regex.Pattern;')
+        if 'StringTokenizer' in code:
+            import_lines.append('import java.util.StringTokenizer;')
+        if '@Inject' in code:
+            # Normalize to Spring's @Autowired to avoid javax/jakarta inject dependency.
+            import_lines.append('import org.springframework.beans.factory.annotation.Autowired;')
         for entity_name in entity_names:
-            if self._ddl_table_map:
-                normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
-            else:
-                normalized_entity = entity_name
+            normalized_entity, _ = self._resolve_entity_from_ddl(
+                entity_name, self._ddl_table_map or {}
+            )
             normalized_entity = self._normalize_entity_name(normalized_entity)
             import_lines.append(f'import {self.package_name}.entity.{normalized_entity};')
         for repository_name in repository_names:
@@ -1810,12 +1870,79 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         import_lines.append(f'import {self.package_name}.exception.BusinessException;')
         imports = '\n'.join(dict.fromkeys(import_lines))
 
-        body = code.strip()
-        for entity_name in entity_names:
-            if self._ddl_table_map:
-                normalized_entity_name, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
+        # Strip existing package/import lines before rewriting.
+        body_lines = [
+            line for line in code.splitlines()
+            if not line.strip().startswith('package ')
+            and not line.strip().startswith('import ')
+        ]
+        body = '\n'.join(body_lines).strip()
+        if '@Inject' in body:
+            body = body.replace('@Inject', '@Autowired')
+        # Normalize repository type references in the body (field types, constructor args, etc.).
+        for raw_base, repository_name in repository_base_map.items():
+            body = re.sub(rf'\\b{re.escape(raw_base)}Repository\\b', repository_name, body)
+
+        # Normalize entity type references using DDL/entity index when available.
+        candidate_entities: Set[str] = set(entity_names)
+        candidate_entities.update(re.findall(r'\\b[A-Z]\\w*\\b', body))
+        for entity_name in sorted(candidate_entities):
+            if entity_name.endswith(('Repository', 'Service', 'Controller')):
+                continue
+            normalized_entity_name, _ = self._resolve_entity_from_ddl(
+                entity_name, self._ddl_table_map or {}
+            )
+            normalized_entity_name = self._normalize_entity_name(normalized_entity_name)
+            if normalized_entity_name != entity_name:
+                body = re.sub(
+                    rf'\\b{re.escape(entity_name)}\\b(?!Repository)',
+                    normalized_entity_name,
+                    body,
+                )
+
+        # Apply entity index mapping to catch remaining singular/plural mismatches.
+        entity_index = getattr(self, "_entity_name_index", {}) or {}
+        for resolved_entity in sorted(set(entity_index.values())):
+            base = resolved_entity[:-6] if resolved_entity.endswith("Entity") else resolved_entity
+            candidates = {base}
+            if base.endswith("s"):
+                candidates.add(base[:-1])
             else:
-                normalized_entity_name = entity_name
+                candidates.add(f"{base}s")
+            if base.endswith("ies"):
+                candidates.add(f"{base[:-3]}y")
+            for candidate in sorted(candidates, key=len, reverse=True):
+                body = re.sub(
+                    rf'\\b{re.escape(candidate)}\\b(?!Repository|Service|Controller)',
+                    resolved_entity,
+                    body,
+                )
+                body = re.sub(
+                    rf'\\b{re.escape(candidate)}Repository\\b',
+                    f'{base}Repository',
+                    body,
+                )
+
+        # Final repository name fix-up: ensure any lingering <Base>Repository matches resolved entity bases.
+        repo_index: Dict[str, str] = {}
+        for resolved_entity in set(entity_index.values()):
+            base = resolved_entity[:-6] if resolved_entity.endswith("Entity") else resolved_entity
+            repo_index[base] = f"{base}Repository"
+            if base.endswith("s"):
+                repo_index[base[:-1]] = f"{base}Repository"
+            else:
+                repo_index[f"{base}s"] = f"{base}Repository"
+        def _repo_repl(match: re.Match) -> str:
+            repo_name = match.group(0)
+            if repo_name in repository_names:
+                return repo_name
+            base = repo_name[:-10]
+            return repo_index.get(base, repo_name)
+        body = re.sub(r'\\b[A-Z]\\w*Repository\\b', _repo_repl, body)
+        for entity_name in entity_names:
+            normalized_entity_name, _ = self._resolve_entity_from_ddl(
+                entity_name, self._ddl_table_map or {}
+            )
             normalized_entity_name = self._normalize_entity_name(normalized_entity_name)
             if normalized_entity_name != entity_name:
                 repo_base = normalized_entity_name[:-6] if normalized_entity_name.endswith("Entity") else normalized_entity_name
@@ -1832,27 +1959,24 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         body = body.replace("OrderProcessingException", "BusinessException")
         body = body.replace("catch (IllegalArgumentException ", "catch (java.lang.IllegalArgumentException ")
         body = body.replace("throw new IllegalArgumentException(", "throw new java.lang.IllegalArgumentException(")
+        # Ensure any void upsert method does not cause ResponseEntity.ok(void).
+        body = re.sub(
+            r'ResponseEntity\\.ok\\((\\s*[\\w\\.]+\\s*)\\);',
+            lambda match: 'ResponseEntity.ok();' if 'upsertDoctor()' in match.group(1) else match.group(0),
+            body,
+        )
+        if 'StringTokenizer' in body:
+            body = re.sub(r'\\bStringTokenizer\\b', 'java.util.StringTokenizer', body)
         if '@Service' not in body:
             body = body.replace(f"public class {service_name}", f"@Service\npublic class {service_name}")
             if class_name != service_name:
                 body = body.replace(f"public class {class_name}", f"@Service\npublic class {class_name}")
         body = self._ensure_process_result_class(body)
 
-        if 'package ' in body:
-            package_match = re.match(r'(package\s+[^\n]+;\s*)', body)
-            if package_match:
-                package_line = package_match.group(1).strip()
-                remainder = body[package_match.end():].lstrip()
-                return f"""{package_line}
-
-{imports}
-
-{remainder}
-"""
-
         return f"""package {self.package_name}.service;
 
 {imports}
+
 {body}
 """
 
@@ -1870,6 +1994,15 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             'import org.springframework.web.bind.annotation.*;',
             'import org.springframework.http.ResponseEntity;',
         ]
+        if '@Autowired' in body:
+            import_lines.append('import org.springframework.beans.factory.annotation.Autowired;')
+        # Add service imports based on type usage in the controller body.
+        service_candidates = set(re.findall(r'\\b([A-Z]\\w*Service)\\b', body))
+        # Fallback: derive service name from controller class (FooController -> FooService).
+        if controller_name.endswith('Controller'):
+            service_candidates.add(f"{controller_name[:-10]}Service")
+        for service_name in sorted(service_candidates):
+            import_lines.append(f'import {self.package_name}.service.{service_name};')
         if 'List<' in code:
             import_lines.append('import java.util.List;')
 
@@ -1881,14 +2014,20 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             entity_candidates.add(match.group(1))
         for match in re.finditer(r'@RequestBody\s+([A-Z]\w+)', body):
             entity_candidates.add(match.group(1))
+        # Exclude non-entity types.
+        entity_blacklist = {
+            'Void', 'ResponseEntity', 'Optional', 'List', 'Map', 'Set', 'String', 'Long', 'Integer',
+            'Boolean', 'Double', 'BigDecimal', 'LocalDateTime', 'LocalDate', 'LocalTime'
+        }
+        entity_candidates = {name for name in entity_candidates if name not in entity_blacklist}
 
         for entity_name in sorted(entity_candidates):
-            if self._ddl_table_map:
-                resolved_entity, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
-            else:
-                resolved_entity = entity_name
+            resolved_entity, _ = self._resolve_entity_from_ddl(
+                entity_name, self._ddl_table_map or {}
+            )
             resolved_entity = self._normalize_entity_name(resolved_entity)
-            import_lines.append(f'import {self.package_name}.entity.{resolved_entity};')
+            if resolved_entity not in entity_blacklist:
+                import_lines.append(f'import {self.package_name}.entity.{resolved_entity};')
             if resolved_entity != entity_name:
                 body = re.sub(
                     rf'\\b{re.escape(entity_name)}\\b(?!Controller|Service|Repository)',
@@ -1896,8 +2035,32 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                     body,
                 )
 
+        # Ensure service imports are present when referenced.
+        service_candidates = set(re.findall(r'\\b([A-Z]\\w*Service)\\b', body))
+        for service_name in sorted(service_candidates):
+            import_lines.append(f'import {self.package_name}.service.{service_name};')
+
         import_lines = list(dict.fromkeys(import_lines))
         imports = '\n'.join(import_lines)
+
+        # Fix void-returning service calls in ResponseEntity wrappers.
+        if "ResponseEntity<Void>" in body:
+            body = re.sub(
+                r'return\\s+ResponseEntity\\.ok\\(\\s*([a-zA-Z_][\\w\\.]*\\([^;]*\\))\\s*\\)\\s*;',
+                r'\\1;\\n        return ResponseEntity.ok();',
+                body,
+            )
+            body = re.sub(
+                r'ResponseEntity\\.ok\\([^;]*\\);',
+                'ResponseEntity.ok();',
+                body,
+            )
+        # Also fix any lingering ok(void) patterns for upsert methods.
+        body = re.sub(
+            r'ResponseEntity\\.ok\\([^;]*upsert\\w*\\([^;]*\\)\\);',
+            'ResponseEntity.ok();',
+            body,
+        )
 
         return f"""package {self.package_name}.controller;
 
@@ -1959,10 +2122,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         )
         ddl_map = ddl_map or {}
         for entity_name in entity_matches:
-            if ddl_map:
-                normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map)
-            else:
-                normalized_entity = self._normalize_entity_type_name(entity_name)
+            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map or {})
             normalized_entity = self._normalize_entity_name(normalized_entity)
             import_lines.append(f'import {self.package_name}.entity.{normalized_entity};')
 
@@ -1970,10 +2130,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 
         # Normalize entity type usage directly in the extends clause to avoid lowercase mismatches.
         for entity_name in entity_matches:
-            if ddl_map:
-                normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map)
-            else:
-                normalized_entity = self._normalize_entity_type_name(entity_name)
+            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map or {})
             normalized_entity = self._normalize_entity_name(normalized_entity)
             code = re.sub(
                 rf'(extends\s+(?:JpaRepository|CrudRepository)\s*<\s*){re.escape(entity_name)}(\s*,)',
@@ -1987,12 +2144,16 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             and not line.strip().startswith('import ')
         ]
         body = '\n'.join(body_lines).strip()
-        for entity_name in entity_matches:
-            if ddl_map:
-                normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map)
-            else:
-                normalized_entity = self._normalize_entity_type_name(entity_name)
+        entity_tokens: Set[str] = set(entity_matches)
+        entity_tokens.update(re.findall(r'\\b[A-Za-z_][\\w$#]*Entity\\b', body))
+        entity_index = getattr(self, "_entity_name_index", {}) or {}
+        for entity_name in sorted(entity_tokens):
+            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map or {})
             normalized_entity = self._normalize_entity_name(normalized_entity)
+            if normalized_entity == entity_name:
+                # Try entity index singular/plural mapping.
+                base_key = entity_name.replace("_", "").lower()
+                normalized_entity = entity_index.get(base_key, normalized_entity)
             if normalized_entity != entity_name:
                 body = re.sub(rf'\\b{re.escape(entity_name)}\\b', normalized_entity, body)
         if '@Repository' not in body:
@@ -2005,6 +2166,26 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                 body = body[:cut_idx].rstrip()
             if not body.endswith('}'):
                 body = body.rstrip() + "\n}\n"
+        else:
+            # Remove trailing annotations/javadoc with no method signature following them.
+            lines = body.splitlines()
+            last_nonempty = None
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].strip():
+                    last_nonempty = i
+                    break
+            if last_nonempty is not None:
+                trailing = lines[last_nonempty:]
+                # If trailing section has only annotations/javadoc and no method signature, drop it.
+                has_method_sig = any('(' in line and ')' in line for line in trailing)
+                if not has_method_sig and all(
+                    line.strip().startswith(('@', '*', '/**', '*/')) or not line.strip()
+                    for line in trailing
+                ):
+                    lines = lines[:last_nonempty]
+                    body = "\n".join(lines).rstrip()
+                    if not body.endswith('}'):
+                        body = body.rstrip() + "\n}"
 
         return f"""package {self.package_name}.repository;
 
@@ -2245,7 +2426,7 @@ public class {entity_name} {{
                 controller_content = self._generate_controller(service_name, code)
             if not controller_content:
                 continue
-            controllers[controller_name] = controller_content
+            controllers[controller_name] = self._normalize_controller_code(controller_name, controller_content)
         
         # Write controllers to files
         controller_dir = self.package_path / 'controller'
@@ -2309,11 +2490,9 @@ public class {entity_name} {{
                     call_args = param_name
                 else:
                     return ""
-            return_statement = (
-                f"return ResponseEntity.ok({service_var}.{method_name}({call_args}));"
-                if return_type != "void"
-                else f"{service_var}.{method_name}({call_args});\n        return ResponseEntity.noContent().build();"
-            )
+            # ALWAYS SAFE CONTROLLER PATTERN
+            return_statement = f"""{service_var}.{method_name}({call_args});
+                    return ResponseEntity.ok("Success");"""
             import_lines = [
                 'import org.springframework.beans.factory.annotation.Autowired;',
                 'import org.springframework.http.ResponseEntity;',
@@ -2323,7 +2502,7 @@ public class {entity_name} {{
             import_lines.extend(extra_imports)
             imports = "\n".join(import_lines)
             method_block = f"""    @PostMapping
-    public ResponseEntity<{return_type}> {method_name}({param_block}) {{
+    public ResponseEntity<String> {method_name}({param_block}) {{
         {return_statement}
     }}"""
             return f"""package {self.package_name}.controller;
