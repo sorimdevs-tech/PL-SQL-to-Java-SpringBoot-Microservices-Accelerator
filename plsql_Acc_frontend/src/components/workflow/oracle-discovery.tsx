@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { ChevronLeft, ChevronRight, LoaderCircle } from "lucide-react"
 
 import {
@@ -53,6 +53,7 @@ interface DualListSelectorProps {
     onNext?: () => void
     disablePrevious?: boolean
     disableNext?: boolean
+    hideNext?: boolean
   }
 }
 
@@ -256,15 +257,17 @@ function DualListSelector(props: DualListSelectorProps) {
             >
               <ChevronLeft className="h-4 w-4" />
             </button>
-            <button
-              type="button"
-              onClick={props.navigation.onNext}
-              disabled={props.navigation.disableNext}
-              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-              aria-label="Next"
-            >
-              <ChevronRight className="h-4 w-4" />
-            </button>
+            {props.navigation.hideNext ? null : (
+              <button
+                type="button"
+                onClick={props.navigation.onNext}
+                disabled={props.navigation.disableNext}
+                className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                aria-label="Next"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            )}
           </div>
         ) : null}
       </CardContent>
@@ -274,6 +277,11 @@ function DualListSelector(props: DualListSelectorProps) {
 
 export function OracleDiscovery(props: OracleDiscoveryProps) {
   const [activeSelectorStep, setActiveSelectorStep] = useState<1 | 2 | 3 | 4>(1)
+  const autoAdvanceState = useRef({
+    containerSelected: false,
+    schemaSelected: false,
+    step3Ready: false,
+  })
   const [isConnecting, setIsConnecting] = useState(false)
   const [isLoadingContainers, setIsLoadingContainers] = useState(false)
   const [isLoadingSchemas, setIsLoadingSchemas] = useState(false)
@@ -552,6 +560,40 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
     hasSchemaSelection,
   ])
 
+  useEffect(() => {
+    if (!hasContainerSelection) {
+      autoAdvanceState.current.containerSelected = false
+      return
+    }
+    if (activeSelectorStep === 1 && !autoAdvanceState.current.containerSelected) {
+      autoAdvanceState.current.containerSelected = true
+      setActiveSelectorStep(2)
+    }
+  }, [activeSelectorStep, hasContainerSelection])
+
+  useEffect(() => {
+    if (!hasSchemaSelection) {
+      autoAdvanceState.current.schemaSelected = false
+      return
+    }
+    if (activeSelectorStep === 2 && !autoAdvanceState.current.schemaSelected) {
+      autoAdvanceState.current.schemaSelected = true
+      setActiveSelectorStep(3)
+    }
+  }, [activeSelectorStep, hasSchemaSelection])
+
+  useEffect(() => {
+    const step3Ready = hasObjectSelection || hasProcedureSelection || canSkipObjectStep
+    if (!step3Ready) {
+      autoAdvanceState.current.step3Ready = false
+      return
+    }
+    if (activeSelectorStep === 3 && !autoAdvanceState.current.step3Ready) {
+      autoAdvanceState.current.step3Ready = true
+      setActiveSelectorStep(4)
+    }
+  }, [activeSelectorStep, canSkipObjectStep, hasObjectSelection, hasProcedureSelection])
+
   function canProceedFromCurrentStep(): boolean {
     if (activeSelectorStep === 1) {
       return hasContainerSelection
@@ -624,6 +666,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
             onNext: goNextStep,
             disablePrevious: false,
             disableNext: !canProceedFromCurrentStep(),
+            hideNext: true,
           }}
         />
       ) : null}
@@ -643,6 +686,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
             onNext: goNextStep,
             disablePrevious: false,
             disableNext: !canProceedFromCurrentStep(),
+            hideNext: true,
           }}
         />
       ) : null}
@@ -673,6 +717,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
             onNext: goNextStep,
             disablePrevious: false,
             disableNext: !canProceedFromCurrentStep(),
+            hideNext: true,
           }}
         />
       ) : null}
@@ -692,6 +737,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
             onNext: goNextStep,
             disablePrevious: false,
             disableNext: activeSelectorStep === 4 || !canProceedFromCurrentStep(),
+            hideNext: true,
           }}
         />
       ) : null}

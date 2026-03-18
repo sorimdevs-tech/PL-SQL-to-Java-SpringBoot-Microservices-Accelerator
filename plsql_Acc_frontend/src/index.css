@@ -29,6 +29,22 @@ a {
   text-decoration: none;
 }
 
+button,
+[role="button"],
+summary,
+label,
+select,
+option,
+input[type="button"],
+input[type="submit"],
+input[type="reset"],
+input[type="checkbox"],
+input[type="radio"],
+input[type="file"],
+a {
+  cursor: pointer;
+}
+
 #root {
   min-height: 100vh;
 }

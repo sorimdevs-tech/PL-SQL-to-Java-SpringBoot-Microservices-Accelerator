@@ -9,6 +9,8 @@ import { workflowSteps } from "@/data/converter-workflow"
 
 function App() {
   const [activeStep, setActiveStep] = useState(1)
+  const [conversionFocus, setConversionFocus] = useState(false)
+  const [maxAccessibleStep, setMaxAccessibleStep] = useState(1)
 
   const goPrevious = () => setActiveStep((current) => Math.max(1, current - 1))
   const goNext = () => setActiveStep((current) => Math.min(workflowSteps.length, current + 1))
@@ -49,9 +51,22 @@ function App() {
           </div>
         </header>
 
-        <ConversionStepper steps={workflowSteps} activeStep={activeStep} onStepClick={setActiveStep} />
+        {conversionFocus ? null : (
+          <ConversionStepper
+            steps={workflowSteps}
+            activeStep={activeStep}
+            maxStep={maxAccessibleStep}
+            onStepClick={setActiveStep}
+          />
+        )}
         <main>
-          <StepPanels activeStep={activeStep} onPrevious={goPrevious} onNext={goNext} />
+          <StepPanels
+            activeStep={activeStep}
+            onPrevious={goPrevious}
+            onNext={goNext}
+            onConversionFocusChange={setConversionFocus}
+            onStepAccessChange={setMaxAccessibleStep}
+          />
         </main>
       </div>
     </div>

@@ -30,6 +30,20 @@ class ProjectStructure:
     dependencies: List[str]
 
 
+@dataclass
+class BuildDependency:
+    group: str
+    artifact: str
+    scope: Optional[str] = None
+    version: Optional[str] = None
+    optional: bool = False
+    gradle_configuration: Optional[str] = None
+    annotation_processor: bool = False
+
+    def key(self) -> tuple:
+        return (self.group, self.artifact)
+
+
 class SpringBootGenerator:
     """Generates complete Spring Boot projects"""
 
@@ -160,6 +174,17 @@ class SpringBootGenerator:
         self.config_format = self._normalize_config_format(config.get('config_format', 'properties'))
         self.target_directory = Path(config.get('target_directory', './output'))
         self.extra_dependencies = self._normalize_extra_dependencies(config.get('dependencies', []))
+        self.dependency_versions = config.get('dependency_versions', {}) or {}
+        self.llm_recommended_dependencies = (
+            config.get('recommended_dependencies')
+            or config.get('llm_recommended_dependencies')
+            or []
+        )
+        self.enable_llm_recommended_dependencies = bool(
+            config.get('enable_llm_recommended_dependencies', False)
+            or config.get('llm_recommended_dependencies_enabled', False)
+            or self.llm_recommended_dependencies
+        )
         self._existing_repositories: Set[str] = set()
         
         # Create standard Spring Boot source layout.
@@ -248,6 +273,435 @@ class SpringBootGenerator:
         if not lines:
             return ""
         return "\n    " + "\n    ".join(lines)
+
+    def _parse_java_version(self, value: Any) -> int:
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return 0
+
+    def _spring_boot_major(self, value: Any) -> int:
+        try:
+            return int(str(value).split(".")[0])
+        except (TypeError, ValueError, IndexError):
+            return 0
+
+    def isJava25AndBoot4(self, config: Dict[str, Any]) -> bool:
+        java_version = self._parse_java_version(config.get("java_version", self.java_version))
+        spring_boot_version = str(config.get("spring_boot_version", self.spring_boot_version))
+        return java_version >= 25 and spring_boot_version.startswith("4.")
+
+    def generateProject(self, config: Dict[str, Any]) -> str:
+        build_tool = self._normalize_build_tool(config.get("build_tool", self.build_tool))
+        if build_tool == "maven":
+            if self.isJava25AndBoot4(config):
+                return self.generateStructuredPom(config)
+            return self.generateMinimalPom(config)
+        if build_tool == "gradle":
+            return self.generateGradleBuild(config)
+        return self.generateMinimalPom(config)
+
+    def _get_database_type(self, config: Dict[str, Any]) -> str:
+        if isinstance(config.get("database"), dict):
+            db_type = config.get("database", {}).get("type")
+            if db_type:
+                return str(db_type).lower()
+        for key in ("database_type", "db_type"):
+            if config.get(key):
+                return str(config.get(key)).lower()
+        return "oracle"
+
+    def _is_boot_managed_dependency(self, dep: BuildDependency) -> bool:
+        if dep.group == "org.springframework.boot":
+            return True
+        if dep.artifact.startswith("spring-boot-starter"):
+            return True
+        if dep.group == "org.springframework" and dep.artifact.startswith("spring-"):
+            return True
+        return False
+
+    def _normalize_dependency_input(self, dep: Any) -> Optional[BuildDependency]:
+        if not dep:
+            return None
+        if isinstance(dep, dict):
+            group = dep.get("group") or dep.get("groupId")
+            artifact = dep.get("artifact") or dep.get("artifactId")
+            if not group or not artifact:
+                return None
+            return BuildDependency(
+                group=str(group).strip(),
+                artifact=str(artifact).strip(),
+                scope=dep.get("scope"),
+                version=dep.get("version"),
+                optional=bool(dep.get("optional", False)),
+                gradle_configuration=dep.get("gradle") or dep.get("gradle_configuration"),
+                annotation_processor=bool(dep.get("annotationProcessor", False)),
+            )
+
+        dep_id = str(dep).strip()
+        if not dep_id:
+            return None
+
+        alias_map = {
+            "web": "spring-boot-starter-web",
+            "webmvc": "spring-boot-starter-web",
+            "webflux": "spring-boot-starter-webflux",
+            "data-jpa": "spring-boot-starter-data-jpa",
+            "mysql": "mysql-connector-j",
+            "postgres": "postgresql",
+            "postgresql": "postgresql",
+            "oracle": "ojdbc8",
+        }
+        dep_id = alias_map.get(dep_id, dep_id)
+
+        info = self.EXTRA_DEPENDENCY_COORDINATES.get(dep_id)
+        if info:
+            return BuildDependency(
+                group=info["group"],
+                artifact=info["artifact"],
+                scope=info.get("scope"),
+                optional=bool(info.get("optional", False)),
+                gradle_configuration=info.get("gradle"),
+                annotation_processor=bool(info.get("annotationProcessor", False)),
+            )
+
+        driver_map = {
+            "ojdbc8": BuildDependency(
+                group="com.oracle.database.jdbc",
+                artifact="ojdbc8",
+                scope="runtime",
+                gradle_configuration="runtimeOnly",
+            ),
+            "ojdbc11": BuildDependency(
+                group="com.oracle.database.jdbc",
+                artifact="ojdbc11",
+                scope="runtime",
+                gradle_configuration="runtimeOnly",
+            ),
+            "mysql-connector-j": BuildDependency(
+                group="com.mysql",
+                artifact="mysql-connector-j",
+                scope="runtime",
+                gradle_configuration="runtimeOnly",
+            ),
+            "postgresql": BuildDependency(
+                group="org.postgresql",
+                artifact="postgresql",
+                scope="runtime",
+                gradle_configuration="runtimeOnly",
+            ),
+        }
+        if dep_id in driver_map:
+            return driver_map[dep_id]
+
+        parts = dep_id.split(":")
+        if len(parts) >= 2:
+            group = parts[0]
+            artifact = parts[1]
+            version = parts[2] if len(parts) >= 3 else None
+            return BuildDependency(group=group, artifact=artifact, version=version)
+
+        return None
+
+    def _resolve_dependency_version(self, dep: BuildDependency, config: Dict[str, Any]) -> Optional[str]:
+        if dep.version:
+            return dep.version
+        if self._is_boot_managed_dependency(dep):
+            return None
+        key = f"{dep.group}:{dep.artifact}"
+        if key in self.dependency_versions:
+            return str(self.dependency_versions[key]).strip()
+        compatibility_versions = {
+            "org.springdoc:springdoc-openapi-starter-webmvc-ui": "2.5.0",
+            "org.mapstruct:mapstruct": "1.5.5.Final",
+            "org.springframework.retry:spring-retry": "2.0.5",
+            "org.flywaydb:flyway-core": "10.10.0",
+            "io.micrometer:micrometer-registry-prometheus": "1.13.6",
+        }
+        return compatibility_versions.get(key)
+
+    def _is_dependency_compatible(self, dep: BuildDependency, config: Dict[str, Any]) -> bool:
+        java_version = self._parse_java_version(config.get("java_version", self.java_version))
+        boot_major = self._spring_boot_major(config.get("spring_boot_version", self.spring_boot_version))
+        compat = {
+            ("org.springframework.retry", "spring-retry"): {"min_java": 8, "min_boot_major": 2},
+            ("org.mapstruct", "mapstruct"): {"min_java": 8, "min_boot_major": 2},
+            ("org.flywaydb", "flyway-core"): {"min_java": 8, "min_boot_major": 2},
+            ("io.micrometer", "micrometer-registry-prometheus"): {"min_java": 8, "min_boot_major": 2},
+            ("org.springdoc", "springdoc-openapi-starter-webmvc-ui"): {"min_java": 17, "min_boot_major": 3},
+        }
+        rule = compat.get(dep.key())
+        if not rule:
+            return True
+        min_java = rule.get("min_java")
+        if min_java and java_version < min_java:
+            return False
+        min_boot_major = rule.get("min_boot_major")
+        if min_boot_major and boot_major < min_boot_major:
+            return False
+        max_boot_major = rule.get("max_boot_major")
+        if max_boot_major and boot_major > max_boot_major:
+            return False
+        return True
+
+    def _select_database_dependency(self, config: Dict[str, Any]) -> Optional[BuildDependency]:
+        db_type = self._get_database_type(config)
+        java_version = self._parse_java_version(config.get("java_version", self.java_version))
+        if db_type == "oracle":
+            artifact = "ojdbc11" if java_version >= 25 else "ojdbc8"
+            return BuildDependency(
+                group="com.oracle.database.jdbc",
+                artifact=artifact,
+                scope="runtime",
+                gradle_configuration="runtimeOnly",
+            )
+        if db_type == "mysql":
+            return BuildDependency(
+                group="com.mysql",
+                artifact="mysql-connector-j",
+                scope="runtime",
+                gradle_configuration="runtimeOnly",
+            )
+        if db_type in ("postgresql", "postgres"):
+            return BuildDependency(
+                group="org.postgresql",
+                artifact="postgresql",
+                scope="runtime",
+                gradle_configuration="runtimeOnly",
+            )
+        return None
+
+    def _dedupe_dependencies(self, deps: List[BuildDependency]) -> List[BuildDependency]:
+        scope_priority = {"compile": 3, None: 3, "runtime": 2, "provided": 1, "test": 0}
+        gradle_priority = {
+            "implementation": 3,
+            "api": 3,
+            None: 3,
+            "runtimeOnly": 2,
+            "developmentOnly": 2,
+            "compileOnly": 1,
+            "testImplementation": 0,
+        }
+        ordered: List[BuildDependency] = []
+        seen: Dict[tuple, BuildDependency] = {}
+        for dep in deps:
+            key = dep.key()
+            existing = seen.get(key)
+            if not existing:
+                seen[key] = dep
+                ordered.append(dep)
+                continue
+            if dep.version and not existing.version:
+                existing.version = dep.version
+            if dep.optional:
+                existing.optional = True
+            if dep.annotation_processor:
+                existing.annotation_processor = True
+            if scope_priority.get(dep.scope, 0) > scope_priority.get(existing.scope, 0):
+                existing.scope = dep.scope
+            if gradle_priority.get(dep.gradle_configuration, 0) > gradle_priority.get(existing.gradle_configuration, 0):
+                existing.gradle_configuration = dep.gradle_configuration
+        return ordered
+
+    def _resolve_conflicts(self, deps: List[BuildDependency]) -> List[BuildDependency]:
+        keys = {dep.key(): dep for dep in deps}
+        web_key = ("org.springframework.boot", "spring-boot-starter-web")
+        webflux_key = ("org.springframework.boot", "spring-boot-starter-webflux")
+        if web_key in keys and webflux_key in keys:
+            deps = [dep for dep in deps if dep.key() != web_key]
+        return deps
+
+    def _build_dependency_list(self, config: Dict[str, Any]) -> List[BuildDependency]:
+        deps: List[BuildDependency] = []
+        deps.extend([
+            BuildDependency(
+                group="org.springframework.boot",
+                artifact="spring-boot-starter-web",
+                gradle_configuration="implementation",
+            ),
+            BuildDependency(
+                group="org.springframework.boot",
+                artifact="spring-boot-starter-data-jpa",
+                gradle_configuration="implementation",
+            ),
+            BuildDependency(
+                group="org.springframework.boot",
+                artifact="spring-boot-starter-validation",
+                gradle_configuration="implementation",
+            ),
+            BuildDependency(
+                group="org.springdoc",
+                artifact="springdoc-openapi-starter-webmvc-ui",
+                version="2.5.0",
+                gradle_configuration="implementation",
+            ),
+            BuildDependency(
+                group="org.springframework.boot",
+                artifact="spring-boot-starter-test",
+                scope="test",
+                gradle_configuration="testImplementation",
+            ),
+            BuildDependency(
+                group="org.testcontainers",
+                artifact="testcontainers",
+                scope="test",
+                gradle_configuration="testImplementation",
+            ),
+            BuildDependency(
+                group="org.testcontainers",
+                artifact="junit-jupiter",
+                scope="test",
+                gradle_configuration="testImplementation",
+            ),
+            BuildDependency(
+                group="org.springframework.boot",
+                artifact="spring-boot-devtools",
+                scope="runtime",
+                optional=True,
+                gradle_configuration="developmentOnly",
+            ),
+        ])
+
+        db_dep = self._select_database_dependency(config)
+        if db_dep:
+            deps.append(db_dep)
+        selected_driver_key = db_dep.key() if db_dep else None
+
+        for dep_id in self.extra_dependencies:
+            dep = self._normalize_dependency_input(dep_id)
+            if dep:
+                deps.append(dep)
+
+        if self.enable_llm_recommended_dependencies:
+            for rec in self.llm_recommended_dependencies or []:
+                dep = self._normalize_dependency_input(rec)
+                if not dep:
+                    continue
+                if not self._is_dependency_compatible(dep, config):
+                    logger.warning("Skipping incompatible LLM dependency: %s:%s", dep.group, dep.artifact)
+                    continue
+                dep.version = self._resolve_dependency_version(dep, config)
+                if not dep.version and not self._is_boot_managed_dependency(dep):
+                    logger.warning("Skipping LLM dependency without managed version: %s:%s", dep.group, dep.artifact)
+                    continue
+                deps.append(dep)
+
+        if selected_driver_key:
+            driver_keys = {
+                ("com.oracle.database.jdbc", "ojdbc8"),
+                ("com.oracle.database.jdbc", "ojdbc11"),
+                ("com.mysql", "mysql-connector-j"),
+                ("org.postgresql", "postgresql"),
+            }
+            deps = [
+                dep for dep in deps
+                if dep.key() not in driver_keys or dep.key() == selected_driver_key
+            ]
+        deps = self._resolve_conflicts(self._dedupe_dependencies(deps))
+        return deps
+
+    def _categorize_dependency(self, dep: BuildDependency) -> str:
+        if dep.scope == "test" or (dep.gradle_configuration or "").startswith("test"):
+            return "testing"
+        if dep.artifact in ("spring-boot-devtools",):
+            return "devtools"
+        if dep.group in ("com.oracle.database.jdbc", "com.mysql", "org.postgresql"):
+            return "database"
+        return "core"
+
+    def _render_maven_dependency_block(self, dep: BuildDependency, indent: str = "        ") -> str:
+        lines = [
+            f"{indent}<dependency>",
+            f"{indent}    <groupId>{dep.group}</groupId>",
+            f"{indent}    <artifactId>{dep.artifact}</artifactId>",
+        ]
+        if dep.version:
+            lines.append(f"{indent}    <version>{dep.version}</version>")
+        if dep.scope:
+            lines.append(f"{indent}    <scope>{dep.scope}</scope>")
+        if dep.optional:
+            lines.append(f"{indent}    <optional>true</optional>")
+        lines.append(f"{indent}</dependency>")
+        return "\n".join(lines)
+
+    def _render_maven_dependencies(self, deps: List[BuildDependency], grouped: bool = False) -> str:
+        if not deps:
+            return ""
+        if not grouped:
+            return "\n".join(self._render_maven_dependency_block(dep) for dep in deps)
+
+        sections = {
+            "core": [],
+            "database": [],
+            "testing": [],
+            "devtools": [],
+        }
+        for dep in deps:
+            sections[self._categorize_dependency(dep)].append(dep)
+
+        parts: List[str] = []
+        if sections["core"]:
+            parts.append("        <!-- Core -->")
+            parts.extend(self._render_maven_dependency_block(dep) for dep in sections["core"])
+        if sections["database"]:
+            parts.append("        <!-- Database -->")
+            parts.extend(self._render_maven_dependency_block(dep) for dep in sections["database"])
+        if sections["testing"]:
+            parts.append("        <!-- Testing -->")
+            parts.extend(self._render_maven_dependency_block(dep) for dep in sections["testing"])
+        if sections["devtools"]:
+            parts.append("        <!-- DevTools -->")
+            parts.extend(self._render_maven_dependency_block(dep) for dep in sections["devtools"])
+        return "\n".join(parts)
+
+    def _render_gradle_dependencies(self, deps: List[BuildDependency], grouped: bool = False) -> str:
+        if not deps:
+            return ""
+        sections = {
+            "core": [],
+            "database": [],
+            "testing": [],
+            "devtools": [],
+        }
+        for dep in deps:
+            sections[self._categorize_dependency(dep)].append(dep)
+
+        def gradle_line(dep: BuildDependency) -> List[str]:
+            conf = dep.gradle_configuration or "implementation"
+            coordinate = f"{dep.group}:{dep.artifact}"
+            if dep.version:
+                coordinate = f"{coordinate}:{dep.version}"
+            lines = [f"    {conf} '{coordinate}'"]
+            if dep.annotation_processor:
+                lines.append(f"    annotationProcessor '{coordinate}'")
+            return lines
+
+        if not grouped:
+            lines: List[str] = []
+            for dep in deps:
+                lines.extend(gradle_line(dep))
+            return "\n".join(lines)
+
+        parts: List[str] = []
+        if sections["core"]:
+            parts.append("    // Core")
+            for dep in sections["core"]:
+                parts.extend(gradle_line(dep))
+        if sections["database"]:
+            parts.append("    // Database")
+            for dep in sections["database"]:
+                parts.extend(gradle_line(dep))
+        if sections["testing"]:
+            parts.append("    // Testing")
+            for dep in sections["testing"]:
+                parts.extend(gradle_line(dep))
+        if sections["devtools"]:
+            parts.append("    // DevTools")
+            for dep in sections["devtools"]:
+                parts.extend(gradle_line(dep))
+        return "\n".join(parts)
     
     async def generate_project(self, java_code: Dict[str, str]) -> Dict[str, Any]:
         """
@@ -327,13 +781,14 @@ class SpringBootGenerator:
     
     def _generate_build_config(self):
         """Generate Maven POM or Gradle build file"""
+        build_content = self.generateProject(self.config)
         if self.build_tool == "gradle":
-            gradle_content = self._generate_gradle_content()
+            gradle_content = build_content
             gradle_path = self.target_directory / 'build.gradle'
             with open(gradle_path, 'w', encoding='utf-8') as f:
                 f.write(gradle_content)
         else:
-            pom_content = self._generate_pom_content()
+            pom_content = build_content
             pom_path = self.target_directory / 'pom.xml'
             with open(pom_path, 'w', encoding='utf-8') as f:
                 f.write(pom_content)
@@ -342,6 +797,11 @@ class SpringBootGenerator:
     
     def _generate_pom_content(self) -> str:
         """Generate Maven POM content"""
+        return self.generateMinimalPom(self.config)
+
+    def generateMinimalPom(self, config: Dict[str, Any]) -> str:
+        deps = self._build_dependency_list(config)
+        dependency_block = self._render_maven_dependencies(deps, grouped=False)
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -370,74 +830,7 @@ class SpringBootGenerator:
     </properties>
 
     <dependencies>
-        <!-- Spring Boot Starters -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-jpa</artifactId>
-        </dependency>
-        
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-validation</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springdoc</groupId>
-            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
-            <version>2.5.0</version>
-        </dependency>
-        
-        <!-- Database Drivers -->
-        <dependency>
-            <groupId>com.oracle.database.jdbc</groupId>
-            <artifactId>ojdbc8</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        
-        <dependency>
-            <groupId>com.mysql</groupId>
-            <artifactId>mysql-connector-j</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        
-        <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        
-        <!-- Testing -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-        
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>testcontainers</artifactId>
-            <scope>test</scope>
-        </dependency>
-        
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <scope>test</scope>
-        </dependency>
-        
-        <!-- Development Tools -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-devtools</artifactId>
-            <scope>runtime</scope>
-            <optional>true</optional>
-        </dependency>
-        {self._render_extra_maven_dependencies()}
+{dependency_block}
     </dependencies>
 
     <build>
@@ -460,9 +853,98 @@ class SpringBootGenerator:
     </build>
 </project>
 """
+
+    def generateStructuredPom(self, config: Dict[str, Any]) -> str:
+        deps = self._build_dependency_list(config)
+        dependency_block = self._render_maven_dependencies(deps, grouped=True)
+        license_name = config.get("license_name", "UNLICENSED")
+        license_url = config.get("license_url", "https://example.com/license")
+        developer_name = config.get("developer_name", "PL/SQL Modernization Team")
+        developer_email = config.get("developer_email", "dev-team@example.com")
+        scm_url = config.get("scm_url", "https://example.com/repo")
+        java_version = 25
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>{self.spring_boot_version}</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>{self.group_id}</groupId>
+    <artifactId>{self.artifact_id}</artifactId>
+    <version>1.0.0</version>
+    <packaging>{self.packaging}</packaging>
+
+    <name>{self.project_name}</name>
+    <description>{self.description}</description>
+    <licenses>
+        <license>
+            <name>{license_name}</name>
+            <url>{license_url}</url>
+        </license>
+    </licenses>
+    <developers>
+        <developer>
+            <name>{developer_name}</name>
+            <email>{developer_email}</email>
+        </developer>
+    </developers>
+    <scm>
+        <url>{scm_url}</url>
+    </scm>
+
+    <properties>
+        <java.version>{java_version}</java.version>
+    </properties>
+
+    <dependencies>
+{dependency_block}
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <release>{java_version}</release>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </path>
+                        <path>
+                            <groupId>org.springframework.boot</groupId>
+                            <artifactId>spring-boot-configuration-processor</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+"""
     
     def _generate_gradle_content(self) -> str:
         """Generate Gradle build file content"""
+        return self.generateGradleBuild(self.config)
+
+    def generateGradleBuild(self, config: Dict[str, Any]) -> str:
+        deps = self._build_dependency_list(config)
+        dependency_block = self._render_gradle_dependencies(deps, grouped=True)
         war_plugin = "    id 'war'\n" if self.packaging == "war" else ""
         war_tasks = ""
         if self.packaging == "war":
@@ -496,21 +978,7 @@ repositories {{
 }}
 
 dependencies {{
-    implementation 'org.springframework.boot:spring-boot-starter-web'
-    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
-    implementation 'org.springframework.boot:spring-boot-starter-validation'
-    implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.5.0'
-    
-    runtimeOnly 'com.oracle.database.jdbc:ojdbc8'
-    runtimeOnly 'com.mysql:mysql-connector-j'
-    runtimeOnly 'org.postgresql:postgresql'
-    
-    testImplementation 'org.springframework.boot:spring-boot-starter-test'
-    testImplementation 'org.testcontainers:testcontainers'
-    testImplementation 'org.testcontainers:junit-jupiter'
-    
-    developmentOnly 'org.springframework.boot:spring-boot-devtools'
-{self._render_extra_gradle_dependencies()}
+{dependency_block}
 }}
 
 tasks.named('test') {{

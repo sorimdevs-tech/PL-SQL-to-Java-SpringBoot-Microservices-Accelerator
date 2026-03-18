@@ -3,6 +3,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Database,
+  Download,
   FileCode2,
   Folder,
   GitBranch,
@@ -16,6 +17,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { strategyOptions, workflowSteps } from "@/data/converter-workflow"
+import { getJobDownloadUrl } from "@/lib/jobs-api"
 import { testOracleConnection } from "@/lib/oracle-api"
 import {
   analyzeGitSqlSource,
@@ -38,6 +40,8 @@ interface StepPanelsProps {
   activeStep: number
   onPrevious: () => void
   onNext: () => void
+  onConversionFocusChange?: (focused: boolean) => void
+  onStepAccessChange?: (maxStep: number) => void
 }
 
 type SourceMethod = "git" | "oracle" | "sqlfile"
@@ -1718,9 +1722,15 @@ interface SummaryPanelProps {
   buildTool: BuildTool
   springConfigFormat: SpringConfigFormat
   conversionSnapshot: ConversionSnapshot | null
+  backendLogs: string[]
+  backendLogsStatus: string | null
 }
 
 function SummaryPanel(props: SummaryPanelProps) {
+  const [filesOpen, setFilesOpen] = useState(false)
+  const filesBodyRef = useRef<HTMLDivElement | null>(null)
+  const [filesBodyHeight, setFilesBodyHeight] = useState("0px")
+  const hasDownload = props.conversionSnapshot?.jobId && props.conversionSnapshot?.status === "completed"
   const sourceLabel =
     props.sourceMethod === "oracle"
       ? `Oracle DB (${props.dbServiceName})`
@@ -1807,11 +1817,33 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
       }.`
     : "Run a conversion to generate a real summary from the backend."
 
+  useEffect(() => {
+    if (!filesBodyRef.current) {
+      return
+    }
+    if (filesOpen) {
+      setFilesBodyHeight(`${filesBodyRef.current.scrollHeight}px`)
+    } else {
+      setFilesBodyHeight("0px")
+    }
+  }, [filesOpen, props.conversionSnapshot?.generatedFiles?.length])
+
   return (
     <div className="space-y-4">
       <Card>
         <CardHeader>
-          <CardTitle>Project Narrative Summary</CardTitle>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <CardTitle>Project Narrative Summary</CardTitle>
+            {hasDownload ? (
+              <a
+                href={getJobDownloadUrl(props.conversionSnapshot?.jobId ?? "")}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-full bg-emerald-500 px-4 text-sm font-semibold text-white! shadow-md shadow-emerald-500/30 transition-all duration-200 hover:-translate-y-0.5 hover:bg-emerald-600"
+              >
+                <Download className="h-4 w-4 text-white" />
+                Download ZIP
+              </a>
+            ) : null}
+          </div>
           <CardDescription>
             {backendSummary ? "From backend conversion summary" : "Waiting for conversion summary"}
           </CardDescription>
@@ -1826,22 +1858,22 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
           <CardTitle>Business Logic Summary</CardTitle>
           <CardDescription>Functional interpretation of selected PL/SQL scope</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          <div className="rounded-xl text-center border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Selected Logic Units</p>
             <p className="text-sm font-semibold text-slate-900">{props.selectedProcedures.length} procedures</p>
           </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+          <div className="rounded-xl text-center border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Primary Logic Domains</p>
             <p className="text-sm font-semibold text-slate-900">
               {dominantDomains.length > 0 ? dominantDomains.join(", ") : "Not inferred yet"}
             </p>
           </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+          {/* <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Applied Strategy</p>
             <p className="text-sm font-semibold text-slate-900">{props.selectedStrategy}</p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+          </div> */}
+          <div className="rounded-xl text-center border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Target Runtime</p>
             <p className="text-sm font-semibold text-slate-900">
               Java {props.javaVersion} with {props.buildTool}
@@ -1950,13 +1982,13 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
           </div>
           <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Dependencies</p>
-            <p className="text-sm font-semibold text-slate-800">
+            <p className="text-sm font-semibold break-words text-slate-800">
               {defaultDependencyNames.join(", ")}
             </p>
           </div>
           <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Output Directory</p>
-            <p className="text-sm font-semibold text-slate-800">
+            <p className="text-sm font-semibold break-words text-slate-800">
               {props.conversionSnapshot?.outputDirectory ?? "Run conversion to get output path"}
             </p>
           </div>
@@ -1975,6 +2007,66 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
         </CardContent>
       </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Generated Files</CardTitle>
+          <CardDescription>Full list of files created by the conversion</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <button
+            type="button"
+            onClick={() => setFilesOpen((current) => !current)}
+            aria-expanded={filesOpen}
+            className="flex w-full items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2 text-left text-sm font-semibold text-slate-800 transition hover:border-slate-300"
+          >
+            <span>
+              {props.conversionSnapshot?.generatedFiles?.length
+                ? `${props.conversionSnapshot.generatedFiles.length} files generated`
+                : "No generated files yet"}
+            </span>
+            <span className={`text-xs uppercase tracking-wide text-slate-500 transition ${filesOpen ? "rotate-180" : ""}`}>
+              ▾
+            </span>
+          </button>
+          <div
+            className="overflow-hidden transition-[max-height,opacity] duration-300 ease-out"
+            style={{ maxHeight: filesBodyHeight, opacity: filesOpen ? 1 : 0 }}
+          >
+            <div ref={filesBodyRef} className="pt-2">
+              {props.conversionSnapshot?.generatedFiles?.length ? (
+                <ul className="space-y-2 text-sm text-slate-700">
+                  {props.conversionSnapshot.generatedFiles.map((path) => (
+                    <li key={path} className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                      {path}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm font-semibold text-slate-800">No generated files yet</p>
+              )}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Backend Logs</CardTitle>
+          <CardDescription>Live logs captured during conversion</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="rounded-xl border border-slate-800 bg-slate-950/95 p-3">
+            <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap text-xs text-emerald-200">
+              {props.backendLogs.length > 0
+                ? props.backendLogs.join("\n")
+                : props.backendLogsStatus === "missing"
+                  ? "Job not found. Start a new conversion to stream logs."
+                  : "No backend logs yet."}
+            </pre>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   )
 }
@@ -2040,6 +2132,9 @@ interface PanelBodyProps {
   projectName: string
   conversionSnapshot: ConversionSnapshot | null
   onSnapshotChange: (snapshot: ConversionSnapshot | null) => void
+  backendLogs: string[]
+  backendLogsStatus: string | null
+  onBackendLogsChange: (lines: string[], status?: string | null) => void
   setGitRepoUrl: (value: string) => void
   setSourceMethod: (method: SourceMethod) => void
   setDbHost: (value: string) => void
@@ -2167,6 +2262,7 @@ function PanelBody(props: PanelBodyProps) {
             optionalDependencies={props.selectedOptionalDependencies}
             onConversionStart={props.onConversionStart}
             onSnapshotChange={props.onSnapshotChange}
+            onBackendLogsChange={props.onBackendLogsChange}
           />
         </div>
       )
@@ -2189,6 +2285,8 @@ function PanelBody(props: PanelBodyProps) {
           buildTool={props.buildTool}
           springConfigFormat={props.springConfigFormat}
           conversionSnapshot={props.conversionSnapshot}
+          backendLogs={props.backendLogs}
+          backendLogsStatus={props.backendLogsStatus}
         />
       )
     default:
@@ -2196,7 +2294,13 @@ function PanelBody(props: PanelBodyProps) {
   }
 }
 
-export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) {
+export function StepPanels({
+  activeStep,
+  onPrevious,
+  onNext,
+  onConversionFocusChange,
+  onStepAccessChange,
+}: StepPanelsProps) {
   const [isDiscoveryLoading, setIsDiscoveryLoading] = useState(false)
   const [sourceMethod, setSourceMethod] = useState<SourceMethod>("oracle")
   const [gitRepoUrl, setGitRepoUrl] = useState("")
@@ -2233,6 +2337,8 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
   const [suggestedDependencies, setSuggestedDependencies] = useState<SuggestedDependency[]>([])
   const [selectedOptionalDependencies, setSelectedOptionalDependencies] = useState<string[]>([])
   const [conversionSnapshot, setConversionSnapshot] = useState<ConversionSnapshot | null>(null)
+  const [backendLogs, setBackendLogs] = useState<string[]>([])
+  const [backendLogsStatus, setBackendLogsStatus] = useState<string | null>(null)
   const [hideSpringConfig, setHideSpringConfig] = useState(false)
 
   useEffect(() => {
@@ -2254,13 +2360,61 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
     }
   }, [activeStep])
 
+  useEffect(() => {
+    onConversionFocusChange?.(activeStep === 3 && hideSpringConfig)
+  }, [activeStep, hideSpringConfig, onConversionFocusChange])
+
+  function hasValue(value: string): boolean {
+    return value.trim().length > 0
+  }
+
+  const isStep1Ready =
+    sourceMethod === "git"
+      ? hasValue(gitRepoUrl)
+      : sourceMethod === "sqlfile"
+        ? Boolean(sourceFile)
+        : hasValue(dbHost) && hasValue(dbPort) && hasValue(dbServiceName) && hasValue(dbUsername) && hasValue(dbPassword)
+  const isStep2Ready = selectedProcedures.length > 0
+  const isStep3Ready =
+    hasValue(springBootVersion) &&
+    hasValue(javaVersion) &&
+    hasValue(projectGroup) &&
+    hasValue(projectArtifact) &&
+    hasValue(projectDisplayName) &&
+    hasValue(projectDescription) &&
+    hasValue(projectPackageName)
+  const isStep4Ready = conversionSnapshot?.status === "completed"
+
+  function isStepReady(stepId: number): boolean {
+    if (stepId === 1) {
+      return isStep1Ready
+    }
+    if (stepId === 2) {
+      return isStep2Ready
+    }
+    if (stepId === 3) {
+      return isStep3Ready
+    }
+    return true
+  }
+
+  useEffect(() => {
+    let maxStep = 1
+    if (isStep1Ready) maxStep = 2
+    if (isStep1Ready && isStep2Ready) maxStep = 3
+    if (isStep1Ready && isStep2Ready && isStep3Ready && isStep4Ready) maxStep = 4
+    onStepAccessChange?.(maxStep)
+  }, [isStep1Ready, isStep2Ready, isStep3Ready, isStep4Ready, onStepAccessChange])
+
   return (
     <section className="space-y-4">
-      <div className="rounded-2xl border border-slate-200/80 bg-white/90 p-4 shadow-lg shadow-slate-200/40 backdrop-blur">
-        <p className="text-xs uppercase tracking-[0.12em] text-slate-500">Step {step.id} of {workflowSteps.length}</p>
-        <h2 className="text-xl font-bold text-slate-900">{step.title}</h2>
-        <p className="text-sm text-slate-600">{step.helper}</p>
-      </div>
+      {hideSpringConfig ? null : (
+        <div className="rounded-2xl border border-slate-200/80 bg-white/90 p-4 shadow-lg shadow-slate-200/40 backdrop-blur">
+          <p className="text-xs uppercase tracking-[0.12em] text-slate-500">Step {step.id} of {workflowSteps.length}</p>
+          <h2 className="text-xl font-bold text-slate-900">{step.title}</h2>
+          <p className="text-sm text-slate-600">{step.helper}</p>
+        </div>
+      )}
 
       <PanelBody
         activeStep={activeStep}
@@ -2333,20 +2487,33 @@ export function StepPanels({ activeStep, onPrevious, onNext }: StepPanelsProps) 
         projectName={projectName}
         conversionSnapshot={conversionSnapshot}
         onSnapshotChange={setConversionSnapshot}
+        backendLogs={backendLogs}
+        backendLogsStatus={backendLogsStatus}
+        onBackendLogsChange={(lines, status) => {
+          setBackendLogs(lines)
+          setBackendLogsStatus(status ?? null)
+        }}
       />
 
-      <div className="flex items-center justify-between rounded-2xl border border-slate-200/80 bg-white/90 p-3 shadow-lg shadow-slate-200/40 backdrop-blur">
-        <Button variant="outline" onClick={onPrevious} disabled={activeStep === 1}>
-          Previous
-        </Button>
+      {activeStep === workflowSteps.length ? null : (
+        <div className="flex items-center justify-between rounded-2xl border border-slate-200/80 bg-white/90 p-3 shadow-lg shadow-slate-200/40 backdrop-blur">
+          <Button variant="outline" onClick={onPrevious} disabled={activeStep === 1}>
+            Previous
+          </Button>
         <Button
           onClick={onNext}
-          disabled={activeStep === workflowSteps.length || (activeStep === 2 && isDiscoveryLoading)}
+          disabled={
+            activeStep === workflowSteps.length ||
+            (activeStep === 2 && isDiscoveryLoading) ||
+            (activeStep === 3 && conversionSnapshot?.status !== "completed") ||
+            !isStepReady(activeStep)
+          }
         >
-          {activeStep === 2 && isDiscoveryLoading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : null}
-          Next step
-        </Button>
-      </div>
+            {activeStep === 2 && isDiscoveryLoading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : null}
+            Next step
+          </Button>
+        </div>
+      )}
     </section>
   )
 }

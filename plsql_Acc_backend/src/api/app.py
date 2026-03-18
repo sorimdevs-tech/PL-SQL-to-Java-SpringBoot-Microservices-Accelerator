@@ -5,7 +5,9 @@ FastAPI backend for the PL/SQL modernization pipeline.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 import re
 import shutil
 import tempfile
@@ -803,16 +805,29 @@ class JobManager:
         job = self.get_job(job_id)
         output_dir = self.get_output_dir(job_id)
         output_dir.mkdir(parents=True, exist_ok=True)
+        job_dir = self.get_job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        log_path = job_dir / "job.log"
+        log_file = log_path.open("a", encoding="utf-8")
+        root_logger = logging.getLogger()
+        log_handler = logging.StreamHandler(log_file)
+        log_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        root_logger.addHandler(log_handler)
 
         job.status = "running"
         job.started_at = _utc_now()
         try:
+            root_logger.info("Job %s started.", job.job_id)
             pipeline = PLSQLModernizationPipeline(
                 config_path=config_path,
                 output_directory=str(output_dir),
                 config_overrides=config_overrides,
             )
-            result = await pipeline.run_pipeline(source_path, source_type)
+            with contextlib.redirect_stdout(log_file), contextlib.redirect_stderr(log_file):
+                result = await pipeline.run_pipeline(source_path, source_type)
+            root_logger.info("Job %s completed.", job.job_id)
             job.status = "completed"
             job.result = result
             job.completed_at = _utc_now()
@@ -820,6 +835,11 @@ class JobManager:
             job.status = "failed"
             job.error = str(exc)
             job.completed_at = _utc_now()
+
+        finally:
+            root_logger.removeHandler(log_handler)
+            log_handler.close()
+            log_file.close()
 
     def start_job(self, job: JobRecord, source_path: str) -> None:
         """Start a job in the current event loop."""
@@ -846,6 +866,7 @@ class JobManager:
         payload["files_url"] = (
             f"/api/jobs/{job.job_id}/files" if job.status == "completed" and job.result else None
         )
+        payload["logs_url"] = f"/api/jobs/{job.job_id}/logs"
         return payload
 
 
@@ -1433,6 +1454,33 @@ async def list_job_files(job_id: str) -> Dict[str, Any]:
     }
 
 
+@app.get("/api/jobs/{job_id}/logs")
+async def get_job_logs(
+    job_id: str,
+    limit: int = Query(200, ge=1, le=2000),
+) -> Dict[str, Any]:
+    """Return recent backend log lines for a job."""
+    try:
+        job = job_manager.get_job(job_id)
+    except KeyError:
+        return {"job_id": job_id, "status": "missing", "lines": [], "count": 0, "total": 0}
+
+    log_path = job_manager.get_job_dir(job_id) / "job.log"
+    if not log_path.exists():
+        return {"job_id": job_id, "status": job.status, "lines": [], "count": 0, "total": 0}
+
+    content = log_path.read_text(encoding="utf-8", errors="ignore")
+    lines = content.splitlines()
+    tail = lines[-limit:] if limit else lines
+    return {
+        "job_id": job_id,
+        "status": job.status,
+        "lines": tail,
+        "count": len(tail),
+        "total": len(lines),
+    }
+
+
 @app.get("/api/jobs/{job_id}/file-content")
 async def get_job_file_content(job_id: str, path: str = Query(..., min_length=1)) -> Dict[str, Any]:
     """Return text content for a generated file."""
@@ -1478,3 +1526,4 @@ async def download_job_output(job_id: str) -> FileResponse:
         media_type="application/zip",
         filename=f"{job_id}.zip",
     )
+

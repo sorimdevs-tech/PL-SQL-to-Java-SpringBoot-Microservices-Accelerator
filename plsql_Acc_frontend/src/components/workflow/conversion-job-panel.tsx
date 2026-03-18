@@ -8,6 +8,7 @@ import {
   createFileJob,
   createGitJob,
   getBackendHealth,
+  getJobLogs,
   getJobDownloadUrl,
   getJobFileContent,
   getJobFiles,
@@ -52,6 +53,7 @@ interface ConversionJobPanelProps {
   optionalDependencies: string[]
   onConversionStart: () => void
   onSnapshotChange: (snapshot: ConversionSnapshot | null) => void
+  onBackendLogsChange?: (lines: string[], status?: string | null) => void
 }
 
 function statusVariant(status: string) {
@@ -76,10 +78,13 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
   const [isStarting, setIsStarting] = useState(false)
   const [isLoadingFiles, setIsLoadingFiles] = useState(false)
   const [isLoadingFileContent, setIsLoadingFileContent] = useState(false)
+  const [isLoadingBackendLogs, setIsLoadingBackendLogs] = useState(false)
   const [isCheckingHealth, setIsCheckingHealth] = useState(false)
   const [isBackendHealthy, setIsBackendHealthy] = useState<boolean | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [logs, setLogs] = useState<{ id: string; message: string; time: string }[]>([])
+  const [backendLogs, setBackendLogs] = useState<string[]>([])
+  const [backendLogsStatus, setBackendLogsStatus] = useState<string | null>(null)
   const [progressStage, setProgressStage] = useState<"idle" | "queued" | "running" | "completed" | "failed">("idle")
   const lastStatusRef = useRef<string | null>(null)
   const [conversionStarted, setConversionStarted] = useState(false)
@@ -183,6 +188,47 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
   }, [isPolling, job?.job_id, refreshJobStatus])
 
   useEffect(() => {
+    props.onBackendLogsChange?.(backendLogs, backendLogsStatus)
+  }, [backendLogs, backendLogsStatus, props])
+
+  useEffect(() => {
+    if (!job?.job_id) {
+      setBackendLogs([])
+      return
+    }
+    let isCancelled = false
+
+    async function fetchLogs() {
+      try {
+        setIsLoadingBackendLogs(true)
+        if (!job?.job_id) {
+          return
+        }
+        const response = await getJobLogs(job.job_id, 300)
+        if (!isCancelled) {
+          setBackendLogs(response.lines)
+          setBackendLogsStatus(response.status ?? null)
+        }
+      } catch {
+        if (!isCancelled) {
+          setBackendLogs([])
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingBackendLogs(false)
+        }
+      }
+    }
+
+    void fetchLogs()
+    const interval = window.setInterval(fetchLogs, 2000)
+    return () => {
+      isCancelled = true
+      window.clearInterval(interval)
+    }
+  }, [job?.job_id])
+
+  useEffect(() => {
     if (props.sourceMethod !== "git") {
       setIsBackendHealthy(null)
       return
@@ -239,6 +285,8 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
     setSelectedFilePath("")
     setSelectedFileContent("")
     setLogs([])
+    setBackendLogs([])
+    setBackendLogsStatus(null)
     setProgressStage("queued")
     props.onConversionStart()
     setConversionStarted(true)
@@ -410,7 +458,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
 
         {logs.length > 0 ? (
           <div className="rounded-xl border border-white/20 bg-white/10 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-200">Backend Logs</p>
+            <p className="text-xs uppercase tracking-wide text-slate-200">Generation Stage</p>
             <div className="mt-2 space-y-2">
               {logs.map((entry, index) => (
                 <div
@@ -426,6 +474,22 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
                 </div>
               ))}
             </div>
+          </div>
+        ) : null}
+
+        {conversionStarted ? (
+          <div className="rounded-xl border border-white/20 bg-slate-950/90 p-3">
+            <div className="flex items-center justify-between text-xs text-slate-300">
+              <span className="uppercase tracking-wide">Backend Logs</span>
+              {isLoadingBackendLogs ? <span>Loading…</span> : null}
+            </div>
+            <pre className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs text-emerald-200">
+              {backendLogs.length > 0
+                ? backendLogs.join("\n")
+                : backendLogsStatus === "missing"
+                  ? "Job not found. Start a new conversion to stream logs."
+                  : "No backend logs yet."}
+            </pre>
           </div>
         ) : null}
 

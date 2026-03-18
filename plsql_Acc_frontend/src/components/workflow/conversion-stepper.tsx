@@ -5,6 +5,7 @@ import type { WorkflowStep } from "@/types/converter"
 interface ConversionStepperProps {
   steps: WorkflowStep[]
   activeStep: number
+  maxStep: number
   onStepClick: (stepId: number) => void
 }
 
@@ -16,7 +17,7 @@ const iconMap = {
   5: Rocket,
 } as const
 
-export function ConversionStepper({ steps, activeStep, onStepClick }: ConversionStepperProps) {
+export function ConversionStepper({ steps, activeStep, maxStep, onStepClick }: ConversionStepperProps) {
   return (
     <nav className="rounded-2xl border border-slate-200/80 bg-white/90 px-3 py-2 shadow-lg shadow-slate-200/40 backdrop-blur">
       <ul className="flex flex-wrap items-stretch gap-2">
@@ -24,17 +25,25 @@ export function ConversionStepper({ steps, activeStep, onStepClick }: Conversion
           const Icon = iconMap[step.id as keyof typeof iconMap]
           const isActive = step.id === activeStep
           const isDone = step.id < activeStep
+          const isLocked = step.id > maxStep || step.id > activeStep + 1
 
           return (
             <li key={step.id} className="min-w-[180px] flex-1">
               <button
-                onClick={() => onStepClick(step.id)}
-                className={`w-full cursor-pointer rounded-xl border px-3 py-3 text-left transition-all duration-200 ${
+                onClick={() => {
+                  if (!isLocked) {
+                    onStepClick(step.id)
+                  }
+                }}
+                disabled={isLocked}
+                className={`w-full rounded-xl border px-3 py-3 text-left transition-all duration-200 ${
                   isActive
                     ? "border-cyan-300 bg-cyan-50"
                     : isDone
                       ? "border-emerald-200 bg-emerald-50"
-                      : "border-transparent bg-slate-50 hover:border-slate-200 hover:bg-slate-100"
+                      : isLocked
+                        ? "border-transparent bg-slate-50 opacity-60"
+                        : "border-transparent bg-slate-50 hover:border-slate-200 hover:bg-slate-100"
                 }`}
               >
                 <div className="flex items-start justify-between gap-2">

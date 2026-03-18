@@ -119,6 +119,13 @@ export async function getJobFiles(jobId: string): Promise<GeneratedFile[]> {
   })
 }
 
+export async function getJobLogs(jobId: string, limit = 200): Promise<{ lines: string[]; status?: string }> {
+  const query = new URLSearchParams({ limit: String(limit) }).toString()
+  const response = await fetch(toApiUrl(`/api/jobs/${jobId}/logs?${query}`))
+  const data = await parseResponse<{ lines?: string[]; status?: string }>(response)
+  return { lines: data.lines ?? [], status: data.status }
+}
+
 export async function getJobFileContent(jobId: string, path: string): Promise<string> {
   const query = new URLSearchParams({ path }).toString()
   const response = await fetch(toApiUrl(`/api/jobs/${jobId}/file-content?${query}`))
