@@ -280,6 +280,10 @@ function ConnectPanel(props: ConnectPanelProps) {
                 onChange={(event) => props.setSourceFile(event.target.files?.[0] ?? null)}
               />
               <p className="text-xs text-slate-500">{props.sourceFile ? props.sourceFile.name : "No file selected"}</p>
+              <p className="text-xs text-slate-500">
+                Recommended: include schema DDL (tables, constraints, sequences) alongside procedures. You can upload
+                multiple files or bundle them into a single `.sql` script for the most accurate entities.
+              </p>
             </div>
           ) : null}
         </div>
@@ -1727,6 +1731,23 @@ interface SummaryPanelProps {
 }
 
 function SummaryPanel(props: SummaryPanelProps) {
+  function formatDuration(ms: number | null | undefined): string {
+    if (!Number.isFinite(ms) || ms === null || ms === undefined) {
+      return "Not available"
+    }
+    const totalSeconds = Math.floor(ms / 1000)
+    const hours = Math.floor(totalSeconds / 3600)
+    const minutes = Math.floor((totalSeconds % 3600) / 60)
+    const seconds = totalSeconds % 60
+    if (hours > 0) {
+      return `${hours}h ${minutes}m ${seconds}s`
+    }
+    if (minutes > 0) {
+      return `${minutes}m ${seconds}s`
+    }
+    return `${seconds}s`
+  }
+
   const [filesOpen, setFilesOpen] = useState(false)
   const filesBodyRef = useRef<HTMLDivElement | null>(null)
   const [filesBodyHeight, setFilesBodyHeight] = useState("0px")
@@ -1896,6 +1917,12 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
           <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Project Source</p>
             <p className="text-sm font-semibold text-slate-900">{sourceLabel}</p>
+          </div>
+          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-500">Conversion Time</p>
+            <p className="text-sm font-semibold text-slate-900">
+              {formatDuration(props.conversionSnapshot?.conversionDurationMs)}
+            </p>
           </div>
           <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Business Logic Strategy</p>

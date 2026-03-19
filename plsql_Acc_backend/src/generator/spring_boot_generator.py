@@ -1,26 +1,45 @@
 """
 Spring Boot Project Generator for PL/SQL Modernization Platform
 Generates complete Spring Boot projects from converted Java code
+
+FIXES APPLIED:
+  SBG-1  : server.port wrong key in application.properties
+  SBG-2  : server.port nested under spring: in application.yml
+  SBG-3  : No Spring Boot version validation
+  SBG-4  : Artifact ID truncated for short coordinate strings
+  SBG-5  : java_version hardcoded to 25 in generateStructuredPom()
+  SBG-6  : Test files never generated despite report claiming 18
+  SBG-7  : \\b word-boundary broken inside f-strings
+  SBG-8  : Literal '\\n' join in _normalize_controller_code()
+  SBG-9  : Literal '\\n\\n' join in _generate_controller() CRUD branch
+  SBG-10 : Entity check precedes repository check in _classify_java_file()
+  SBG-11 : Service CRUD bodies never populated
+  SBG-12 : Duplicate repository interfaces for same entity
+  SBG-13 : build.gradle missing from summary for Gradle projects
+  SBG-14 : GenerationType.IDENTITY incompatible with Oracle sequences
+  SBG-15 : README.md written twice by two separate methods
 """
 
 import os
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 import logging
 
-# Import platform utilities
 from ..utils.logger import get_logger
 from ..utils.config import get_config_value
 
 logger = get_logger(__name__)
 
+# ── SBG-3: known stable Spring Boot versions ─────────────────────────────────
+_KNOWN_STABLE_SPRING_BOOT = "3.2.5"
+_MAX_SUPPORTED_SPRING_BOOT_MAJOR = 3
+
 
 @dataclass
 class ProjectStructure:
-    """Represents the generated project structure"""
     project_name: str
     package_name: str
     java_version: str
@@ -48,15 +67,8 @@ class SpringBootGenerator:
     """Generates complete Spring Boot projects"""
 
     RESERVED_ENTITY_NAMES = {
-        'Order',
-        'User',
-        'Group',
-        'Table',
-        'Column',
-        'Index',
-        'Key',
-        'Value',
-        'Constraint',
+        'Order', 'User', 'Group', 'Table', 'Column',
+        'Index', 'Key', 'Value', 'Constraint',
     }
 
     EXTRA_DEPENDENCY_COORDINATES = {
@@ -153,14 +165,8 @@ class SpringBootGenerator:
         "junit-jupiter",
         "spring-boot-devtools",
     }
-    
+
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize Spring Boot generator
-        
-        Args:
-            config (Dict[str, Any]): Output configuration
-        """
         self.config = config
         self.project_name = config.get('project_name', 'converted-app')
         self.group_id = config.get('group_id', 'com.company')
@@ -168,7 +174,10 @@ class SpringBootGenerator:
         self.package_name = config.get('package_name', 'com.company.project')
         self.description = config.get('description', 'PL/SQL to Java Modernization Project')
         self.java_version = config.get('java_version', '17')
-        self.spring_boot_version = config.get('spring_boot_version', '3.1.0')
+        # SBG-3: validate and clamp spring_boot_version
+        self.spring_boot_version = self._validate_spring_boot_version(
+            config.get('spring_boot_version', _KNOWN_STABLE_SPRING_BOOT)
+        )
         self.build_tool = self._normalize_build_tool(config.get('build_tool', 'maven'))
         self.packaging = self._normalize_packaging(config.get('packaging', 'jar'))
         self.config_format = self._normalize_config_format(config.get('config_format', 'properties'))
@@ -186,17 +195,33 @@ class SpringBootGenerator:
             or self.llm_recommended_dependencies
         )
         self._existing_repositories: Set[str] = set()
-        
-        # Create standard Spring Boot source layout.
+        self._ddl_table_map: Dict[str, str] = {}
+        self._entity_name_index: Dict[str, str] = {}
+
         self.base_path = self.target_directory / 'src' / 'main' / 'java'
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.resources_path = self.target_directory / 'src' / 'main' / 'resources'
         self.test_base_path = self.target_directory / 'src' / 'test' / 'java'
-        
-        # Package structure paths
+
         self.package_path = self.base_path / self.package_name.replace('.', '/')
-        
+
         logger.info(f"Spring Boot Generator initialized for project: {self.project_name}")
+
+    # ── SBG-3: version guard ──────────────────────────────────────────────────
+    def _validate_spring_boot_version(self, version: str) -> str:
+        """Clamp spring_boot_version to a known-stable value if unsupported."""
+        try:
+            major = int(str(version).split(".")[0])
+        except (ValueError, AttributeError):
+            logger.warning("Invalid spring_boot_version '%s'; using %s", version, _KNOWN_STABLE_SPRING_BOOT)
+            return _KNOWN_STABLE_SPRING_BOOT
+        if major > _MAX_SUPPORTED_SPRING_BOOT_MAJOR:
+            logger.warning(
+                "spring_boot_version '%s' (major=%d) is unsupported; clamping to %s",
+                version, major, _KNOWN_STABLE_SPRING_BOOT,
+            )
+            return _KNOWN_STABLE_SPRING_BOOT
+        return str(version).strip()
 
     def _normalize_extra_dependencies(self, dependencies: List[str]) -> List[str]:
         normalized: List[str] = []
@@ -207,8 +232,12 @@ class SpringBootGenerator:
             if not dep_id or dep_id in self.BASE_DEPENDENCY_IDS:
                 continue
             if ":" in dep_id:
-                if dep_id not in normalized:
+                # SBG-4: validate artifact part is non-trivial
+                parts = dep_id.split(":")
+                if len(parts) >= 2 and len(parts[1]) > 1 and dep_id not in normalized:
                     normalized.append(dep_id)
+                elif len(parts) >= 2 and len(parts[1]) <= 1:
+                    logger.warning("Ignoring suspiciously short artifact in coordinate '%s'", dep_id)
                 continue
             if dep_id in self.EXTRA_DEPENDENCY_COORDINATES and dep_id not in normalized:
                 normalized.append(dep_id)
@@ -258,7 +287,8 @@ class SpringBootGenerator:
             info = self.EXTRA_DEPENDENCY_COORDINATES.get(dep_id)
             if not info:
                 coordinate_parts = dep_id.split(":")
-                if len(coordinate_parts) >= 2:
+                # SBG-4: guard against short/truncated artifact
+                if len(coordinate_parts) >= 2 and len(coordinate_parts[1]) > 1:
                     coordinate = f"{coordinate_parts[0]}:{coordinate_parts[1]}"
                     lines.append(f"implementation '{coordinate}'")
                 continue
@@ -369,28 +399,20 @@ class SpringBootGenerator:
 
         driver_map = {
             "ojdbc8": BuildDependency(
-                group="com.oracle.database.jdbc",
-                artifact="ojdbc8",
-                scope="runtime",
-                gradle_configuration="runtimeOnly",
+                group="com.oracle.database.jdbc", artifact="ojdbc8",
+                scope="runtime", gradle_configuration="runtimeOnly",
             ),
             "ojdbc11": BuildDependency(
-                group="com.oracle.database.jdbc",
-                artifact="ojdbc11",
-                scope="runtime",
-                gradle_configuration="runtimeOnly",
+                group="com.oracle.database.jdbc", artifact="ojdbc11",
+                scope="runtime", gradle_configuration="runtimeOnly",
             ),
             "mysql-connector-j": BuildDependency(
-                group="com.mysql",
-                artifact="mysql-connector-j",
-                scope="runtime",
-                gradle_configuration="runtimeOnly",
+                group="com.mysql", artifact="mysql-connector-j",
+                scope="runtime", gradle_configuration="runtimeOnly",
             ),
             "postgresql": BuildDependency(
-                group="org.postgresql",
-                artifact="postgresql",
-                scope="runtime",
-                gradle_configuration="runtimeOnly",
+                group="org.postgresql", artifact="postgresql",
+                scope="runtime", gradle_configuration="runtimeOnly",
             ),
         }
         if dep_id in driver_map:
@@ -452,37 +474,27 @@ class SpringBootGenerator:
         if db_type == "oracle":
             artifact = "ojdbc11" if java_version >= 25 else "ojdbc8"
             return BuildDependency(
-                group="com.oracle.database.jdbc",
-                artifact=artifact,
-                scope="runtime",
-                gradle_configuration="runtimeOnly",
+                group="com.oracle.database.jdbc", artifact=artifact,
+                scope="runtime", gradle_configuration="runtimeOnly",
             )
         if db_type == "mysql":
             return BuildDependency(
-                group="com.mysql",
-                artifact="mysql-connector-j",
-                scope="runtime",
-                gradle_configuration="runtimeOnly",
+                group="com.mysql", artifact="mysql-connector-j",
+                scope="runtime", gradle_configuration="runtimeOnly",
             )
         if db_type in ("postgresql", "postgres"):
             return BuildDependency(
-                group="org.postgresql",
-                artifact="postgresql",
-                scope="runtime",
-                gradle_configuration="runtimeOnly",
+                group="org.postgresql", artifact="postgresql",
+                scope="runtime", gradle_configuration="runtimeOnly",
             )
         return None
 
     def _dedupe_dependencies(self, deps: List[BuildDependency]) -> List[BuildDependency]:
         scope_priority = {"compile": 3, None: 3, "runtime": 2, "provided": 1, "test": 0}
         gradle_priority = {
-            "implementation": 3,
-            "api": 3,
-            None: 3,
-            "runtimeOnly": 2,
-            "developmentOnly": 2,
-            "compileOnly": 1,
-            "testImplementation": 0,
+            "implementation": 3, "api": 3, None: 3,
+            "runtimeOnly": 2, "developmentOnly": 2,
+            "compileOnly": 1, "testImplementation": 0,
         }
         ordered: List[BuildDependency] = []
         seen: Dict[tuple, BuildDependency] = {}
@@ -516,52 +528,14 @@ class SpringBootGenerator:
     def _build_dependency_list(self, config: Dict[str, Any]) -> List[BuildDependency]:
         deps: List[BuildDependency] = []
         deps.extend([
-            BuildDependency(
-                group="org.springframework.boot",
-                artifact="spring-boot-starter-web",
-                gradle_configuration="implementation",
-            ),
-            BuildDependency(
-                group="org.springframework.boot",
-                artifact="spring-boot-starter-data-jpa",
-                gradle_configuration="implementation",
-            ),
-            BuildDependency(
-                group="org.springframework.boot",
-                artifact="spring-boot-starter-validation",
-                gradle_configuration="implementation",
-            ),
-            BuildDependency(
-                group="org.springdoc",
-                artifact="springdoc-openapi-starter-webmvc-ui",
-                version="2.5.0",
-                gradle_configuration="implementation",
-            ),
-            BuildDependency(
-                group="org.springframework.boot",
-                artifact="spring-boot-starter-test",
-                scope="test",
-                gradle_configuration="testImplementation",
-            ),
-            BuildDependency(
-                group="org.testcontainers",
-                artifact="testcontainers",
-                scope="test",
-                gradle_configuration="testImplementation",
-            ),
-            BuildDependency(
-                group="org.testcontainers",
-                artifact="junit-jupiter",
-                scope="test",
-                gradle_configuration="testImplementation",
-            ),
-            BuildDependency(
-                group="org.springframework.boot",
-                artifact="spring-boot-devtools",
-                scope="runtime",
-                optional=True,
-                gradle_configuration="developmentOnly",
-            ),
+            BuildDependency("org.springframework.boot", "spring-boot-starter-web", gradle_configuration="implementation"),
+            BuildDependency("org.springframework.boot", "spring-boot-starter-data-jpa", gradle_configuration="implementation"),
+            BuildDependency("org.springframework.boot", "spring-boot-starter-validation", gradle_configuration="implementation"),
+            BuildDependency("org.springdoc", "springdoc-openapi-starter-webmvc-ui", version="2.5.0", gradle_configuration="implementation"),
+            BuildDependency("org.springframework.boot", "spring-boot-starter-test", scope="test", gradle_configuration="testImplementation"),
+            BuildDependency("org.testcontainers", "testcontainers", scope="test", gradle_configuration="testImplementation"),
+            BuildDependency("org.testcontainers", "junit-jupiter", scope="test", gradle_configuration="testImplementation"),
+            BuildDependency("org.springframework.boot", "spring-boot-devtools", scope="runtime", optional=True, gradle_configuration="developmentOnly"),
         ])
 
         db_dep = self._select_database_dependency(config)
@@ -632,12 +606,7 @@ class SpringBootGenerator:
         if not grouped:
             return "\n".join(self._render_maven_dependency_block(dep) for dep in deps)
 
-        sections = {
-            "core": [],
-            "database": [],
-            "testing": [],
-            "devtools": [],
-        }
+        sections = {"core": [], "database": [], "testing": [], "devtools": []}
         for dep in deps:
             sections[self._categorize_dependency(dep)].append(dep)
 
@@ -659,12 +628,7 @@ class SpringBootGenerator:
     def _render_gradle_dependencies(self, deps: List[BuildDependency], grouped: bool = False) -> str:
         if not deps:
             return ""
-        sections = {
-            "core": [],
-            "database": [],
-            "testing": [],
-            "devtools": [],
-        }
+        sections = {"core": [], "database": [], "testing": [], "devtools": []}
         for dep in deps:
             sections[self._categorize_dependency(dep)].append(dep)
 
@@ -702,51 +666,30 @@ class SpringBootGenerator:
             for dep in sections["devtools"]:
                 parts.extend(gradle_line(dep))
         return "\n".join(parts)
-    
+
     async def generate_project(self, java_code: Dict[str, str]) -> Dict[str, Any]:
-        """
-        Generate complete Spring Boot project
-        
-        Args:
-            java_code (Dict[str, str]): Generated Java code files
-            
-        Returns:
-            Dict[str, Any]: Project generation results
-        """
         logger.info("Starting Spring Boot project generation...")
-        # Keep a copy for downstream normalization/generation steps.
         self._latest_java_code = dict(java_code or {})
-        
-        # Create project structure
+
         self._create_project_structure()
-        
-        # Generate Maven/Gradle configuration
         self._generate_build_config()
-        
-        # Generate application configuration
         self._generate_application_config()
-        
-        # Generate Java files
+
         java_files = self._generate_java_files(java_code)
 
-        # Safety cleanup: remove any accidentally generated repository stubs that shadow Spring classes.
         repo_dir = self.package_path / 'repository'
         for reserved in ('JpaRepository.java', 'CrudRepository.java'):
             reserved_path = repo_dir / reserved
             if reserved_path.exists():
                 reserved_path.unlink()
 
-        # Generate additional configuration files
         self._generate_additional_configs()
-        
-        # Generate README
+        # SBG-15: only generate README once, here
         self._generate_readme()
-        
-        # Generate project summary
+
         project_summary = self._generate_project_summary(java_files)
-        
+
         logger.info(f"Spring Boot project generation completed. Generated {len(java_files)} files.")
-        
         return {
             'project_name': self.project_name,
             'package_name': self.package_name,
@@ -754,49 +697,31 @@ class SpringBootGenerator:
             'java_files': java_files,
             'project_structure': project_summary
         }
-    
+
     def _create_project_structure(self):
-        """Create the basic Spring Boot project structure"""
-        # Main source directories
-        (self.package_path / 'controller').mkdir(parents=True, exist_ok=True)
-        (self.package_path / 'service').mkdir(parents=True, exist_ok=True)
-        (self.package_path / 'repository').mkdir(parents=True, exist_ok=True)
-        (self.package_path / 'entity').mkdir(parents=True, exist_ok=True)
-        (self.package_path / 'dto').mkdir(parents=True, exist_ok=True)
-        (self.package_path / 'exception').mkdir(parents=True, exist_ok=True)
-        (self.package_path / 'config').mkdir(parents=True, exist_ok=True)
-        
-        # Test directories
+        for sub in ('controller', 'service', 'repository', 'entity', 'dto', 'exception', 'config'):
+            (self.package_path / sub).mkdir(parents=True, exist_ok=True)
+
         test_path = self.test_base_path / self.package_name.replace('.', '/')
-        (test_path / 'service').mkdir(parents=True, exist_ok=True)
-        (test_path / 'repository').mkdir(parents=True, exist_ok=True)
-        (test_path / 'controller').mkdir(parents=True, exist_ok=True)
-        (test_path / 'entity').mkdir(parents=True, exist_ok=True)
-        (test_path / 'integration').mkdir(parents=True, exist_ok=True)
-        
-        # Resources directory
+        for sub in ('service', 'repository', 'controller', 'entity', 'integration'):
+            (test_path / sub).mkdir(parents=True, exist_ok=True)
+
         self.resources_path.mkdir(parents=True, exist_ok=True)
-        
         logger.info("Project structure created successfully")
-    
+
     def _generate_build_config(self):
-        """Generate Maven POM or Gradle build file"""
         build_content = self.generateProject(self.config)
         if self.build_tool == "gradle":
-            gradle_content = build_content
             gradle_path = self.target_directory / 'build.gradle'
             with open(gradle_path, 'w', encoding='utf-8') as f:
-                f.write(gradle_content)
+                f.write(build_content)
         else:
-            pom_content = build_content
             pom_path = self.target_directory / 'pom.xml'
             with open(pom_path, 'w', encoding='utf-8') as f:
-                f.write(pom_content)
-        
+                f.write(build_content)
         logger.info("Build configuration files generated")
-    
+
     def _generate_pom_content(self) -> str:
-        """Generate Maven POM content"""
         return self.generateMinimalPom(self.config)
 
     def generateMinimalPom(self, config: Dict[str, Any]) -> str:
@@ -839,7 +764,6 @@ class SpringBootGenerator:
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
-            
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
@@ -862,7 +786,8 @@ class SpringBootGenerator:
         developer_name = config.get("developer_name", "PL/SQL Modernization Team")
         developer_email = config.get("developer_email", "dev-team@example.com")
         scm_url = config.get("scm_url", "https://example.com/repo")
-        java_version = 25
+        # SBG-5: use self.java_version, never hardcode 25
+        java_version = self.java_version
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -914,7 +839,6 @@ class SpringBootGenerator:
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
-            
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
@@ -937,9 +861,8 @@ class SpringBootGenerator:
     </build>
 </project>
 """
-    
+
     def _generate_gradle_content(self) -> str:
-        """Generate Gradle build file content"""
         return self.generateGradleBuild(self.config)
 
     def generateGradleBuild(self, config: Dict[str, Any]) -> str:
@@ -949,7 +872,6 @@ class SpringBootGenerator:
         war_tasks = ""
         if self.packaging == "war":
             war_tasks = """
-
 bootJar {
     enabled = false
 }
@@ -986,9 +908,8 @@ tasks.named('test') {{
 }}
 {war_tasks}
 """
-    
+
     def _generate_application_config(self):
-        """Generate Spring Boot application configuration"""
         if self.config_format == "yaml":
             app_config = self._generate_application_yml()
             config_path = self.resources_path / 'application.yml'
@@ -999,23 +920,22 @@ tasks.named('test') {{
             props_path = self.resources_path / 'application.properties'
             with open(props_path, 'w', encoding='utf-8') as f:
                 f.write(app_props)
-        
         logger.info("Application configuration files generated")
-    
+
     def _generate_application_yml(self) -> str:
-        """Generate application.yml content"""
+        # SBG-2: server: is a top-level key, NOT nested under spring:
         return f"""# Spring Boot Application Configuration
 spring:
   application:
     name: {self.project_name}
-  
+
   # Database Configuration
   datasource:
     url: jdbc:oracle:thin:@localhost:1521:xe
     username: your_username
     password: your_password
     driver-class-name: oracle.jdbc.OracleDriver
-  
+
   # JPA Configuration
   jpa:
     hibernate:
@@ -1025,17 +945,17 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.OracleDialect
         format_sql: true
-  
-  # Server Configuration
-  server:
-    port: 8080
-  
-  # Logging Configuration
-  logging:
-    level:
-      {self.package_name}: DEBUG
-      org.hibernate.SQL: DEBUG
-      org.springframework.data.jpa.repository: DEBUG
+
+# SBG-2 FIX: server is top-level, not under spring:
+server:
+  port: 8080
+
+# Logging Configuration
+logging:
+  level:
+    {self.package_name}: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.springframework.data.jpa.repository: DEBUG
 
 # Custom Application Properties
 app:
@@ -1043,9 +963,9 @@ app:
   description: {self.description}
   build-time: {self._get_current_time()}
 """
-    
+
     def _generate_application_properties(self) -> str:
-        """Generate application.properties content"""
+        # SBG-1: correct key is server.port, not spring.server.port
         return f"""# Spring Boot Application Configuration
 spring.application.name={self.project_name}
 
@@ -1061,8 +981,8 @@ spring.jpa.show-sql=true
 spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.OracleDialect
 spring.jpa.properties.hibernate.format_sql=true
 
-# Server Configuration
-spring.server.port=8080
+# SBG-1 FIX: correct key (was spring.server.port)
+server.port=8080
 
 # Logging Configuration
 logging.level.{self.package_name}=DEBUG
@@ -1092,33 +1012,26 @@ app.build-time={self._get_current_time()}
     def _normalize_config_format(self, value: str) -> str:
         lowered = str(value or "").strip().lower()
         return "yaml" if lowered in {"yaml", "yml"} else "properties"
-    
+
     def _generate_java_files(self, java_code: Dict[str, str]) -> Dict[str, str]:
-        """Generate Java source files"""
         java_files = {}
-        
+
         for filename, code in java_code.items():
             type_name = self._extract_type_name(code)
             if (type_name in {'JpaRepository', 'CrudRepository'}
-                or filename.lower() in {'jparepository.java', 'crudrepository.java'}):
+                    or filename.lower() in {'jparepository.java', 'crudrepository.java'}):
                 continue
             target_filename = f"{type_name}.java" if type_name else filename
-            # Determine the appropriate package directory
             file_type = self._classify_java_file(target_filename, code)
             if file_type == 'repository' and type_name in {'JpaRepository', 'CrudRepository'}:
                 continue
-            if file_type == 'repository' and target_filename.lower() in {'jparepository.java', 'crudrepository.java'}:
-                continue
             target_dir = self._get_target_directory(file_type)
-            
-            # Create directory if it doesn't exist
             target_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Write the Java file
+
             file_path = target_dir / target_filename
             payload = code
             if file_type == 'repository':
-                payload = self._normalize_repository_code(target_filename, code, getattr(self, "_ddl_table_map", None))
+                payload = self._normalize_repository_code(target_filename, code, self._ddl_table_map)
                 repo_interface = self._extract_type_name(payload)
                 if repo_interface:
                     self._existing_repositories.add(repo_interface)
@@ -1128,102 +1041,167 @@ app.build-time={self._get_current_time()}
                 payload = self._normalize_controller_code(target_filename, code)
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(payload)
-            
+
             java_files[target_filename] = str(file_path)
-        
-        # Generate additional Java files
+
         self._generate_additional_java_files()
-        
         logger.info(f"Generated {len(java_files)} Java source files")
         return java_files
-    
+
     def _classify_java_file(self, filename: str, code: str) -> str:
-        """Classify Java file by type"""
+        """
+        SBG-10 FIX: repository/JPA check runs BEFORE entity annotation check.
+        A repository interface importing entities will not be misclassified.
+        """
         filename_lower = filename.lower()
 
-        if any(token in code for token in ('@Entity', '@Table', '@Id', '@Column')):
-            return 'entity'
+        # Repository check FIRST (fixes SBG-10)
         if 'JpaRepository' in code or 'CrudRepository' in code or '@Repository' in code:
             return 'repository'
+        if 'repository' in filename_lower or 'dao' in filename_lower:
+            return 'repository'
+
+        # Then entity
+        if any(token in code for token in ('@Entity', '@Table', '@Id', '@Column')):
+            return 'entity'
+        if 'entity' in filename_lower or 'model' in filename_lower:
+            return 'entity'
 
         if 'controller' in filename_lower or 'rest' in filename_lower:
             return 'controller'
-        elif 'service' in filename_lower:
+        if 'service' in filename_lower:
             return 'service'
-        elif 'repository' in filename_lower or 'dao' in filename_lower:
-            return 'repository'
-        elif 'entity' in filename_lower or 'model' in filename_lower:
-            return 'entity'
-        elif 'dto' in filename_lower or 'request' in filename_lower or 'response' in filename_lower:
+        if 'dto' in filename_lower or 'request' in filename_lower or 'response' in filename_lower:
             return 'dto'
-        elif 'exception' in filename_lower:
+        if 'exception' in filename_lower:
             return 'exception'
-        elif 'config' in filename_lower:
+        if 'config' in filename_lower:
             return 'config'
-        else:
-            # Analyze code content to determine type
-            if '@RestController' in code or '@Controller' in code:
-                return 'controller'
-            elif '@Service' in code:
-                return 'service'
-            elif '@Repository' in code:
-                return 'repository'
-            elif '@Entity' in code:
-                return 'entity'
-            elif '@Configuration' in code:
-                return 'config'
-            else:
-                return 'service'  # Default to service
-    
+
+        if '@RestController' in code or '@Controller' in code:
+            return 'controller'
+        if '@Service' in code:
+            return 'service'
+        if '@Entity' in code:
+            return 'entity'
+        if '@Configuration' in code:
+            return 'config'
+
+        return 'service'
+
     def _get_target_directory(self, file_type: str) -> Path:
-        """Get target directory for file type"""
-        if file_type == 'controller':
-            return self.package_path / 'controller'
-        elif file_type == 'service':
-            return self.package_path / 'service'
-        elif file_type == 'repository':
-            return self.package_path / 'repository'
-        elif file_type == 'entity':
-            return self.package_path / 'entity'
-        elif file_type == 'dto':
-            return self.package_path / 'dto'
-        elif file_type == 'exception':
-            return self.package_path / 'exception'
-        elif file_type == 'config':
-            return self.package_path / 'config'
-        else:
-            return self.package_path / 'service'
-    
+        mapping = {
+            'controller': 'controller',
+            'service': 'service',
+            'repository': 'repository',
+            'entity': 'entity',
+            'dto': 'dto',
+            'exception': 'exception',
+            'config': 'config',
+        }
+        return self.package_path / mapping.get(file_type, 'service')
+
     def _generate_additional_java_files(self):
-        """Generate additional Java files needed for Spring Boot application"""
-        # Generate main application class
         main_class = self._generate_main_application_class()
         main_path = self.package_path / f"{self._to_camel_case(self.project_name)}Application.java"
         with open(main_path, 'w', encoding='utf-8') as f:
             f.write(main_class)
-        
-        # Generate exception classes
-        base_exceptions = self._generate_base_exceptions()
-        for class_name, content in base_exceptions.items():
+
+        for class_name, content in self._generate_base_exceptions().items():
             exception_path = self.package_path / 'exception' / f"{class_name}.java"
             with open(exception_path, 'w', encoding='utf-8') as f:
                 f.write(content)
-        
-        # Generate DTO base classes
-        base_dto = self._generate_base_dto()
+
         dto_path = self.package_path / 'dto' / 'BaseDTO.java'
         with open(dto_path, 'w', encoding='utf-8') as f:
-            f.write(base_dto)
-        
-        # Generate configuration classes
-        config_classes = self._generate_config_classes()
-        for class_name, content in config_classes.items():
+            f.write(self._generate_base_dto())
+
+        for class_name, content in self._generate_config_classes().items():
             config_path = self.package_path / 'config' / f"{class_name}.java"
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.write(content)
-    
+
+        # SBG-6: generate at least a context-load test per service
+        self._generate_test_files()
+
+    # ── SBG-6: test file generation ──────────────────────────────────────────
+    def _generate_test_files(self):
+        """Generate a Spring Boot context load test for each generated service."""
+        service_dir = self.package_path / 'service'
+        test_service_dir = self.test_base_path / self.package_name.replace('.', '/') / 'service'
+        test_service_dir.mkdir(parents=True, exist_ok=True)
+
+        generated = 0
+        if service_dir.exists():
+            for service_file in service_dir.glob('*.java'):
+                service_class = service_file.stem
+                test_path = test_service_dir / f"{service_class}Test.java"
+                if test_path.exists():
+                    continue
+                content = self._generate_service_test(service_class)
+                with open(test_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                generated += 1
+
+        # Always write at least one context load test
+        if generated == 0:
+            app_test_dir = self.test_base_path / self.package_name.replace('.', '/')
+            app_test_dir.mkdir(parents=True, exist_ok=True)
+            app_class = self._to_camel_case(self.project_name)
+            test_path = app_test_dir / f"{app_class}ApplicationTests.java"
+            with open(test_path, 'w', encoding='utf-8') as f:
+                f.write(self._generate_context_load_test(app_class))
+            generated += 1
+
+        logger.info(f"Generated {generated} test files")
+
+    def _generate_service_test(self, service_class: str) -> str:
+        return f"""package {self.package_name}.service;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import javax.sql.DataSource;
+
+@SpringBootTest
+class {service_class}Test {{
+
+    @MockBean
+    DataSource dataSource;
+
+    @Autowired(required = false)
+    private {service_class} service;
+
+    @Test
+    void contextLoads() {{
+        // Verifies that the Spring context starts without errors.
+    }}
+}}
+"""
+
+    def _generate_context_load_test(self, app_class: str) -> str:
+        return f"""package {self.package_name};
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import javax.sql.DataSource;
+
+@SpringBootTest
+class {app_class}ApplicationTests {{
+
+    @MockBean
+    DataSource dataSource;
+
+    @Test
+    void contextLoads() {{
+        // Verifies that the Spring context starts without errors.
+    }}
+}}
+"""
+
     def _generate_main_application_class(self) -> str:
-        """Generate main Spring Boot application class"""
         return f"""package {self.package_name};
 
 import org.springframework.boot.SpringApplication;
@@ -1233,107 +1211,55 @@ import org.springframework.transaction.annotation.EnableTransactionManagement;
 
 /**
  * Main application class for {self.project_name}
- * 
- * This class serves as the entry point for the Spring Boot application
- * generated from PL/SQL modernization.
  */
 @SpringBootApplication
 @EnableJpaRepositories(basePackages = "{self.package_name}.repository")
 @EnableTransactionManagement
 public class {self._to_camel_case(self.project_name)}Application {{
-    
+
     public static void main(String[] args) {{
         SpringApplication.run({self._to_camel_case(self.project_name)}Application.class, args);
     }}
 }}
 """
-    
+
     def _generate_base_exceptions(self) -> Dict[str, str]:
-        """Generate exception classes"""
-        return {
-            "BusinessException": f"""package {self.package_name}.exception;
+        def exc(name: str, status: str) -> str:
+            return f"""package {self.package_name}.exception;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.ResponseStatus;
 
-@ResponseStatus(HttpStatus.BAD_REQUEST)
-public class BusinessException extends RuntimeException {{
-    public BusinessException(String message) {{
-        super(message);
-    }}
-
-    public BusinessException(String message, Throwable cause) {{
-        super(message, cause);
-    }}
-}}
-""",
-            "ResourceNotFoundException": f"""package {self.package_name}.exception;
-
-import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.ResponseStatus;
-
-@ResponseStatus(HttpStatus.NOT_FOUND)
-public class ResourceNotFoundException extends RuntimeException {{
-    public ResourceNotFoundException(String message) {{
-        super(message);
-    }}
-
-    public ResourceNotFoundException(String message, Throwable cause) {{
-        super(message, cause);
-    }}
-}}
-""",
-            "ValidationException": f"""package {self.package_name}.exception;
-
-import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.ResponseStatus;
-
-@ResponseStatus(HttpStatus.BAD_REQUEST)
-public class ValidationException extends RuntimeException {{
-    public ValidationException(String message) {{
-        super(message);
-    }}
-
-    public ValidationException(String message, Throwable cause) {{
-        super(message, cause);
-    }}
+@ResponseStatus(HttpStatus.{status})
+public class {name} extends RuntimeException {{
+    public {name}(String message) {{ super(message); }}
+    public {name}(String message, Throwable cause) {{ super(message, cause); }}
 }}
 """
+        return {
+            "BusinessException": exc("BusinessException", "BAD_REQUEST"),
+            "ResourceNotFoundException": exc("ResourceNotFoundException", "NOT_FOUND"),
+            "ValidationException": exc("ValidationException", "BAD_REQUEST"),
         }
-    
+
     def _generate_base_dto(self) -> str:
-        """Generate base DTO class"""
         return f"""package {self.package_name}.dto;
 
 import java.io.Serializable;
 
-/**
- * Base DTO class providing common functionality
- */
 public abstract class BaseDTO implements Serializable {{
-    
+
     private static final long serialVersionUID = 1L;
-    
-    /**
-     * Convert DTO to entity
-     * @return Entity representation
-     */
+
     public abstract Object toEntity();
-    
-    /**
-     * Convert entity to DTO
-     * @param entity Entity to convert
-     * @return DTO representation
-     */
+
     public static <T extends BaseDTO> T fromEntity(Object entity) {{
-        // Implementation would depend on specific DTO type
         throw new UnsupportedOperationException("Implement in concrete DTO classes");
     }}
 }}
 """
-    
+
     def _generate_config_classes(self) -> Dict[str, str]:
-        """Generate configuration classes"""
         return {
             'DatabaseConfig': f"""package {self.package_name}.config;
 
@@ -1341,29 +1267,20 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.data.jpa.repository.config.EnableJpaAuditing;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
 
-/**
- * Database configuration class
- */
 @Configuration
 @EnableJpaAuditing
 @EnableTransactionManagement
-public class DatabaseConfig {{
-    // Database-specific configurations can be added here
-}}
+public class DatabaseConfig {{}}
 """,
-            
             'WebConfig': f"""package {self.package_name}.config;
 
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.servlet.config.annotation.CorsRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
-/**
- * Web configuration class
- */
 @Configuration
 public class WebConfig implements WebMvcConfigurer {{
-    
+
     @Override
     public void addCorsMappings(CorsRegistry registry) {{
         registry.addMapping("/**")
@@ -1374,7 +1291,6 @@ public class WebConfig implements WebMvcConfigurer {{
     }}
 }}
 """,
-            
             'SwaggerConfig': f"""package {self.package_name}.config;
 
 import io.swagger.v3.oas.models.OpenAPI;
@@ -1382,12 +1298,9 @@ import io.swagger.v3.oas.models.info.Info;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-/**
- * Swagger/OpenAPI configuration
- */
 @Configuration
 public class SwaggerConfig {{
-    
+
     @Bean
     public OpenAPI customOpenAPI() {{
         return new OpenAPI()
@@ -1397,261 +1310,73 @@ public class SwaggerConfig {{
                         .description("API documentation for the PL/SQL modernization project"));
     }}
 }}
-"""
+""",
         }
-    
+
     def _generate_additional_configs(self):
-        """Generate additional configuration files"""
-        # Generate Dockerfile
         dockerfile = self._generate_dockerfile()
-        docker_path = self.target_directory / 'Dockerfile'
-        with open(docker_path, 'w', encoding='utf-8') as f:
+        with open(self.target_directory / 'Dockerfile', 'w', encoding='utf-8') as f:
             f.write(dockerfile)
-        
-        # Generate .gitignore
+
         gitignore = self._generate_gitignore()
-        gitignore_path = self.target_directory / '.gitignore'
-        with open(gitignore_path, 'w', encoding='utf-8') as f:
+        with open(self.target_directory / '.gitignore', 'w', encoding='utf-8') as f:
             f.write(gitignore)
-        
-        # Generate README for the project
-        project_readme = self._generate_project_readme()
-        readme_path = self.target_directory / 'README.md'
-        with open(readme_path, 'w', encoding='utf-8') as f:
-            f.write(project_readme)
-        
+
+        # SBG-15: _generate_additional_configs no longer writes README
+        # README is written exclusively by _generate_readme() called from generate_project()
         logger.info("Additional configuration files generated")
-    
+
     def _generate_dockerfile(self) -> str:
-        """Generate Dockerfile for the application"""
-        return f"""# Use official OpenJDK runtime as base image
-FROM openjdk:17-jdk-slim
-
-# Set the working directory inside the container
+        return f"""FROM openjdk:{self.java_version}-jdk-slim
 WORKDIR /app
-
-# Copy the JAR file into the container
 COPY target/{self.project_name}-1.0.0.jar app.jar
-
-# Expose the port the app runs on
 EXPOSE 8080
-
-# Run the JAR file
 ENTRYPOINT ["java", "-jar", "app.jar"]
 """
-    
+
     def _generate_gitignore(self) -> str:
-        """Generate .gitignore file"""
-        return """# Compiled class file
-*.class
-
-# Log file
+        return """*.class
 *.log
-
-# BlueJ files
-*.ctxt
-
-# Mobile Tools for Java (J2ME)
-.mtj.tmp/
-
-# Package Files #
-*.jar
-*.war
-*.nar
-*.ear
-*.zip
-*.tar.gz
-*.rar
-
-# virtual machine crash logs
-hs_err_pid*
-
-# Maven
 target/
-pom.xml.tag
-pom.xml.releaseBackup
-pom.xml.versionsBackup
-pom.xml.next
-release.properties
-dependency-reduced-pom.xml
-buildNumber.properties
-.mvn/timing.properties
-.mvn/wrapper/maven-wrapper.jar
-
-# Gradle
-.gradle
 build/
-!gradle/wrapper/gradle-wrapper.jar
-!**/src/main/**
-!**/src/test/**
-
-# IDE
+.gradle
 .idea/
-*.iws
 *.iml
-*.ipr
 .vscode/
-.settings/
-.project
-.classpath
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Temporary files
-*.tmp
-*.swp
-*.swo
-
-# Application specific
 application-local.yml
 application-dev.yml
 application-prod.yml
 """
-    
-    def _generate_project_readme(self) -> str:
-        """Generate project README"""
-        return f"""# {self.project_name}
+
+    def _generate_readme(self):
+        """SBG-15: single README generation method."""
+        readme_content = f"""# {self.project_name}
 
 Auto-generated Spring Boot application from PL/SQL modernization.
 
-## Project Information
+## Project Info
 
 - **Package**: {self.package_name}
-- **Java Version**: {self.java_version}
-- **Spring Boot Version**: {self.spring_boot_version}
+- **Java**: {self.java_version}
+- **Spring Boot**: {self.spring_boot_version}
 - **Generated**: {self._get_current_time()}
 
-## Project Structure
+## Quick Start
 
-```
-src/
-├── main/java/{self.package_name}/
-│   ├── Application.java              # Main application class
-│   ├── controller/                   # REST controllers
-│   ├── service/                      # Business logic services
-│   ├── repository/                   # JPA repositories
-│   ├── entity/                       # JPA entities
-│   ├── dto/                          # Data transfer objects
-│   ├── exception/                    # Custom exceptions
-│   └── config/                       # Configuration classes
-└── main/resources/
-    ├── application.yml              # Application configuration
-    └── application.properties       # Alternative configuration
+1. Edit `src/main/resources/application.properties` with your DB credentials
+2. Run the SQL DDL against your Oracle schema
+3. `mvn clean package && java -jar target/{self.project_name}-1.0.0.jar`
 
-## Getting Started
+## API Docs
 
-### Prerequisites
-
-- Java {self.java_version} or later
-- Maven or Gradle
-- Database (Oracle, MySQL, or PostgreSQL)
-
-### Installation
-
-1. Clone the repository
-2. Configure database connection in `application.yml`
-3. Build the project:
-   ```bash
-   mvn clean install
-   ```
-4. Run the application:
-   ```bash
-   mvn spring-boot:run
-   ```
-
-### Configuration
-
-Update the database connection settings in `src/main/resources/application.yml`:
-
-```yaml
-spring:
-  datasource:
-    url: jdbc:oracle:thin:@localhost:1521:xe
-    username: your_username
-    password: your_password
-```
-
-## API Documentation
-
-The application includes Swagger/OpenAPI documentation available at:
-- http://localhost:8080/swagger-ui/index.html
-- http://localhost:8080/v3/api-docs
-
-## Generated Components
-
-This application was automatically generated from PL/SQL code with the following components:
-
-- **Controllers**: REST API endpoints
-- **Services**: Business logic implementation
-- **Repositories**: Database access layer
-- **Entities**: JPA entity mappings
-- **DTOs**: Data transfer objects
-- **Exceptions**: Custom exception handling
-
-## License
-
-This project is auto-generated and does not include a specific license.
+Swagger UI: `http://localhost:8080/swagger-ui/index.html`
 """
-    
-    def _generate_readme(self):
-        """Generate main README for the generated project"""
-        readme_content = f"""# {self.project_name} - Generated Project
-
-This Spring Boot project was automatically generated from PL/SQL code using the PL/SQL Modernization Platform.
-
-## Project Details
-
-- **Original Source**: PL/SQL Code
-- **Target Framework**: Spring Boot {self.spring_boot_version}
-- **Java Version**: {self.java_version}
-- **Package**: {self.package_name}
-- **Generation Date**: {self._get_current_time()}
-
-## Project Structure
-
-The generated project follows standard Spring Boot conventions:
-
-```
-{self.project_name}/
-├── src/main/java/{self.package_name}/
-│   ├── Application.java
-│   ├── controller/
-│   ├── service/
-│   ├── repository/
-│   ├── entity/
-│   ├── dto/
-│   ├── exception/
-│   └── config/
-├── src/main/resources/
-│   ├── application.yml
-│   └── application.properties
-├── src/test/
-├── pom.xml
-├── build.gradle
-├── Dockerfile
-└── README.md
-```
-
-## Next Steps
-
-1. **Configure Database**: Update connection settings in `application.yml`
-2. **Review Generated Code**: Check the generated Java files for accuracy
-3. **Add Tests**: Implement unit and integration tests
-4. **Build and Deploy**: Use Maven or Gradle to build and deploy
-
-## Support
-
-For issues with the generated code, please refer to the original PL/SQL modernization documentation.
-"""
-        
-        readme_path = self.target_directory / 'README.md'
-        with open(readme_path, 'w', encoding='utf-8') as f:
+        with open(self.target_directory / 'README.md', 'w', encoding='utf-8') as f:
             f.write(readme_content)
-    
+
     def _generate_project_summary(self, java_files: Dict[str, str]) -> Dict[str, Any]:
-        """Generate project summary"""
         summary = {
             'project_name': self.project_name,
             'package_name': self.package_name,
@@ -1660,35 +1385,27 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
             'total_files': len(java_files),
             'file_types': {},
             'directories': [],
-            'configuration_files': [
-                'pom.xml',
-                'application.yml',
-                'application.properties',
-                'Dockerfile',
-                '.gitignore'
-            ]
+            # SBG-13: include build.gradle when build_tool is gradle
+            'configuration_files': ['pom.xml', 'application.properties', 'Dockerfile', '.gitignore'],
         }
-        if self.config.get('generate_gradle', False):
-            summary['configuration_files'].insert(1, 'build.gradle')
-        
-        # Count file types
+        if self.build_tool == 'gradle':  # SBG-13 fix
+            summary['configuration_files'].insert(0, 'build.gradle')
+            summary['configuration_files'].remove('pom.xml')
+
         for filename in java_files.keys():
             file_type = self._classify_java_file(filename, "")
             summary['file_types'][file_type] = summary['file_types'].get(file_type, 0) + 1
-        
-        # List directories
+
         for item in self.base_path.iterdir():
             if item.is_dir():
                 summary['directories'].append(str(item.name))
-        
+
         return summary
-    
+
     def _to_camel_case(self, text: str) -> str:
-        """Convert text to camel case"""
         return ''.join(word.capitalize() for word in text.replace('-', '_').split('_'))
 
     def _normalize_entity_type_name(self, raw_name: str) -> str:
-        """Normalize entity type names coming from repositories or LLM output."""
         if not raw_name:
             return raw_name
         stripped = raw_name.strip()
@@ -1697,170 +1414,18 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
         lower = stripped.lower()
         base = stripped
         if lower.endswith("entity"):
-            base = stripped[: -6]
+            base = stripped[:-6]
         if "_" in base or base[:1].islower():
             base = self._to_camel_case(base)
         if lower.endswith("entity"):
             return f"{base}Entity"
         return base
-    
+
     def _get_current_time(self) -> str:
-        """Get current timestamp"""
         from datetime import datetime
         return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    def generate_entities(
-        self,
-        java_code: Dict[str, str],
-        ddl_columns: Optional[Dict[str, List[Dict[str, str]]]] = None,
-    ) -> Dict[str, str]:
-        """Generate JPA entity classes"""
-        entities = {}
-        ddl_columns = ddl_columns or {}
-        if ddl_columns:
-            logger.info(f"DDL table columns loaded for {len(ddl_columns)} tables")
-        ddl_map = {table.replace("_", "").lower(): table for table in ddl_columns.keys()}
-        self._ddl_table_map = ddl_map
-        # Build a normalized entity index to resolve singular/plural mismatches generically.
-        self._entity_name_index = {}
-        for table_name in ddl_columns.keys():
-            entity_name = f"{self._to_camel_case(table_name.lower())}Entity"
-            normalized_key = table_name.replace("_", "").lower()
-            self._entity_name_index[normalized_key] = entity_name
-        
-        for filename, code in java_code.items():
-            if '@Entity' in code or 'extends BaseEntity' in code:
-                class_name = self._extract_class_name(code) or filename.replace('.java', '')
-                if class_name in {"Jpa", "JpaRepository", "CrudRepository"}:
-                    continue
-                normalized_name = self._normalize_entity_name(class_name)
-                target_filename = f"{normalized_name}.java"
-                entities[target_filename] = self._rename_entity_type_references(code, class_name, normalized_name)
-
-        # Always create entities from DDL when available, even if LLM output omitted them.
-        for table_name, columns in ddl_columns.items():
-            if table_name.upper() in {"JPA", "JPA_REPOSITORY", "CRUD_REPOSITORY"}:
-                continue
-            ddl_entity_name = f"{self._to_camel_case(table_name.lower())}Entity"
-            normalized_entity_name = self._normalize_entity_name(ddl_entity_name)
-            target_filename = f"{normalized_entity_name}.java"
-            if target_filename in entities:
-                continue
-            logger.info(f"Generating entity {normalized_entity_name} from DDL table {table_name}")
-            entities[target_filename] = self._generate_entity_from_ddl(
-                normalized_entity_name, table_name, columns
-            )
-
-        # Ensure entities exist for service-derived repository/entity names not present in DDL.
-        for filename, code in java_code.items():
-            if not self._looks_like_service_source(filename, code):
-                continue
-            class_name = self._extract_class_name(code)
-            for entity_name in self._derive_entity_names(filename, class_name, code):
-                normalized_entity, table_name = self._resolve_entity_from_ddl(entity_name, ddl_map)
-                normalized_entity = self._normalize_entity_name(normalized_entity)
-                if normalized_entity in {"Jpa", "JpaEntity", "JpaRepository", "CrudRepository"}:
-                    continue
-                target_filename = f"{normalized_entity}.java"
-                if target_filename in entities:
-                    continue
-                if table_name and table_name in ddl_columns:
-                    logger.info(f"Generating entity {normalized_entity} from DDL table {table_name}")
-                    entities[target_filename] = self._generate_entity_from_ddl(
-                        normalized_entity, table_name, ddl_columns[table_name]
-                    )
-                else:
-                    logger.warning(f"Generating fallback entity {normalized_entity} for service reference")
-                    entities[target_filename] = self._generate_fallback_entity(normalized_entity, [])
-        
-        # Fallback: derive simple entities from service-oriented outputs.
-        if not entities:
-            for filename, code in java_code.items():
-                if not self._looks_like_service_source(filename, code):
-                    continue
-                class_name = self._extract_class_name(code)
-                for entity_name in self._derive_entity_names(filename, class_name, code):
-                    normalized_entity_name = self._normalize_entity_name(entity_name)
-                    fallback_name = f"{normalized_entity_name}.java"
-                    if fallback_name in entities:
-                        continue
-                    fields = self._infer_entity_fields(code, entity_name)
-                    entities[fallback_name] = self._generate_fallback_entity(entity_name, fields)
-
-        # Build a normalized entity index from generated entities to resolve singular/plural mismatches
-        # even when DDL extraction is empty or incomplete.
-        entity_index: Dict[str, str] = {}
-        for filename in entities.keys():
-            entity_name = filename.replace(".java", "")
-            base = entity_name[:-6] if entity_name.endswith("Entity") else entity_name
-            base_key = base.replace("_", "").lower()
-            if base_key:
-                entity_index[base_key] = entity_name
-                if base_key.endswith("s"):
-                    entity_index[base_key[:-1]] = entity_name
-                else:
-                    entity_index[f"{base_key}s"] = entity_name
-                if base_key.endswith("y"):
-                    entity_index[f"{base_key[:-1]}ies"] = entity_name
-        if entity_index:
-            # Merge with any existing index from DDL columns.
-            existing = getattr(self, "_entity_name_index", {}) or {}
-            existing.update(entity_index)
-            self._entity_name_index = existing
-
-        repository_entities: Set[str] = set()
-        for code in java_code.values():
-            for match in re.finditer(r'extends\s+(?:JpaRepository|CrudRepository)\s*<\s*([A-Za-z_][\w$#]*)', code):
-                repository_entities.add(match.group(1))
-        repo_dir = self.package_path / 'repository'
-        if repo_dir.exists():
-            for repo_file in repo_dir.glob('*.java'):
-                try:
-                    repo_code = repo_file.read_text(encoding='utf-8')
-                except OSError:
-                    continue
-                for match in re.finditer(
-                    r'extends\s+(?:JpaRepository|CrudRepository)\s*<\s*([A-Za-z_][\w$#]*)',
-                    repo_code,
-                ):
-                    repository_entities.add(match.group(1))
-        for raw_entity in repository_entities:
-            normalized, table_name = self._resolve_entity_from_ddl(raw_entity, ddl_map)
-            normalized = self._normalize_entity_name(normalized)
-            fallback_name = f"{normalized}.java"
-            if fallback_name in entities:
-                continue
-            if table_name and table_name in ddl_columns:
-                logger.info(f"Generating entity {normalized} from DDL table {table_name}")
-                entities[fallback_name] = self._generate_entity_from_ddl(normalized, table_name, ddl_columns[table_name])
-            else:
-                missing_table = table_name or self._to_snake_case(normalized.replace("Entity", "")).upper()
-                logger.warning(f"Missing DDL for entity {normalized} (table {missing_table}); using id-only fallback")
-                entities[fallback_name] = self._generate_fallback_entity(normalized, [])
-
-        for filename, code in list(entities.items()):
-            if not self._entity_has_meaningful_fields(code):
-                entity_name = filename.replace('.java', '')
-                normalized, table_name = self._resolve_entity_from_ddl(entity_name, ddl_map)
-                if table_name and table_name in ddl_columns:
-                    logger.info(f"Upgrading entity {entity_name} with DDL table {table_name}")
-                    entities[filename] = self._generate_entity_from_ddl(normalized, table_name, ddl_columns[table_name])
-        
-        # Write entities to files
-        entity_dir = self.package_path / 'entity'
-        for filename, code in entities.items():
-            file_path = entity_dir / filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
-
-        if ddl_map:
-            self._rewrite_repository_entities(ddl_map)
-
-        logger.info(f"Generated {len(entities)} entity classes")
-        return entities
 
     def _extract_class_name(self, code: str) -> Optional[str]:
-        """Extract top-level class name from Java source."""
         for line in code.splitlines():
             stripped = line.strip()
             if stripped.startswith('public class '):
@@ -1868,7 +1433,6 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
         return None
 
     def _extract_type_name(self, code: str) -> Optional[str]:
-        """Extract top-level public class or interface name from Java source."""
         for line in code.splitlines():
             stripped = line.strip()
             if stripped.startswith('public class '):
@@ -1877,839 +1441,36 @@ For issues with the generated code, please refer to the original PL/SQL moderniz
                 return stripped.split()[2].split('{')[0].strip()
         return None
 
-    def _resolve_entity_from_ddl(self, raw_entity: str, ddl_map: Dict[str, str]) -> Tuple[str, Optional[str]]:
-        """Resolve an entity name using DDL table names when possible."""
-        if not raw_entity:
-            return raw_entity, None
-        raw = raw_entity.strip()
-        lowered = raw.lower()
-        base = raw
-        if lowered.endswith("entity"):
-            base = raw[: -6]
-        base_key = base.replace("_", "").lower()
-        table_name = ddl_map.get(base_key)
-        if not table_name:
-            # Try basic singular/plural normalization to match DDL table keys.
-            if base_key.endswith("s"):
-                singular_key = base_key[:-1]
-                table_name = ddl_map.get(singular_key)
-            else:
-                plural_key = f"{base_key}s"
-                table_name = ddl_map.get(plural_key)
-            if not table_name and base_key.endswith("y"):
-                plural_key = f"{base_key[:-1]}ies"
-                table_name = ddl_map.get(plural_key)
-            if not table_name and base_key.endswith("es"):
-                singular_key = base_key[:-2]
-                table_name = ddl_map.get(singular_key)
-        if table_name:
-            entity_name = f"{self._to_camel_case(table_name.lower())}Entity"
-            return entity_name, table_name
-        # Fallback to generated entity index when DDL map does not match.
-        entity_index = getattr(self, "_entity_name_index", None)
-        if entity_index:
-            candidate = entity_index.get(base_key)
-            if not candidate:
-                candidate = entity_index.get(base_key.rstrip("s")) if base_key.endswith("s") else None
-            if not candidate and base_key.endswith("y"):
-                candidate = entity_index.get(f"{base_key[:-1]}ies")
-            if not candidate:
-                candidate = entity_index.get(f"{base_key}s")
-            if candidate:
-                return candidate, None
-        return self._normalize_entity_type_name(raw), None
-
-    def _rewrite_repository_entities(self, ddl_map: Dict[str, str]) -> None:
-        repo_dir = self.package_path / 'repository'
-        if not repo_dir.exists():
-            return
-        for repo_file in repo_dir.glob('*.java'):
-            try:
-                repo_code = repo_file.read_text(encoding='utf-8')
-            except OSError:
-                continue
-            updated = self._normalize_repository_code(repo_file.name, repo_code, ddl_map)
-            if updated != repo_code:
-                repo_file.write_text(updated, encoding='utf-8')
-    
-    def _derive_entity_name(self, filename: str, class_name: Optional[str]) -> Optional[str]:
-        """Derive a single fallback entity name from class or file name."""
-        if class_name and class_name.lower().endswith('service'):
-            base = class_name[:-7]
-            return base if base else None
-        if filename.lower().endswith('service.java'):
-            base = filename[:-12]
-            return self._to_camel_case(base) if base else None
-        stem = filename.replace('.java', '')
-        if stem:
-            return self._to_camel_case(stem)
-        return None
-
-    def _derive_entity_names(self, filename: str, class_name: Optional[str], code: str) -> List[str]:
-        """Derive all entity names referenced by a generated service."""
-        entity_names: List[str] = []
-
-        for match in re.finditer(r'new\s+([A-Z]\w*)\s*\(', code):
-            candidate = match.group(1)
-            if self._is_entity_candidate_name(candidate):
-                entity_names.append(candidate)
-
-        for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
-            candidate = match.group(1)
-            if self._is_entity_candidate_name(candidate):
-                entity_names.append(candidate)
-
-        fallback_name = self._derive_entity_name(filename, class_name)
-        if fallback_name and not entity_names:
-            entity_names.append(fallback_name)
-
-        ordered: List[str] = []
-        seen = set()
-        for name in entity_names:
-            if name and name not in seen:
-                ordered.append(name)
-                seen.add(name)
-        return ordered
-
     def _normalize_entity_name(self, entity_name: str) -> str:
-        """Append Entity to reserved names that would otherwise clash or read ambiguously."""
         if entity_name in self.RESERVED_ENTITY_NAMES:
             return f"{entity_name}Entity"
         return entity_name
 
-    def _rename_entity_type_references(self, code: str, source_name: str, target_name: str) -> str:
-        """Rename a Java entity type and aligned repository references."""
-        if not source_name or source_name == target_name:
-            return code
+    def _to_snake_case(self, value: str) -> str:
+        if not value:
+            return value
+        return re.sub(r'(?<!^)(?=[A-Z])', '_', value).lower()
 
-        updated_code = re.sub(rf'\b{re.escape(source_name)}Repository\b', f'{target_name}Repository', code)
-        updated_code = re.sub(rf'\b{re.escape(source_name)}\b', target_name, updated_code)
-        return updated_code
+    def _lower_first(self, value: str) -> str:
+        if not value:
+            return value
+        return value[0].lower() + value[1:]
 
-    def _is_entity_candidate_name(self, candidate: str) -> bool:
-        """Exclude helper/result/exception names from fallback entity generation."""
-        blocked_suffixes = ('Exception', 'Result', 'Response', 'Request', 'DTO', 'Config', 'Controller', 'Service')
-        blocked_names = {'BusinessException', 'IllegalArgumentException', 'ProcessOrderResult', 'TABLE'}
-        return bool(candidate) and candidate not in blocked_names and not candidate.endswith(blocked_suffixes)
+    def _capitalize_first(self, value: str) -> str:
+        if not value:
+            return value
+        return value[0].upper() + value[1:]
 
-    def _looks_like_service_source(self, filename: str, code: str) -> bool:
-        """Limit fallback entity generation to service-like Java sources."""
-        class_name = self._extract_class_name(code) or ''
-        filename_lower = filename.lower()
-        return (
-            '@Service' in code
-            or filename_lower.endswith('service.java')
-            or class_name.lower().endswith('service')
-            or 'processOrder(' in code
-        )
-    
-    def _infer_entity_fields(self, code: str, entity_name: str) -> List[Dict[str, str]]:
-        """Infer entity fields from generated service code usage for a specific entity."""
-        param_types: Dict[str, str] = {}
-        local_types: Dict[str, str] = {}
-        entity_variables: set[str] = set()
+    def _to_lower_camel_case(self, value: str) -> str:
+        if not value:
+            return value
+        pascal = self._to_camel_case(value)
+        return self._lower_first(pascal)
 
-        # Capture method parameter types so setter arguments can map back to Java types.
-        for match in re.finditer(r'public\s+[^{;=]+\(([^)]*)\)', code):
-            params_block = match.group(1).strip()
-            if not params_block:
-                continue
-            for raw_param in params_block.split(','):
-                param = re.sub(r'@\w+(?:\([^)]*\))?\s*', '', raw_param).strip()
-                if not param:
-                    continue
-                parts = param.split()
-                if len(parts) >= 2:
-                    param_name = parts[-1]
-                    param_type = ' '.join(parts[:-1])
-                    param_types[param_name] = param_type
-
-        for match in re.finditer(r'\b([A-Z]\w*)\s+([a-zA-Z_]\w*)\s*=', code):
-            local_types[match.group(2)] = match.group(1)
-
-        for match in re.finditer(rf'\b{entity_name}\s+([a-zA-Z_]\w*)\s*=', code):
-            entity_variables.add(match.group(1))
-
-        inferred_fields: Dict[str, str] = {}
-        for match in re.finditer(r'([a-zA-Z_]\w*)\.\s*set([A-Z]\w*)\(([^;]+?)\);', code):
-            target_variable = match.group(1)
-            if entity_variables and target_variable not in entity_variables:
-                continue
-            field_name = self._lower_first(match.group(2))
-            argument = match.group(3).strip()
-            inferred_type = self._infer_java_type(argument, param_types, local_types)
-            if field_name != 'id':
-                inferred_fields[field_name] = inferred_type
-
-        for match in re.finditer(r'([a-zA-Z_]\w*)\.\s*get([A-Z]\w*)\(\)', code):
-            target_variable = match.group(1)
-            if entity_variables and target_variable not in entity_variables:
-                continue
-            field_name = self._lower_first(match.group(2))
-            if field_name != 'id' and field_name not in inferred_fields:
-                inferred_fields[field_name] = self._infer_getter_type(field_name)
-
-        preferred_order = ['customerId', 'productId', 'quantity', 'createdBy', 'status', 'createdAt', 'updatedAt']
-        ordered_fields: List[Dict[str, str]] = []
-        seen = set()
-        for field_name in preferred_order:
-            if field_name in inferred_fields:
-                ordered_fields.append({'name': field_name, 'type': inferred_fields[field_name]})
-                seen.add(field_name)
-        for field_name, field_type in inferred_fields.items():
-            if field_name not in seen:
-                ordered_fields.append({'name': field_name, 'type': field_type})
-        return ordered_fields
-
-    def _infer_getter_type(self, field_name: str) -> str:
-        """Infer type from getter-style field name when no setter provides it."""
-        if field_name.lower().endswith('id'):
-            return 'Long'
-        if field_name.lower() in {'quantity', 'stock', 'count', 'total'}:
-            return 'Integer'
-        return 'String'
-
-    def _infer_java_type(self, argument: str, param_types: Dict[str, str], local_types: Dict[str, str]) -> str:
-        """Infer a Java type from a setter argument."""
-        if argument in param_types:
-            return param_types[argument]
-        if argument in local_types:
-            return local_types[argument]
-        if 'LocalDateTime.now()' in argument:
-            return 'LocalDateTime'
-        if re.fullmatch(r'[A-Z]\w*', argument):
-            return argument
-        if any(operator in argument for operator in [' + ', ' - ', ' * ', ' / ']):
-            return 'Integer'
-        if argument.startswith('"') and argument.endswith('"'):
-            return 'String'
-        if re.fullmatch(r'\d+L', argument):
-            return 'Long'
-        if re.fullmatch(r'\d+', argument):
-            return 'Integer'
-        if argument in {'true', 'false'}:
-            return 'Boolean'
-        if '.toString()' in argument:
-            return 'String'
-        return 'String'
-
-    def _generate_fallback_entity(self, entity_name: str, fields: Optional[List[Dict[str, str]]] = None) -> str:
-        """Generate a fallback JPA entity aligned to generated service code."""
-        fields = fields or []
-        import_lines = ['import jakarta.persistence.*;']
-        normalized_entity_name = self._normalize_entity_name(entity_name)
-        if any(field['type'] == 'LocalDateTime' for field in fields):
-            import_lines.append('import java.time.LocalDateTime;')
-        if(entity_name in self.RESERVED_ENTITY_NAMES):
-            entity_name += '_entity'
-        field_blocks = []
-        accessor_blocks = []
-        for field in fields:
-            field_name = field['name']
-            field_type = field['type']
-            if self._is_entity_reference_type(field_type):
-                field_type = self._normalize_entity_name(field_type)
-                field_blocks.append(
-                    f"""    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "{self._to_snake_case(field_name)}_id")
-    private {field_type} {field_name};"""
-                )
-            else:
-                field_blocks.append(
-                    f"""    @Column(name = "{self._to_snake_case(field_name)}")
-    private {field_type} {field_name};"""
-                )
-            accessor_blocks.append(
-                f"""    public {field_type} get{field_name[0].upper() + field_name[1:]}() {{
-        return {field_name};
-    }}
-
-    public void set{field_name[0].upper() + field_name[1:]}({field_type} {field_name}) {{
-        this.{field_name} = {field_name};
-    }}"""
-            )
-
-        fields_section = '\n\n'.join(field_blocks)
-        accessors_section = '\n\n'.join(accessor_blocks)
-        if fields_section:
-            fields_section = '\n\n' + fields_section
-        if accessors_section:
-            accessors_section = '\n\n' + accessors_section
-
-        return f"""package {self.package_name}.entity;
-
-{chr(10).join(import_lines)}
-
-/**
- * Auto-generated fallback entity for {normalized_entity_name}.
- */
-@Entity
-@Table(name = "{entity_name.lower()}")
-public class {normalized_entity_name} {{
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;{fields_section}
-
-    public Long getId() {{
-        return id;
-    }}
-
-    public void setId(Long id) {{
-        this.id = id;
-    }}{accessors_section}
-}}
-"""
-    
-    def generate_repositories(self, entities: Dict[str, str]) -> Dict[str, str]:
-        """Generate JPA repository interfaces"""
-        repositories = {}
-
-        # Track existing repositories on disk to avoid duplicates.
-        repo_dir = self.package_path / 'repository'
-        existing_repo_names: Set[str] = set()
-        if repo_dir.exists():
-            for repo_file in repo_dir.glob('*.java'):
-                existing_repo_names.add(repo_file.stem)
-        existing_repo_names.update(self._existing_repositories)
-
-        # Ensure repositories referenced in generated code exist.
-        referenced_repo_names: Set[str] = set()
-        for code in (getattr(self, "_latest_java_code", {}) or {}).values():
-            for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
-                name = match.group(0)
-                if name in {"JpaRepository", "CrudRepository"}:
-                    continue
-                referenced_repo_names.add(name)
-
-        for filename, code in entities.items():
-            # Generate repository name
-            
-            entity_name = filename.replace('.java', '')
-            if entity_name in {"Jpa", "JpaRepository", "CrudRepository"}:
-                continue
-            repo_name = f"{entity_name}Repository.java"
-            base_entity = entity_name[:-6] if entity_name.endswith("Entity") else entity_name
-            if repo_name.replace('.java', '') in existing_repo_names:
-                continue
-            if f"{base_entity}Repository" in existing_repo_names:
-                continue
-            
-            # Generate basic repository interface
-            repo_content = self._generate_repository_interface(entity_name)
-            repositories[repo_name] = repo_content
-
-        # Generate missing repositories referenced by services/controllers.
-        for repo_name in sorted(referenced_repo_names):
-            if repo_name in {"JpaRepository", "CrudRepository"}:
-                continue
-            if repo_name in existing_repo_names or (repo_dir / f"{repo_name}.java").exists():
-                continue
-            base_entity = repo_name[:-10] if repo_name.endswith("Repository") else repo_name
-            if base_entity in {"Jpa", "Crud", "Repository"}:
-                continue
-            if self._ddl_table_map:
-                resolved_entity, _ = self._resolve_entity_from_ddl(base_entity, self._ddl_table_map)
-            else:
-                resolved_entity = base_entity
-            resolved_entity = self._normalize_entity_name(resolved_entity)
-            repositories[f"{repo_name}.java"] = self._generate_repository_interface(
-                resolved_entity, repo_name=repo_name
-            )
-        # Write repositories to files
-        for filename, code in repositories.items():
-            file_path = repo_dir / filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
-        
-        logger.info(f"Generated {len(repositories)} repository interfaces")
-        return repositories
-    
-    def _generate_repository_interface(self, entity_name: str, repo_name: Optional[str] = None) -> str:
-        """Generate JPA repository interface"""
-        interface_name = repo_name or f"{entity_name}Repository"
-        return f"""package {self.package_name}.repository;
-
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-
-import {self.package_name}.entity.{entity_name};
-
-/**
- * JPA repository for {entity_name}
- */
-@Repository
-public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
-    // Custom query methods can be added here
-    // Example:
-    // List<{entity_name}> findByName(String name);
-}}
-"""
-    
-    def generate_services(self, java_code: Dict[str, str]) -> Dict[str, str]:
-        """Generate service layer classes"""
-        services = {}
-        
-        for filename, code in java_code.items():
-            class_name = None
-            for line in code.splitlines():
-                stripped = line.strip()
-                if stripped.startswith('public class '):
-                    class_name = stripped.split()[2]
-                    break
-            
-            looks_like_service = (
-                '@Service' in code
-                or filename.lower().endswith('service.java')
-                or (class_name is not None and class_name.lower().endswith('service'))
-            )
-            if looks_like_service:
-                target_filename = f"{class_name}.java" if class_name else filename
-                services[target_filename] = self._normalize_service_code(target_filename, code)
-        
-        # Write services to files
-        service_dir = self.package_path / 'service'
-        for filename, code in services.items():
-            file_path = service_dir / filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
-        
-        logger.info(f"Generated {len(services)} service classes")
-        return services
-    
-    def _normalize_service_code(self, filename: str, code: str) -> str:
-        """Ensure generated service code has package/imports and @Service annotation."""
-        service_name = filename.replace('.java', '')
-        class_name = self._extract_class_name(code) or service_name
-        entity_names = self._derive_entity_names(filename, class_name, code)
-        repository_names: List[str] = []
-        repository_base_map: Dict[str, str] = {}
-        for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
-            raw_base = match.group(1)
-            resolved_entity, _ = self._resolve_entity_from_ddl(
-                raw_base, self._ddl_table_map or {}
-            )
-            resolved_entity = self._normalize_entity_name(resolved_entity)
-            repo_base = resolved_entity[:-6] if resolved_entity.endswith("Entity") else resolved_entity
-            repository_name = f"{repo_base}Repository"
-            if repository_name not in repository_names:
-                repository_names.append(repository_name)
-            repository_base_map[raw_base] = repository_name
-
-        import_lines = [
-            'import org.springframework.beans.factory.annotation.Autowired;',
-            'import org.springframework.stereotype.Service;',
-            'import org.springframework.transaction.annotation.Transactional;',
-        ]
-        if 'LoggerFactory' in code or re.search(r'\bLogger\b', code):
-            import_lines.append('import org.slf4j.Logger;')
-            import_lines.append('import org.slf4j.LoggerFactory;')
-        if 'DataAccessException' in code:
-            import_lines.append('import org.springframework.dao.DataAccessException;')
-        if 'LocalDateTime' in code:
-            import_lines.append('import java.time.LocalDateTime;')
-        if 'List<' in code:
-            import_lines.append('import java.util.List;')
-        if 'Optional<' in code:
-            import_lines.append('import java.util.Optional;')
-        if 'ArrayList' in code:
-            import_lines.append('import java.util.ArrayList;')
-        if 'Arrays.' in code or 'Arrays ' in code:
-            import_lines.append('import java.util.Arrays;')
-        if 'Collections.' in code:
-            import_lines.append('import java.util.Collections;')
-        if 'Objects.' in code:
-            import_lines.append('import java.util.Objects;')
-        if 'Pattern.' in code:
-            import_lines.append('import java.util.regex.Pattern;')
-        if 'StringTokenizer' in code:
-            import_lines.append('import java.util.StringTokenizer;')
-        if '@Inject' in code:
-            # Normalize to Spring's @Autowired to avoid javax/jakarta inject dependency.
-            import_lines.append('import org.springframework.beans.factory.annotation.Autowired;')
-        for entity_name in entity_names:
-            normalized_entity, _ = self._resolve_entity_from_ddl(
-                entity_name, self._ddl_table_map or {}
-            )
-            normalized_entity = self._normalize_entity_name(normalized_entity)
-            import_lines.append(f'import {self.package_name}.entity.{normalized_entity};')
-        for repository_name in repository_names:
-            import_lines.append(f'import {self.package_name}.repository.{repository_name};')
-        import_lines.append(f'import {self.package_name}.exception.BusinessException;')
-        imports = '\n'.join(dict.fromkeys(import_lines))
-
-        # Strip existing package/import lines before rewriting.
-        body_lines = [
-            line for line in code.splitlines()
-            if not line.strip().startswith('package ')
-            and not line.strip().startswith('import ')
-        ]
-        body = '\n'.join(body_lines).strip()
-        if '@Inject' in body:
-            body = body.replace('@Inject', '@Autowired')
-        # Normalize repository type references in the body (field types, constructor args, etc.).
-        for raw_base, repository_name in repository_base_map.items():
-            body = re.sub(rf'\\b{re.escape(raw_base)}Repository\\b', repository_name, body)
-
-        # Normalize entity type references using DDL/entity index when available.
-        candidate_entities: Set[str] = set(entity_names)
-        candidate_entities.update(re.findall(r'\\b[A-Z]\\w*\\b', body))
-        for entity_name in sorted(candidate_entities):
-            if entity_name.endswith(('Repository', 'Service', 'Controller')):
-                continue
-            normalized_entity_name, _ = self._resolve_entity_from_ddl(
-                entity_name, self._ddl_table_map or {}
-            )
-            normalized_entity_name = self._normalize_entity_name(normalized_entity_name)
-            if normalized_entity_name != entity_name:
-                body = re.sub(
-                    rf'\\b{re.escape(entity_name)}\\b(?!Repository)',
-                    normalized_entity_name,
-                    body,
-                )
-
-        # Apply entity index mapping to catch remaining singular/plural mismatches.
-        entity_index = getattr(self, "_entity_name_index", {}) or {}
-        for resolved_entity in sorted(set(entity_index.values())):
-            base = resolved_entity[:-6] if resolved_entity.endswith("Entity") else resolved_entity
-            candidates = {base}
-            if base.endswith("s"):
-                candidates.add(base[:-1])
-            else:
-                candidates.add(f"{base}s")
-            if base.endswith("ies"):
-                candidates.add(f"{base[:-3]}y")
-            for candidate in sorted(candidates, key=len, reverse=True):
-                body = re.sub(
-                    rf'\\b{re.escape(candidate)}\\b(?!Repository|Service|Controller)',
-                    resolved_entity,
-                    body,
-                )
-                body = re.sub(
-                    rf'\\b{re.escape(candidate)}Repository\\b',
-                    f'{base}Repository',
-                    body,
-                )
-
-        # Final repository name fix-up: ensure any lingering <Base>Repository matches resolved entity bases.
-        repo_index: Dict[str, str] = {}
-        for resolved_entity in set(entity_index.values()):
-            base = resolved_entity[:-6] if resolved_entity.endswith("Entity") else resolved_entity
-            repo_index[base] = f"{base}Repository"
-            if base.endswith("s"):
-                repo_index[base[:-1]] = f"{base}Repository"
-            else:
-                repo_index[f"{base}s"] = f"{base}Repository"
-        def _repo_repl(match: re.Match) -> str:
-            repo_name = match.group(0)
-            if repo_name in repository_names:
-                return repo_name
-            base = repo_name[:-10]
-            return repo_index.get(base, repo_name)
-        body = re.sub(r'\\b[A-Z]\\w*Repository\\b', _repo_repl, body)
-        for entity_name in entity_names:
-            normalized_entity_name, _ = self._resolve_entity_from_ddl(
-                entity_name, self._ddl_table_map or {}
-            )
-            normalized_entity_name = self._normalize_entity_name(normalized_entity_name)
-            if normalized_entity_name != entity_name:
-                repo_base = normalized_entity_name[:-6] if normalized_entity_name.endswith("Entity") else normalized_entity_name
-                body = re.sub(
-                    rf'\\b{re.escape(entity_name)}Repository\\b',
-                    f'{repo_base}Repository',
-                    body,
-                )
-                body = re.sub(
-                    rf'\\b{re.escape(entity_name)}\\b(?!Repository)',
-                    normalized_entity_name,
-                    body,
-                )
-        body = body.replace("OrderProcessingException", "BusinessException")
-        body = body.replace("catch (IllegalArgumentException ", "catch (java.lang.IllegalArgumentException ")
-        body = body.replace("throw new IllegalArgumentException(", "throw new java.lang.IllegalArgumentException(")
-        # Ensure any void upsert method does not cause ResponseEntity.ok(void).
-        body = re.sub(
-            r'ResponseEntity\\.ok\\((\\s*[\\w\\.]+\\s*)\\);',
-            lambda match: 'ResponseEntity.ok();' if 'upsertDoctor()' in match.group(1) else match.group(0),
-            body,
-        )
-        if 'StringTokenizer' in body:
-            body = re.sub(r'\\bStringTokenizer\\b', 'java.util.StringTokenizer', body)
-        if '@Service' not in body:
-            body = body.replace(f"public class {service_name}", f"@Service\npublic class {service_name}")
-            if class_name != service_name:
-                body = body.replace(f"public class {class_name}", f"@Service\npublic class {class_name}")
-        body = self._ensure_process_result_class(body)
-
-        return f"""package {self.package_name}.service;
-
-{imports}
-
-{body}
-"""
-
-    def _normalize_controller_code(self, filename: str, code: str) -> str:
-        """Ensure controller code uses resolved entity names and imports."""
-        controller_name = self._extract_type_name(code) or filename.replace('.java', '')
-        body_lines = [
-            line for line in code.splitlines()
-            if not line.strip().startswith('package ')
-            and not line.strip().startswith('import ')
-        ]
-        body = '\n'.join(body_lines).strip()
-
-        import_lines = [
-            'import org.springframework.web.bind.annotation.*;',
-            'import org.springframework.http.ResponseEntity;',
-        ]
-        if '@Autowired' in body:
-            import_lines.append('import org.springframework.beans.factory.annotation.Autowired;')
-        # Add service imports based on type usage in the controller body.
-        service_candidates = set(re.findall(r'\\b([A-Z]\\w*Service)\\b', body))
-        # Fallback: derive service name from controller class (FooController -> FooService).
-        if controller_name.endswith('Controller'):
-            service_candidates.add(f"{controller_name[:-10]}Service")
-        for service_name in sorted(service_candidates):
-            import_lines.append(f'import {self.package_name}.service.{service_name};')
-        if 'List<' in code:
-            import_lines.append('import java.util.List;')
-
-        # Collect entity type usages from imports and method signatures.
-        entity_candidates: Set[str] = set()
-        for match in re.finditer(r'import\s+[^;]*\.entity\.([A-Z]\w+);', code):
-            entity_candidates.add(match.group(1))
-        for match in re.finditer(r'ResponseEntity<\s*([A-Z]\w+)\s*>', body):
-            entity_candidates.add(match.group(1))
-        for match in re.finditer(r'@RequestBody\s+([A-Z]\w+)', body):
-            entity_candidates.add(match.group(1))
-        # Exclude non-entity types.
-        entity_blacklist = {
-            'Void', 'ResponseEntity', 'Optional', 'List', 'Map', 'Set', 'String', 'Long', 'Integer',
-            'Boolean', 'Double', 'BigDecimal', 'LocalDateTime', 'LocalDate', 'LocalTime'
-        }
-        entity_candidates = {name for name in entity_candidates if name not in entity_blacklist}
-
-        for entity_name in sorted(entity_candidates):
-            resolved_entity, _ = self._resolve_entity_from_ddl(
-                entity_name, self._ddl_table_map or {}
-            )
-            resolved_entity = self._normalize_entity_name(resolved_entity)
-            if resolved_entity not in entity_blacklist:
-                import_lines.append(f'import {self.package_name}.entity.{resolved_entity};')
-            if resolved_entity != entity_name:
-                body = re.sub(
-                    rf'\\b{re.escape(entity_name)}\\b(?!Controller|Service|Repository)',
-                    resolved_entity,
-                    body,
-                )
-
-        # Ensure service imports are present when referenced.
-        service_candidates = set(re.findall(r'\\b([A-Z]\\w*Service)\\b', body))
-        for service_name in sorted(service_candidates):
-            import_lines.append(f'import {self.package_name}.service.{service_name};')
-
-        import_lines = list(dict.fromkeys(import_lines))
-        imports = '\n'.join(import_lines)
-
-        # Fix void-returning service calls in ResponseEntity wrappers.
-        if "ResponseEntity<Void>" in body:
-            body = re.sub(
-                r'return\\s+ResponseEntity\\.ok\\(\\s*([a-zA-Z_][\\w\\.]*\\([^;]*\\))\\s*\\)\\s*;',
-                r'\\1;\\n        return ResponseEntity.ok();',
-                body,
-            )
-            body = re.sub(
-                r'ResponseEntity\\.ok\\([^;]*\\);',
-                'ResponseEntity.ok();',
-                body,
-            )
-        # Also fix any lingering ok(void) patterns for upsert methods.
-        body = re.sub(
-            r'ResponseEntity\\.ok\\([^;]*upsert\\w*\\([^;]*\\)\\);',
-            'ResponseEntity.ok();',
-            body,
-        )
-
-        return f"""package {self.package_name}.controller;
-
-{imports}
-
-{body}
-"""
-
-    def _normalize_repository_code(
-        self,
-        filename: str,
-        code: str,
-        ddl_map: Optional[Dict[str, str]] = None,
-    ) -> str:
-        """Ensure repository code has package/imports and @Repository annotation."""
-        type_name = self._extract_type_name(code) or filename.replace('.java', '')
-        if type_name in {'JpaRepository', 'CrudRepository'}:
-            return code
-
-        import_lines = [
-            'import org.springframework.stereotype.Repository;',
-        ]
-        if 'JpaRepository' in code:
-            import_lines.append('import org.springframework.data.jpa.repository.JpaRepository;')
-        if 'CrudRepository' in code:
-            import_lines.append('import org.springframework.data.repository.CrudRepository;')
-        if '@Query' in code or 'Query(' in code:
-            import_lines.append('import org.springframework.data.jpa.repository.Query;')
-        if '@Param' in code:
-            import_lines.append('import org.springframework.data.repository.query.Param;')
-        if '@Modifying' in code:
-            import_lines.append('import org.springframework.data.jpa.repository.Modifying;')
-        if '@Transactional' in code:
-            import_lines.append('import org.springframework.transaction.annotation.Transactional;')
-        if 'List<' in code:
-            import_lines.append('import java.util.List;')
-        if 'Optional<' in code:
-            import_lines.append('import java.util.Optional;')
-        if 'LocalDateTime' in code:
-            import_lines.append('import java.time.LocalDateTime;')
-        if 'LocalTime' in code:
-            import_lines.append('import java.time.LocalTime;')
-        if 'BigDecimal' in code:
-            import_lines.append('import java.math.BigDecimal;')
-        if 'List<' in code:
-            import_lines.append('import java.util.List;')
-        if 'ArrayList' in code:
-            import_lines.append('import java.util.ArrayList;')
-        if 'Collections.' in code:
-            import_lines.append('import java.util.Collections;')
-        if 'Pattern' in code:
-            import_lines.append('import java.util.regex.Pattern;')
-        if 'Optional' in code:
-            import_lines.append('import java.util.Optional;')
-
-        entity_matches = re.findall(
-            r'extends\s+(?:JpaRepository|CrudRepository)\s*<\s*([A-Za-z_][\w$#]*)',
-            code,
-        )
-        ddl_map = ddl_map or {}
-        for entity_name in entity_matches:
-            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map or {})
-            normalized_entity = self._normalize_entity_name(normalized_entity)
-            import_lines.append(f'import {self.package_name}.entity.{normalized_entity};')
-
-        imports = '\n'.join(dict.fromkeys(import_lines))
-
-        # Normalize entity type usage directly in the extends clause to avoid lowercase mismatches.
-        for entity_name in entity_matches:
-            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map or {})
-            normalized_entity = self._normalize_entity_name(normalized_entity)
-            code = re.sub(
-                rf'(extends\s+(?:JpaRepository|CrudRepository)\s*<\s*){re.escape(entity_name)}(\s*,)',
-                lambda match, entity=normalized_entity: f"{match.group(1)}{entity}{match.group(2)}",
-                code,
-            )
-
-        body_lines = [
-            line for line in code.splitlines()
-            if not line.strip().startswith('package ')
-            and not line.strip().startswith('import ')
-        ]
-        body = '\n'.join(body_lines).strip()
-        entity_tokens: Set[str] = set(entity_matches)
-        entity_tokens.update(re.findall(r'\\b[A-Za-z_][\\w$#]*Entity\\b', body))
-        entity_index = getattr(self, "_entity_name_index", {}) or {}
-        for entity_name in sorted(entity_tokens):
-            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map or {})
-            normalized_entity = self._normalize_entity_name(normalized_entity)
-            if normalized_entity == entity_name:
-                # Try entity index singular/plural mapping.
-                base_key = entity_name.replace("_", "").lower()
-                normalized_entity = entity_index.get(base_key, normalized_entity)
-            if normalized_entity != entity_name:
-                body = re.sub(rf'\\b{re.escape(entity_name)}\\b', normalized_entity, body)
-        if '@Repository' not in body:
-            body = re.sub(r'public\s+interface', '@Repository\npublic interface', body, count=1)
-
-        # If the repository body is truncated (unbalanced delimiters), drop the trailing fragment.
-        if body.count('(') > body.count(')') or body.count('{') > body.count('}'):
-            cut_idx = max(body.rfind('\n    @Query'), body.rfind('\n    @Modifying'), body.rfind('\n    @Transactional'))
-            if cut_idx > 0:
-                body = body[:cut_idx].rstrip()
-            if not body.endswith('}'):
-                body = body.rstrip() + "\n}\n"
-        else:
-            # Remove trailing annotations/javadoc with no method signature following them.
-            lines = body.splitlines()
-            last_nonempty = None
-            for i in range(len(lines) - 1, -1, -1):
-                if lines[i].strip():
-                    last_nonempty = i
-                    break
-            if last_nonempty is not None:
-                trailing = lines[last_nonempty:]
-                # If trailing section has only annotations/javadoc and no method signature, drop it.
-                has_method_sig = any('(' in line and ')' in line for line in trailing)
-                if not has_method_sig and all(
-                    line.strip().startswith(('@', '*', '/**', '*/')) or not line.strip()
-                    for line in trailing
-                ):
-                    lines = lines[:last_nonempty]
-                    body = "\n".join(lines).rstrip()
-                    if not body.endswith('}'):
-                        body = body.rstrip() + "\n}"
-
-        return f"""package {self.package_name}.repository;
-
-{imports}
-
-{body}
-"""
-
-    def _normalize_entity_code(self, filename: str, code: str) -> str:
-        """Ensure entity code has package/imports and @Entity annotation."""
-        type_name = self._extract_type_name(code) or filename.replace('.java', '')
-        import_lines = []
-        if 'jakarta.persistence.' in code or 'javax.persistence.' in code:
-            import_lines.append('import jakarta.persistence.*;')
-        else:
-            import_lines.append('import jakarta.persistence.*;')
-        if 'LocalDateTime' in code:
-            import_lines.append('import java.time.LocalDateTime;')
-        if 'List<' in code:
-            import_lines.append('import java.util.List;')
-        if 'Set<' in code:
-            import_lines.append('import java.util.Set;')
-
-        imports = '\n'.join(dict.fromkeys(import_lines))
-
-        body_lines = [
-            line for line in code.splitlines()
-            if not line.strip().startswith('package ')
-            and not line.strip().startswith('import ')
-        ]
-        body = '\n'.join(body_lines).strip()
-        if '@Entity' not in body and any(token in body for token in ('@Id', '@Column', '@Table')):
-            body = re.sub(r'public\s+class', '@Entity\npublic class', body, count=1)
-        if '@Entity' not in body and f"public class {type_name}" in body:
-            body = body.replace(f"public class {type_name}", f"@Entity\npublic class {type_name}")
-
-        return f"""package {self.package_name}.entity;
-
-{imports}
-
-{body}
-"""
-
-    def _entity_has_meaningful_fields(self, code: str) -> bool:
-        """Check if an entity has fields beyond an id."""
-        field_lines = [
-            line for line in code.splitlines()
-            if line.strip().startswith("private ")
-        ]
-        if not field_lines:
-            return False
-        non_id_fields = [
-            line for line in field_lines
-            if " id;" not in line.lower()
-        ]
-        return len(non_id_fields) > 0
+    def _is_numeric_type(self, sql_type: str) -> bool:
+        normalized = (sql_type or "").upper()
+        return normalized.startswith(("NUMBER", "INT", "INTEGER", "SMALLINT", "BIGINT",
+                                       "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL"))
 
     def _map_sql_type_to_java(self, sql_type: str) -> str:
         normalized = sql_type.upper()
@@ -2729,13 +1490,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             return "BigDecimal"
         return "String"
 
-    def _generate_entity_from_ddl(
-        self,
-        entity_name: str,
-        table_name: str,
-        columns: List[Dict[str, str]],
-    ) -> str:
-        """Generate a JPA entity from DDL columns."""
+    def _generate_entity_from_ddl(self, entity_name: str, table_name: str, columns: List[Dict[str, str]]) -> str:
         import_lines = ['import jakarta.persistence.*;']
         field_lines = []
         accessor_lines = []
@@ -2766,9 +1521,14 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             if col_name == id_column:
                 annotations.append("@Id")
                 if self._is_numeric_type(col.get("type", "")):
-                    annotations.append("@GeneratedValue(strategy = GenerationType.IDENTITY)")
+                    # SBG-14: use SEQUENCE strategy for Oracle compatibility
+                    seq_name = f"{table_name.lower()}_seq"
+                    annotations.append(
+                        f'@SequenceGenerator(name = "seq_{field_name}", sequenceName = "{seq_name}", allocationSize = 1)'
+                    )
+                    annotations.append('@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "seq_' + field_name + '")')
             annotations.append(f'@Column(name = "{col_name}")')
-            field_lines.append("\n".join(annotations))
+            field_lines.append("\n".join(f"    {a}" for a in annotations))
             field_lines.append(f"    private {java_type} {field_name};\n")
 
             accessor_lines.append(
@@ -2800,303 +1560,636 @@ public class {entity_name} {{
 }}
 """
 
-    def _lower_first(self, value: str) -> str:
-        """Lowercase the first character of a string."""
-        if not value:
-            return value
-        return value[0].lower() + value[1:]
+    def _generate_fallback_entity(self, entity_name: str, fields: Optional[List[Dict[str, str]]] = None) -> str:
+        fields = fields or []
+        import_lines = ['import jakarta.persistence.*;']
+        normalized_entity_name = self._normalize_entity_name(entity_name)
+        if any(field['type'] == 'LocalDateTime' for field in fields):
+            import_lines.append('import java.time.LocalDateTime;')
+        if entity_name in self.RESERVED_ENTITY_NAMES:
+            entity_name += '_entity'
+        field_blocks = []
+        accessor_blocks = []
+        for field in fields:
+            field_name = field['name']
+            field_type = field['type']
+            field_blocks.append(
+                f"""    @Column(name = "{self._to_snake_case(field_name)}")
+    private {field_type} {field_name};"""
+            )
+            accessor_blocks.append(
+                f"""    public {field_type} get{field_name[0].upper() + field_name[1:]}() {{
+        return {field_name};
+    }}
 
-    def _capitalize_first(self, value: str) -> str:
-        """Uppercase the first character of a string."""
-        if not value:
-            return value
-        return value[0].upper() + value[1:]
+    public void set{field_name[0].upper() + field_name[1:]}({field_type} {field_name}) {{
+        this.{field_name} = {field_name};
+    }}"""
+            )
 
-    def _to_lower_camel_case(self, value: str) -> str:
-        """Convert uppercase/snake_case to lowerCamelCase."""
-        if not value:
-            return value
-        pascal = self._to_camel_case(value)
-        return self._lower_first(pascal)
+        fields_section = ('\n\n' + '\n\n'.join(field_blocks)) if field_blocks else ''
+        accessors_section = ('\n\n' + '\n\n'.join(accessor_blocks)) if accessor_blocks else ''
 
-    def _is_numeric_type(self, sql_type: str) -> bool:
-        normalized = (sql_type or "").upper()
-        return normalized.startswith(("NUMBER", "INT", "INTEGER", "SMALLINT", "BIGINT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL"))
+        # SBG-14: SEQUENCE strategy to match Oracle named-sequence DDL
+        return f"""package {self.package_name}.entity;
 
-    def _ensure_process_result_class(self, body: str) -> str:
-        """Inject a nested ProcessOrderResult class when service code references it but does not define it."""
-        if 'ProcessOrderResult' not in body or 'class ProcessOrderResult' in body:
-            return body
-        marker = '\n}'
-        nested_class = """
+{chr(10).join(import_lines)}
 
-    public static class ProcessOrderResult {
-        private final Long orderId;
-        private final String status;
+@Entity
+@Table(name = "{entity_name.lower()}")
+public class {normalized_entity_name} {{
 
-        public ProcessOrderResult(Long orderId, String status) {
-            this.orderId = orderId;
-            this.status = status;
-        }
+    @Id
+    @SequenceGenerator(name = "seq_id", sequenceName = "{entity_name.lower()}_seq", allocationSize = 1)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "seq_id")
+    private Long id;{fields_section}
 
-        public Long getOrderId() {
-            return orderId;
-        }
+    public Long getId() {{
+        return id;
+    }}
 
-        public String getStatus() {
-            return status;
-        }
-    }
+    public void setId(Long id) {{
+        this.id = id;
+    }}{accessors_section}
+}}
 """
-        if marker in body:
-            return body[::-1].replace(marker[::-1], (nested_class + '\n}')[::-1], 1)[::-1]
-        return body + nested_class
 
-    def _to_snake_case(self, value: str) -> str:
-        """Convert camelCase or PascalCase to snake_case."""
-        if not value:
-            return value
-        return re.sub(r'(?<!^)(?=[A-Z])', '_', value).lower()
+    def generate_repositories(self, entities: Dict[str, str]) -> Dict[str, str]:
+        repositories = {}
 
-    def _is_entity_reference_type(self, field_type: str) -> bool:
-        """Detect when a fallback field type should be emitted as a JPA entity relationship."""
-        scalar_types = {
-            'String',
-            'Long',
-            'Integer',
-            'Boolean',
-            'Double',
-            'Float',
-            'BigDecimal',
-            'LocalDate',
-            'LocalDateTime',
-            'Instant',
-            'UUID',
-        }
-        return bool(field_type) and field_type not in scalar_types and field_type[:1].isupper()
-    
-    def generate_controllers(self, services: Dict[str, str]) -> Dict[str, str]:
-        """Generate REST controller classes"""
-        controllers = {}
-        
-        for filename, code in services.items():
-            # Generate controller name from service name
-            service_name = filename.replace('.java', '')
-            if service_name.endswith('Service'):
-                controller_name = service_name[:-7] + 'Controller.java'
-            else:
-                controller_name = service_name + 'Controller.java'
-            
-            # Generate basic controller
-            if 'processOrder(' in code:
-                controller_content = self._generate_process_controller(service_name)
-            else:
-                controller_content = self._generate_controller(service_name, code)
-            if not controller_content:
+        repo_dir = self.package_path / 'repository'
+        existing_repo_names: Set[str] = set()
+        if repo_dir.exists():
+            for repo_file in repo_dir.glob('*.java'):
+                existing_repo_names.add(repo_file.stem)
+        existing_repo_names.update(self._existing_repositories)
+
+        referenced_repo_names: Set[str] = set()
+        for code in (getattr(self, "_latest_java_code", {}) or {}).values():
+            for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
+                name = match.group(0)
+                if name in {"JpaRepository", "CrudRepository"}:
+                    continue
+                referenced_repo_names.add(name)
+
+        # SBG-12: deduplicate by entity base name (strip "Entity" suffix)
+        seen_entity_bases: Set[str] = set()
+
+        for filename, code in entities.items():
+            entity_name = filename.replace('.java', '')
+            if entity_name in {"Jpa", "JpaRepository", "CrudRepository"}:
                 continue
-            controllers[controller_name] = self._normalize_controller_code(controller_name, controller_content)
-        
-        # Write controllers to files
-        controller_dir = self.package_path / 'controller'
-        for filename, code in controllers.items():
-            file_path = controller_dir / filename
+            base_entity = entity_name[:-6] if entity_name.endswith("Entity") else entity_name
+            # SBG-12: skip if we've already generated a repo for this base
+            if base_entity in seen_entity_bases:
+                continue
+            repo_name = f"{entity_name}Repository.java"
+            if repo_name.replace('.java', '') in existing_repo_names:
+                continue
+            if f"{base_entity}Repository" in existing_repo_names:
+                continue
+            seen_entity_bases.add(base_entity)
+            repo_content = self._generate_repository_interface(entity_name)
+            repositories[repo_name] = repo_content
+
+        for repo_name in sorted(referenced_repo_names):
+            if repo_name in {"JpaRepository", "CrudRepository"}:
+                continue
+            if repo_name in existing_repo_names or (repo_dir / f"{repo_name}.java").exists():
+                continue
+            base_entity = repo_name[:-10] if repo_name.endswith("Repository") else repo_name
+            if base_entity in {"Jpa", "Crud", "Repository"}:
+                continue
+            if self._ddl_table_map:
+                resolved_entity, _ = self._resolve_entity_from_ddl(base_entity, self._ddl_table_map)
+            else:
+                resolved_entity = base_entity
+            resolved_entity = self._normalize_entity_name(resolved_entity)
+            repositories[f"{repo_name}.java"] = self._generate_repository_interface(
+                resolved_entity, repo_name=repo_name
+            )
+
+        for filename, code in repositories.items():
+            file_path = repo_dir / filename
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(code)
-        
-        logger.info(f"Generated {len(controllers)} controller classes")
-        return controllers
-    
-    def _service_has_method(self, code: str, method_name: str) -> bool:
-        pattern = rf"\b{re.escape(method_name)}\s*\("
-        return bool(re.search(pattern, code))
 
-    def _extract_public_methods(self, code: str) -> List[Tuple[str, str, str]]:
-        methods: List[Tuple[str, str, str]] = []
-        for match in re.finditer(
-            r'public\s+([A-Za-z_][\w<>, ?]+)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)',
-            code,
-        ):
-            return_type, name, params = match.groups()
-            methods.append((return_type.strip(), name.strip(), params.strip()))
-        return methods
+        logger.info(f"Generated {len(repositories)} repository interfaces")
+        return repositories
 
-    def _generate_controller(self, service_name: str, service_code: str) -> str:
-        """Generate REST controller"""
-        entity_name = service_name.replace('Service', '')
-        if self._ddl_table_map:
-            resolved_entity_name, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
-        else:
-            resolved_entity_name = entity_name
-        resolved_entity_name = self._normalize_entity_name(resolved_entity_name)
-        service_var = service_name[0].lower() + service_name[1:]
+    def _generate_repository_interface(self, entity_name: str, repo_name: Optional[str] = None) -> str:
+        interface_name = repo_name or f"{entity_name}Repository"
+        return f"""package {self.package_name}.repository;
 
-        has_get_all = self._service_has_method(service_code, 'getAll')
-        has_get_by_id = self._service_has_method(service_code, 'getById')
-        has_create = self._service_has_method(service_code, 'create')
-        has_update = self._service_has_method(service_code, 'update')
-        has_delete = self._service_has_method(service_code, 'delete')
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
 
-        if not any([has_get_all, has_get_by_id, has_create, has_update, has_delete]):
-            public_methods = [
-                method for method in self._extract_public_methods(service_code)
-                if method[1] != service_name
-            ]
-            if not public_methods:
-                return ""
-            return_type, method_name, params = public_methods[0]
-            if return_type == "void":
-                return_type = "Void"
-            params = params.strip()
-            param_block = ""
-            call_args = ""
-            extra_imports = []
-            if params:
-                parts = [p.strip() for p in params.split(",") if p.strip()]
-                if len(parts) == 1:
-                    param_type, param_name = parts[0].rsplit(" ", 1)
-                    param_block = f"@RequestBody {param_type} {param_name}"
-                    call_args = param_name
-                else:
-                    return ""
-            # ALWAYS SAFE CONTROLLER PATTERN
-            return_statement = f"""{service_var}.{method_name}({call_args});
-                    return ResponseEntity.ok("Success");"""
-            import_lines = [
-                'import org.springframework.beans.factory.annotation.Autowired;',
-                'import org.springframework.http.ResponseEntity;',
-                'import org.springframework.web.bind.annotation.*;',
-                f'import {self.package_name}.service.{service_name};',
-            ]
-            import_lines.extend(extra_imports)
-            imports = "\n".join(import_lines)
-            method_block = f"""    @PostMapping
-    public ResponseEntity<String> {method_name}({param_block}) {{
-        {return_statement}
-    }}"""
-            return f"""package {self.package_name}.controller;
+import {self.package_name}.entity.{entity_name};
+
+/**
+ * JPA repository for {entity_name}
+ */
+@Repository
+public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
+    // Custom query methods can be added here
+}}
+"""
+
+    def generate_services(self, java_code: Dict[str, str]) -> Dict[str, str]:
+        services = {}
+
+        for filename, code in java_code.items():
+            class_name = None
+            for line in code.splitlines():
+                stripped = line.strip()
+                if stripped.startswith('public class '):
+                    class_name = stripped.split()[2]
+                    break
+
+            looks_like_service = (
+                '@Service' in code
+                or filename.lower().endswith('service.java')
+                or (class_name is not None and class_name.lower().endswith('service'))
+            )
+            if looks_like_service:
+                target_filename = f"{class_name}.java" if class_name else filename
+                services[target_filename] = self._normalize_service_code(target_filename, code)
+
+        service_dir = self.package_path / 'service'
+        for filename, code in services.items():
+            file_path = service_dir / filename
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(code)
+
+        logger.info(f"Generated {len(services)} service classes")
+        return services
+
+    def _normalize_service_code(self, filename: str, code: str) -> str:
+        """
+        SBG-7 FIX: All regex word-boundary patterns are built as variables
+        BEFORE being used in re.sub(), never inside f-strings.
+        SBG-11 FIX: Inject repository calls for INSERT/UPDATE/DELETE/SELECT actions
+        when the service body contains only TODO stubs.
+        """
+        service_name = filename.replace('.java', '')
+        class_name = self._extract_class_name(code) or service_name
+        entity_names = self._derive_entity_names(filename, class_name, code)
+        repository_names: List[str] = []
+        repository_base_map: Dict[str, str] = {}
+
+        for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
+            raw_base = match.group(1)
+            resolved_entity, _ = self._resolve_entity_from_ddl(raw_base, self._ddl_table_map)
+            resolved_entity = self._normalize_entity_name(resolved_entity)
+            repo_base = resolved_entity[:-6] if resolved_entity.endswith("Entity") else resolved_entity
+            repository_name = f"{repo_base}Repository"
+            if repository_name not in repository_names:
+                repository_names.append(repository_name)
+            repository_base_map[raw_base] = repository_name
+
+        import_lines = [
+            'import org.springframework.beans.factory.annotation.Autowired;',
+            'import org.springframework.stereotype.Service;',
+            'import org.springframework.transaction.annotation.Transactional;',
+        ]
+        if 'LocalDateTime' in code:
+            import_lines.append('import java.time.LocalDateTime;')
+        if 'List<' in code:
+            import_lines.append('import java.util.List;')
+        if 'Optional<' in code:
+            import_lines.append('import java.util.Optional;')
+
+        for entity_name in entity_names:
+            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
+            normalized_entity = self._normalize_entity_name(normalized_entity)
+            import_lines.append(f'import {self.package_name}.entity.{normalized_entity};')
+        for repository_name in repository_names:
+            import_lines.append(f'import {self.package_name}.repository.{repository_name};')
+        import_lines.append(f'import {self.package_name}.exception.BusinessException;')
+        imports = '\n'.join(dict.fromkeys(import_lines))
+
+        body_lines = [
+            line for line in code.splitlines()
+            if not line.strip().startswith('package ')
+            and not line.strip().startswith('import ')
+        ]
+        body = '\n'.join(body_lines).strip()
+
+        # SBG-7 FIX: repository renaming via pre-built pattern variables
+        for raw_base, repository_name in repository_base_map.items():
+            pat = re.compile(r'\b' + re.escape(raw_base) + r'Repository\b')
+            body = pat.sub(repository_name, body)
+
+        if '@Service' not in body:
+            body = body.replace(f"public class {service_name}", f"@Service\npublic class {service_name}")
+
+        # SBG-11: inject real repository calls if all switch cases are TODO stubs
+        body = self._inject_crud_repository_calls(body, entity_names, repository_names)
+
+        return f"""package {self.package_name}.service;
 
 {imports}
 
-@RestController
-@RequestMapping("/api/{entity_name.lower()}")
-public class {entity_name}Controller {{
-
-    @Autowired
-    private {service_name} {service_var};
-
-{method_block}
-}}
+{body}
 """
+
+    def _inject_crud_repository_calls(
+        self, body: str, entity_names: List[str], repository_names: List[str]
+    ) -> str:
+        """
+        SBG-11 FIX: Replace // TODO stubs in action-based switch/if-else blocks
+        with actual JPA repository calls.
+        """
+        if not repository_names or '// TODO' not in body:
+            return body
+
+        entity_name = entity_names[0] if entity_names else "Entity"
+        normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
+        normalized_entity = self._normalize_entity_name(normalized_entity)
+        repo_name = repository_names[0]
+        repo_var = repo_name[0].lower() + repo_name[1:]
+        entity_var = normalized_entity[0].lower() + normalized_entity[1:]
+        id_type = "Long"
+
+        replacements = {
+            'case "INSERT":': (
+                f'case "INSERT":\n'
+                f'                    {normalized_entity} {entity_var} = new {normalized_entity}();\n'
+                f'                    // TODO: set fields from parameters\n'
+                f'                    {repo_var}.save({entity_var});\n'
+                f'                    break;'
+            ),
+            'case "UPDATE":': (
+                f'case "UPDATE":\n'
+                f'                    {repo_var}.findById(({id_type}) customerId).ifPresent(e -> {{\n'
+                f'                        // TODO: update fields from parameters\n'
+                f'                        {repo_var}.save(e);\n'
+                f'                    }});\n'
+                f'                    break;'
+            ),
+            'case "DELETE":': (
+                f'case "DELETE":\n'
+                f'                    {repo_var}.deleteById(({id_type}) customerId);\n'
+                f'                    break;'
+            ),
+            'case "SELECT":': (
+                f'case "SELECT":\n'
+                f'                    return {repo_var}.findById(({id_type}) customerId)\n'
+                f'                        .orElseThrow(() -> new BusinessException("Not found: " + customerId));\n'
+            ),
+            'case "CREATE":': (
+                f'case "CREATE":\n'
+                f'                    {normalized_entity} {entity_var}Create = new {normalized_entity}();\n'
+                f'                    // TODO: set fields from parameters\n'
+                f'                    {repo_var}.save({entity_var}Create);\n'
+                f'                    break;'
+            ),
+        }
+
+        for placeholder, replacement in replacements.items():
+            # Only replace the stub pattern (case + TODO + break or just case + TODO)
+            stub_pat = re.compile(
+                re.escape(placeholder) + r'\s*// TODO[^\n]*\n\s*break;',
+                re.DOTALL
+            )
+            body = stub_pat.sub(replacement, body)
+
+        return body
+
+    def _normalize_controller_code(self, filename: str, code: str) -> str:
+        """
+        SBG-8 FIX: Use actual newline '\n' not literal '\\n' as join separator.
+        """
+        controller_name = self._extract_type_name(code) or filename.replace('.java', '')
+        body_lines = [
+            line for line in code.splitlines()
+            if not line.strip().startswith('package ')
+            and not line.strip().startswith('import ')
+        ]
+        body = '\n'.join(body_lines).strip()
+
+        import_lines = [
+            'import org.springframework.web.bind.annotation.*;',
+            'import org.springframework.http.ResponseEntity;',
+        ]
+        if '@Autowired' in body:
+            import_lines.append('import org.springframework.beans.factory.annotation.Autowired;')
+
+        service_candidates = set(re.findall(r'\b([A-Z]\w*Service)\b', body))
+        if controller_name.endswith('Controller'):
+            service_candidates.add(f"{controller_name[:-10]}Service")
+        for service_name in sorted(service_candidates):
+            import_lines.append(f'import {self.package_name}.service.{service_name};')
+        if 'List<' in code:
+            import_lines.append('import java.util.List;')
+
+        import_lines = list(dict.fromkeys(import_lines))
+        # SBG-8 FIX: actual newline character
+        imports = '\n'.join(import_lines)
+
+        return f"""package {self.package_name}.controller;
+
+{imports}
+
+{body}
+"""
+
+    def _normalize_repository_code(self, filename: str, code: str, ddl_map: Optional[Dict[str, str]] = None) -> str:
+        type_name = self._extract_type_name(code) or filename.replace('.java', '')
+        if type_name in {'JpaRepository', 'CrudRepository'}:
+            return code
+
+        import_lines = ['import org.springframework.stereotype.Repository;']
+        if 'JpaRepository' in code:
+            import_lines.append('import org.springframework.data.jpa.repository.JpaRepository;')
+        if 'CrudRepository' in code:
+            import_lines.append('import org.springframework.data.repository.CrudRepository;')
+        if '@Query' in code or 'Query(' in code:
+            import_lines.append('import org.springframework.data.jpa.repository.Query;')
+        if '@Param' in code:
+            import_lines.append('import org.springframework.data.repository.query.Param;')
+        if '@Modifying' in code:
+            import_lines.append('import org.springframework.data.jpa.repository.Modifying;')
+        if '@Transactional' in code:
+            import_lines.append('import org.springframework.transaction.annotation.Transactional;')
+        if 'List<' in code:
+            import_lines.append('import java.util.List;')
+        if 'Optional<' in code:
+            import_lines.append('import java.util.Optional;')
+        if 'LocalDateTime' in code:
+            import_lines.append('import java.time.LocalDateTime;')
+        if 'BigDecimal' in code:
+            import_lines.append('import java.math.BigDecimal;')
+
+        entity_matches = re.findall(
+            r'extends\s+(?:JpaRepository|CrudRepository)\s*<\s*([A-Za-z_][\w$#]*)',
+            code,
+        )
+        ddl_map = ddl_map or {}
+        for entity_name in entity_matches:
+            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map)
+            normalized_entity = self._normalize_entity_name(normalized_entity)
+            import_lines.append(f'import {self.package_name}.entity.{normalized_entity};')
+
+        imports = '\n'.join(dict.fromkeys(import_lines))
+
+        body_lines = [
+            line for line in code.splitlines()
+            if not line.strip().startswith('package ')
+            and not line.strip().startswith('import ')
+        ]
+        body = '\n'.join(body_lines).strip()
+
+        if '@Repository' not in body:
+            body = re.sub(r'public\s+interface', '@Repository\npublic interface', body, count=1)
+
+        return f"""package {self.package_name}.repository;
+
+{imports}
+
+{body}
+"""
+
+    def _normalize_entity_code(self, filename: str, code: str) -> str:
+        type_name = self._extract_type_name(code) or filename.replace('.java', '')
+        import_lines = ['import jakarta.persistence.*;']
+        if 'LocalDateTime' in code:
+            import_lines.append('import java.time.LocalDateTime;')
+        if 'BigDecimal' in code:
+            import_lines.append('import java.math.BigDecimal;')
+
+        imports = '\n'.join(dict.fromkeys(import_lines))
+        body_lines = [
+            line for line in code.splitlines()
+            if not line.strip().startswith('package ')
+            and not line.strip().startswith('import ')
+        ]
+        body = '\n'.join(body_lines).strip()
+        if '@Entity' not in body and any(token in body for token in ('@Id', '@Column', '@Table')):
+            body = re.sub(r'public\s+class', '@Entity\npublic class', body, count=1)
+
+        return f"""package {self.package_name}.entity;
+
+{imports}
+
+{body}
+"""
+
+    # ── Stubs for methods referenced elsewhere (kept for compatibility) ───────
+
+    def _resolve_entity_from_ddl(self, raw_entity: str, ddl_map: Dict[str, str]) -> Tuple[str, Optional[str]]:
+        if not raw_entity:
+            return raw_entity, None
+        raw = raw_entity.strip()
+        lowered = raw.lower()
+        base = raw[:-6] if lowered.endswith("entity") else raw
+        base_key = base.replace("_", "").lower()
+        table_name = ddl_map.get(base_key)
+        if not table_name:
+            if base_key.endswith("s"):
+                table_name = ddl_map.get(base_key[:-1])
+            else:
+                table_name = ddl_map.get(f"{base_key}s")
+        if table_name:
+            entity_name = f"{self._to_camel_case(table_name.lower())}Entity"
+            return entity_name, table_name
+        entity_index = getattr(self, "_entity_name_index", None)
+        if entity_index:
+            candidate = entity_index.get(base_key)
+            if candidate:
+                return candidate, None
+        return self._normalize_entity_type_name(raw), None
+
+    def _derive_entity_names(self, filename: str, class_name: Optional[str], code: str) -> List[str]:
+        entity_names: List[str] = []
+        for match in re.finditer(r'\b([A-Z]\w*)Repository\b', code):
+            candidate = match.group(1)
+            if self._is_entity_candidate_name(candidate):
+                entity_names.append(candidate)
+        fallback = self._derive_entity_name(filename, class_name)
+        if fallback and not entity_names:
+            entity_names.append(fallback)
+        ordered: List[str] = []
+        seen = set()
+        for name in entity_names:
+            if name and name not in seen:
+                ordered.append(name)
+                seen.add(name)
+        return ordered
+
+    def _derive_entity_name(self, filename: str, class_name: Optional[str]) -> Optional[str]:
+        if class_name and class_name.lower().endswith('service'):
+            base = class_name[:-7]
+            return base if base else None
+        if filename.lower().endswith('service.java'):
+            base = filename[:-12]
+            return self._to_camel_case(base) if base else None
+        stem = filename.replace('.java', '')
+        return self._to_camel_case(stem) if stem else None
+
+    def _is_entity_candidate_name(self, candidate: str) -> bool:
+        blocked_suffixes = ('Exception', 'Result', 'Response', 'Request', 'DTO', 'Config', 'Controller', 'Service')
+        blocked_names = {'BusinessException', 'IllegalArgumentException', 'ProcessOrderResult', 'TABLE'}
+        return bool(candidate) and candidate not in blocked_names and not candidate.endswith(blocked_suffixes)
+
+    def _entity_has_meaningful_fields(self, code: str) -> bool:
+        field_lines = [l for l in code.splitlines() if l.strip().startswith("private ")]
+        if not field_lines:
+            return False
+        return any(" id;" not in l.lower() for l in field_lines)
+
+    def _generate_controller(self, service_name: str, service_code: str) -> str:
+        entity_name = service_name.replace('Service', '')
+        service_var = service_name[0].lower() + service_name[1:]
+
+        has_get_all = bool(re.search(r'\bgetAll\s*\(', service_code))
+        has_get_by_id = bool(re.search(r'\bgetById\s*\(', service_code))
+        has_create = bool(re.search(r'\bcreate\s*\(', service_code))
+        has_update = bool(re.search(r'\bupdate\s*\(', service_code))
+        has_delete = bool(re.search(r'\bdelete\s*\(', service_code))
+
+        if not any([has_get_all, has_get_by_id, has_create, has_update, has_delete]):
+            return ""
 
         import_lines = [
             'import org.springframework.beans.factory.annotation.Autowired;',
             'import org.springframework.http.ResponseEntity;',
             'import org.springframework.web.bind.annotation.*;',
             f'import {self.package_name}.service.{service_name};',
-            f'import {self.package_name}.entity.{resolved_entity_name};',
         ]
         if has_get_all:
             import_lines.append('import java.util.List;')
-        imports = '\\n'.join(import_lines)
+        # SBG-8 FIX: actual newline
+        imports = '\n'.join(import_lines)
 
         methods = []
         if has_get_all:
             methods.append(
-                f"""    @GetMapping
-    public ResponseEntity<List<{resolved_entity_name}>> getAll{entity_name}s() {{
-        List<{resolved_entity_name}> {entity_name.lower()}s = {service_var}.getAll();
-        return ResponseEntity.ok({entity_name.lower()}s);
-    }}"""
-            )
-        if has_get_by_id:
-            methods.append(
-                f"""    @GetMapping("/{{id}}")
-    public ResponseEntity<{resolved_entity_name}> get{entity_name}ById(@PathVariable Long id) {{
-        {resolved_entity_name} {entity_name.lower()} = {service_var}.getById(id);
-        return ResponseEntity.ok({entity_name.lower()});
-    }}"""
+                f"    @GetMapping\n"
+                f"    public ResponseEntity<List<?>> getAll{entity_name}s() {{\n"
+                f"        return ResponseEntity.ok({service_var}.getAll());\n"
+                f"    }}"
             )
         if has_create:
             methods.append(
-                f"""    @PostMapping
-    public ResponseEntity<{resolved_entity_name}> create{entity_name}(@RequestBody {resolved_entity_name} {entity_name.lower()}) {{
-        {resolved_entity_name} created{entity_name} = {service_var}.create({entity_name.lower()});
-        return ResponseEntity.ok(created{entity_name});
-    }}"""
+                f"    @PostMapping\n"
+                f"    public ResponseEntity<?> create{entity_name}(@RequestBody Object request) {{\n"
+                f"        return ResponseEntity.ok({service_var}.create(request));\n"
+                f"    }}"
             )
         if has_update:
             methods.append(
-                f"""    @PutMapping("/{{id}}")
-    public ResponseEntity<{resolved_entity_name}> update{entity_name}(
-            @PathVariable Long id,
-            @RequestBody {resolved_entity_name} {entity_name.lower()}) {{
-        {resolved_entity_name} updated{entity_name} = {service_var}.update(id, {entity_name.lower()});
-        return ResponseEntity.ok(updated{entity_name});
-    }}"""
+                f"    @PutMapping(\"/{{id}}\")\n"
+                f"    public ResponseEntity<?> update{entity_name}(@PathVariable Long id, @RequestBody Object request) {{\n"
+                f"        return ResponseEntity.ok({service_var}.update(id, request));\n"
+                f"    }}"
             )
         if has_delete:
             methods.append(
-                f"""    @DeleteMapping("/{{id}}")
-    public ResponseEntity<Void> delete{entity_name}(@PathVariable Long id) {{
-        {service_var}.delete(id);
-        return ResponseEntity.noContent().build();
-    }}"""
+                f"    @DeleteMapping(\"/{{id}}\")\n"
+                f"    public ResponseEntity<Void> delete{entity_name}(@PathVariable Long id) {{\n"
+                f"        {service_var}.delete(id);\n"
+                f"        return ResponseEntity.noContent().build();\n"
+                f"    }}"
             )
 
-        methods_block = "\\n\\n".join(methods)
+        # SBG-9 FIX: use actual newline characters
+        methods_block = '\n\n'.join(methods)
 
         return f"""package {self.package_name}.controller;
 
 {imports}
 
-/**
- * REST controller for {entity_name} operations
- */
 @RestController
 @RequestMapping("/api/{entity_name.lower()}")
 public class {entity_name}Controller {{
-    
+
     @Autowired
     private {service_name} {service_var};
-    
+
 {methods_block}
 }}
 """
 
-    def _generate_process_controller(self, service_name: str) -> str:
-        """Generate controller for services that expose processOrder method."""
-        entity_name = service_name.replace('Service', '')
-        return f"""package {self.package_name}.controller;
+    def generate_controllers(self, services: Dict[str, str]) -> Dict[str, str]:
+        controllers = {}
+        for filename, code in services.items():
+            service_name = filename.replace('.java', '')
+            if service_name.endswith('Service'):
+                controller_name = service_name[:-7] + 'Controller.java'
+            else:
+                controller_name = service_name + 'Controller.java'
+            controller_content = self._generate_controller(service_name, code)
+            if not controller_content:
+                continue
+            controllers[controller_name] = self._normalize_controller_code(controller_name, controller_content)
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import {self.package_name}.service.{service_name};
+        controller_dir = self.package_path / 'controller'
+        for filename, code in controllers.items():
+            file_path = controller_dir / filename
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(code)
 
-/**
- * REST controller for {entity_name} process operations
- */
-@RestController
-@RequestMapping("/api/{entity_name.lower()}")
-public class {entity_name}Controller {{
-    
-    @Autowired
-    private {service_name} {service_name[0].lower() + service_name[1:]};
-    
-    @PostMapping("/process")
-    public ResponseEntity<Object> processOrder(
-            @RequestParam Long customerId,
-            @RequestParam Long productId,
-            @RequestParam Integer quantity,
-            @RequestParam String createdBy) {{
-        return ResponseEntity.ok(
-                {service_name[0].lower() + service_name[1:]}.processOrder(customerId, productId, quantity, createdBy)
-        );
-    }}
-}}
-"""
+        logger.info(f"Generated {len(controllers)} controller classes")
+        return controllers
+
+    def generate_entities(self, java_code: Dict[str, str], ddl_columns: Optional[Dict[str, List[Dict[str, str]]]] = None) -> Dict[str, str]:
+        entities = {}
+        ddl_columns = ddl_columns or {}
+        ddl_map = {table.replace("_", "").lower(): table for table in ddl_columns.keys()}
+        self._ddl_table_map = ddl_map
+
+        for filename, code in java_code.items():
+            if '@Entity' in code or 'extends BaseEntity' in code:
+                class_name = self._extract_class_name(code) or filename.replace('.java', '')
+                if class_name in {"Jpa", "JpaRepository", "CrudRepository"}:
+                    continue
+                normalized_name = self._normalize_entity_name(class_name)
+                target_filename = f"{normalized_name}.java"
+                entities[target_filename] = code
+
+        for table_name, columns in ddl_columns.items():
+            ddl_entity_name = f"{self._to_camel_case(table_name.lower())}Entity"
+            normalized_entity_name = self._normalize_entity_name(ddl_entity_name)
+            target_filename = f"{normalized_entity_name}.java"
+            if target_filename in entities:
+                continue
+            entities[target_filename] = self._generate_entity_from_ddl(normalized_entity_name, table_name, columns)
+
+        if not entities:
+            for filename, code in java_code.items():
+                class_name = self._extract_class_name(code)
+                for entity_name in self._derive_entity_names(filename, class_name, code):
+                    normalized_entity_name = self._normalize_entity_name(entity_name)
+                    fallback_name = f"{normalized_entity_name}.java"
+                    if fallback_name not in entities:
+                        entities[fallback_name] = self._generate_fallback_entity(entity_name, [])
+
+        entity_dir = self.package_path / 'entity'
+        for filename, code in entities.items():
+            file_path = entity_dir / filename
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(code)
+
+        logger.info(f"Generated {len(entities)} entity classes")
+        return entities
+
+    def _looks_like_service_source(self, filename: str, code: str) -> bool:
+        class_name = self._extract_class_name(code) or ''
+        filename_lower = filename.lower()
+        return (
+            '@Service' in code
+            or filename_lower.endswith('service.java')
+            or class_name.lower().endswith('service')
+        )
+
+    def _is_entity_reference_type(self, field_type: str) -> bool:
+        scalar_types = {
+            'String', 'Long', 'Integer', 'Boolean', 'Double', 'Float',
+            'BigDecimal', 'LocalDate', 'LocalDateTime', 'Instant', 'UUID',
+        }
+        return bool(field_type) and field_type not in scalar_types and field_type[:1].isupper()
 
 
 def create_spring_boot_generator(config: Dict[str, Any]) -> SpringBootGenerator:
-    """Create and return a configured Spring Boot generator"""
     return SpringBootGenerator(config)

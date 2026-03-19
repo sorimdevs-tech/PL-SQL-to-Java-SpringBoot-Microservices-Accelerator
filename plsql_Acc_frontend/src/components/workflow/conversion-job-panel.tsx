@@ -26,6 +26,7 @@ export interface ConversionSnapshot {
   generatedFiles: string[]
   backendSummary?: string
   backendSummaryData?: Record<string, unknown>
+  conversionDurationMs?: number
 }
 
 interface ConversionJobPanelProps {
@@ -88,6 +89,9 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
   const [progressStage, setProgressStage] = useState<"idle" | "queued" | "running" | "completed" | "failed">("idle")
   const lastStatusRef = useRef<string | null>(null)
   const [conversionStarted, setConversionStarted] = useState(false)
+  const [conversionStartAt, setConversionStartAt] = useState<number | null>(null)
+  const [conversionDurationMs, setConversionDurationMs] = useState<number | null>(null)
+  const [conversionElapsedMs, setConversionElapsedMs] = useState(0)
 
   const isPolling = job?.status === "queued" || job?.status === "running"
 
@@ -116,8 +120,9 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       generatedFiles: generatedFiles.map((file) => file.path),
       backendSummary,
       backendSummaryData,
+      conversionDurationMs: conversionDurationMs ?? undefined,
     })
-  }, [generatedFiles, job, onSnapshotChange])
+  }, [conversionDurationMs, generatedFiles, job, onSnapshotChange])
 
   useEffect(() => {
     if (!job) {
@@ -143,10 +148,31 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       setProgressStage(job.status)
     } else if (job.status === "completed") {
       setProgressStage("completed")
+      if (conversionStartAt && conversionDurationMs === null) {
+        const elapsed = Date.now() - conversionStartAt
+        setConversionDurationMs(elapsed)
+        setConversionElapsedMs(elapsed)
+      }
     } else if (job.status === "failed") {
       setProgressStage("failed")
+      if (conversionStartAt && conversionDurationMs === null) {
+        const elapsed = Date.now() - conversionStartAt
+        setConversionDurationMs(elapsed)
+        setConversionElapsedMs(elapsed)
+      }
     }
-  }, [job])
+  }, [conversionDurationMs, conversionStartAt, job])
+
+  useEffect(() => {
+    const isConverting = conversionStarted && conversionDurationMs === null
+    if (!conversionStartAt || !isConverting) {
+      return
+    }
+    const tick = () => setConversionElapsedMs(Date.now() - conversionStartAt)
+    tick()
+    const interval = window.setInterval(tick, 1000)
+    return () => window.clearInterval(interval)
+  }, [conversionDurationMs, conversionStartAt, conversionStarted])
 
   const loadGeneratedFiles = useCallback(async (jobId: string) => {
     try {
@@ -290,6 +316,10 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
     setProgressStage("queued")
     props.onConversionStart()
     setConversionStarted(true)
+    const startAt = Date.now()
+    setConversionStartAt(startAt)
+    setConversionDurationMs(null)
+    setConversionElapsedMs(0)
     try {
       setIsStarting(true)
       let createdJob: ConversionJob | null = null
@@ -355,9 +385,31 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Failed to start conversion.")
       setProgressStage("failed")
+      if (startAt) {
+        const elapsed = Date.now() - startAt
+        setConversionDurationMs(elapsed)
+        setConversionElapsedMs(elapsed)
+      }
     } finally {
       setIsStarting(false)
     }
+  }
+
+  function formatDuration(ms: number): string {
+    if (!Number.isFinite(ms) || ms < 0) {
+      return "0s"
+    }
+    const totalSeconds = Math.floor(ms / 1000)
+    const hours = Math.floor(totalSeconds / 3600)
+    const minutes = Math.floor((totalSeconds % 3600) / 60)
+    const seconds = totalSeconds % 60
+    if (hours > 0) {
+      return `${hours}h ${minutes}m ${seconds}s`
+    }
+    if (minutes > 0) {
+      return `${minutes}m ${seconds}s`
+    }
+    return `${seconds}s`
   }
 
   return (
@@ -431,7 +483,10 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           <div className="rounded-xl border border-white/20 bg-white/10 p-3">
             <div className="flex items-center justify-between text-xs text-slate-200">
               <span>Application creation</span>
-              <span className="uppercase tracking-wide">{progressStage}</span>
+              <span className="flex items-center gap-3">
+                <span className="text-[11px] text-slate-300">Elapsed: {formatDuration(conversionElapsedMs)}</span>
+                <span className="uppercase tracking-wide">{progressStage}</span>
+              </span>
             </div>
             <div className="relative mt-2 h-2 overflow-hidden rounded-full bg-white/20">
               {progressStage === "completed" ? (
