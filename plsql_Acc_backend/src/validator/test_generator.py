@@ -38,8 +38,9 @@ class ValidationResult:
 class TestGenerator:
     """Generates unit tests for converted Java code"""
     
-    def __init__(self):
+    def __init__(self, package_name: str = "com.company.project"):
         """Initialize test generator"""
+        self.package_name = package_name
         self.test_patterns = self._load_test_patterns()
     
     async def generate_and_validate(self, entities: Dict[str, str], 
@@ -196,7 +197,7 @@ class TestGenerator:
         # Generate imports
         imports = self._generate_entity_test_imports(class_name)
         
-        return f"""package com.company.project.entity;
+        return f"""package {self.package_name}.entity;
 
 {imports}
 
@@ -275,7 +276,7 @@ class {class_name}Test {{
         # Generate imports
         imports = self._generate_repository_test_imports(entity_name, interface_name)
         
-        return f"""package com.company.project.repository;
+        return f"""package {self.package_name}.repository;
 
 {imports}
 
@@ -360,7 +361,7 @@ class {interface_name}Test {{
         # Generate imports
         imports = self._generate_service_test_imports(class_name, dependencies)
         
-        return f"""package com.company.project.service;
+        return f"""package {self.package_name}.service;
 
 {imports}
 
@@ -443,7 +444,7 @@ class {class_name}Test {{
         # Generate imports
         imports = self._generate_controller_test_imports(class_name, service_dependency)
         
-        return f"""package com.company.project.controller;
+        return f"""package {self.package_name}.controller;
 
 {imports}
 
@@ -527,9 +528,9 @@ class {class_name}Test {{
             "import static org.junit.jupiter.api.Assertions.*;",
         ]
         if repository_name:
-            import_lines.append(f"import com.company.project.repository.{repository_name};")
+            import_lines.append(f"import {self.package_name}.repository.{repository_name};")
         if service_name:
-            import_lines.append(f"import com.company.project.service.{service_name};")
+            import_lines.append(f"import {self.package_name}.service.{service_name};")
 
         field_blocks = []
         assertion_lines = ["        assertTrue(true);"]
@@ -546,7 +547,7 @@ class {class_name}Test {{
             )
             assertion_lines.append("        assertNotNull(service);")
 
-        return f"""package com.company.project.integration;
+        return f"""package {self.package_name}.integration;
 
 {chr(10).join(import_lines)}
 
@@ -918,7 +919,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.junit.jupiter.api.extension.ExtendWith;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
-import com.company.project.entity.{entity_name};"""
+import {self.package_name}.entity.{entity_name};"""
     
     def _generate_service_test_imports(self, class_name: str, dependencies: List[Dict[str, str]]) -> str:
         """Generate imports for service test"""
@@ -943,7 +944,7 @@ import static org.mockito.Mockito.*;"""
             "import static org.junit.jupiter.api.Assertions.*;",
         ]
         if service_dependency:
-            import_lines.append(f"import com.company.project.service.{service_dependency};")
+            import_lines.append(f"import {self.package_name}.service.{service_dependency};")
         return "\n".join(import_lines)
     
     def _get_entity_path(self, class_name: str) -> str:
@@ -951,9 +952,10 @@ import static org.mockito.Mockito.*;"""
         return class_name.replace('Controller', '').lower()
     
     def _get_test_path(self, test_type: str) -> Path:
-        """Get test directory path"""
+        """Get test directory path using the actual configured package name."""
         output_dir = Path(get_config_value('output.target_directory', './output'))
-        base_path = output_dir / 'src' / 'test' / 'java' / 'com' / 'company' / 'project'
+        package_path = self.package_name.replace('.', '/')
+        base_path = output_dir / 'src' / 'test' / 'java' / package_path
         return base_path / test_type
     
     def _get_current_time(self) -> str:

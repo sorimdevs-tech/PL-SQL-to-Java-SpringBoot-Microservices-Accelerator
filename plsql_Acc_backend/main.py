@@ -9,8 +9,11 @@ import sys
 import logging
 import argparse
 import asyncio
+import json
+import re
+import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # Import platform components
 from src.utils.logger import setup_logging
@@ -69,6 +72,8 @@ class PLSQLModernizationPipeline:
         self.generator = SpringBootGenerator(self.config.get('output', {}))
         self.test_generator = TestGenerator()
         self.file_extractor = FileExtractor()
+        self.repair_config = self.config.get('backup_llm', {}) or {}
+        self._last_repair_result: Dict[str, Any] = {}
         
         # Setup output directories
         self.setup_output_directories()
@@ -116,6 +121,24 @@ class PLSQLModernizationPipeline:
             
             # Stage 4: Convert to Java using LLM
             logger.info("Stage 4: Converting to Java using LLM...")
+
+            # LCE-FIX: Extract DDL table names NOW (before Stage 4) so convert_to_java
+            # can inject them into the LLM context. The dependency graph may not have
+            # found any tables if the SQL statement parser couldn't resolve table
+            # references in procedure bodies.
+            try:
+                from src.parser.sql_table_discovery import extract_create_table_columns
+                self._last_ddl_tables = []
+                for _content in (plsql_files or {}).values():
+                    for _tbl in extract_create_table_columns(_content).keys():
+                        if _tbl.upper() not in [t.upper() for t in self._last_ddl_tables]:
+                            self._last_ddl_tables.append(_tbl.upper())
+                if self._last_ddl_tables:
+                    logger.info(f"LCE-FIX: found {len(self._last_ddl_tables)} DDL tables for LLM context: {self._last_ddl_tables}")
+            except Exception as _e:
+                logger.warning(f"LCE-FIX: DDL table extraction failed: {_e}")
+                self._last_ddl_tables = []
+
             java_code = await self.convert_to_java(ast_results, dependency_graph)
             if not java_code:
                 raise RuntimeError(
@@ -148,12 +171,16 @@ class PLSQLModernizationPipeline:
             test_results = await self.generate_tests_and_validate(
                 entities, repositories, services, controllers
             )
+
+            # Stage 11: Build validation and backup-LLM repair
+            logger.info("Stage 11: Validating generated project build...")
+            repair_results = await self.repair_generated_project_if_needed(project_structure)
             
             # Generate migration report
             logger.info("Generating migration report...")
             await self.generate_migration_report(
                 plsql_files, ast_results, dependency_graph, 
-                project_structure, entities, repositories, services, controllers, test_results
+                project_structure, entities, repositories, services, controllers, test_results, repair_results
             )
             
             logger.info("Pipeline completed successfully!")
@@ -169,6 +196,7 @@ class PLSQLModernizationPipeline:
                 services=services,
                 controllers=controllers,
                 test_results=test_results,
+                repair_results=repair_results,
             )
             
         except Exception as e:
@@ -243,6 +271,21 @@ class PLSQLModernizationPipeline:
             Dict[str, str]: Generated Java code files
         """
         merged_ast = self._merge_ast_results(ast_results)
+
+        # LCE-FIX: If the dependency graph produced no tables (which happens when
+        # the PL/SQL parser doesn't fully resolve SQL statement table references),
+        # enrich the dependency_graph with DDL-extracted table names so that
+        # llm_engine._prepare_conversion_context() can build correct entity_names
+        # and repository_names for the LLM prompt.
+        if not dependency_graph.get('tables'):
+            # Re-extract table names from the raw PL/SQL source stored in plsql_files
+            # (available via self._last_plsql_files set in run_pipeline)
+            ddl_tables = getattr(self, '_last_ddl_tables', [])
+            if ddl_tables:
+                dependency_graph = dict(dependency_graph)
+                dependency_graph['tables'] = ddl_tables
+                logger.info(f"LCE-FIX: enriched dependency_graph with {len(ddl_tables)} DDL tables: {ddl_tables}")
+
         return await self.llm_engine.convert(merged_ast, dependency_graph)
 
     def _merge_ast_results(self, ast_results: Dict[str, Any]) -> Dict[str, Any]:
@@ -289,6 +332,7 @@ class PLSQLModernizationPipeline:
         
         Args:
             java_code (Dict[str, str]): Generated Java code
+            plsql_files (Dict[str, str]): Original PL/SQL source files
             
         Returns:
             Dict[str, str]: Generated entity files
@@ -299,7 +343,17 @@ class PLSQLModernizationPipeline:
                 ddl_columns.update(extract_create_table_columns(content))
             except Exception:
                 continue
-        return self.generator.generate_entities(java_code, ddl_columns)
+
+        # SBG-20 FIX (Issue 6): parse ALTER TABLE ... FOREIGN KEY constraints
+        # so that _generate_entity_from_ddl can emit @ManyToOne/@JoinColumn
+        fk_map: Dict[str, List[Dict[str, str]]] = {}
+        for content in (plsql_files or {}).values():
+            try:
+                fk_map.update(SpringBootGenerator.parse_fk_constraints(content))
+            except Exception:
+                continue
+
+        return self.generator.generate_entities(java_code, ddl_columns, fk_map)
     
     async def generate_repositories(self, entities: Dict[str, str]) -> Dict[str, str]:
         """
@@ -356,6 +410,224 @@ class PLSQLModernizationPipeline:
         return await self.test_generator.generate_and_validate(
             entities, repositories, services, controllers
         )
+
+    async def repair_generated_project_if_needed(self, project_structure: Dict[str, Any]) -> Dict[str, Any]:
+        project_root = self.output_directory
+        initial_build = await self._run_generated_project_build(project_root)
+        if initial_build.get('success'):
+            self._last_repair_result = {
+                'enabled': bool(self.repair_config.get('enabled')),
+                'attempted': False,
+                'build_passed': True,
+                'iterations': [],
+                'final_build': initial_build,
+            }
+            return self._last_repair_result
+
+        if not self.repair_config.get('enabled'):
+            self._last_repair_result = {
+                'enabled': False,
+                'attempted': False,
+                'build_passed': False,
+                'iterations': [],
+                'final_build': initial_build,
+                'reason': 'backup_llm_disabled',
+            }
+            return self._last_repair_result
+
+        max_loops = max(1, int(self.repair_config.get('max_repair_loops', 2)))
+        max_files = max(1, int(self.repair_config.get('max_files_per_attempt', 8)))
+        iterations: List[Dict[str, Any]] = []
+        current_build = initial_build
+
+        for attempt in range(1, max_loops + 1):
+            context = self._build_repair_context(
+                project_root=project_root,
+                project_structure=project_structure,
+                build_result=current_build,
+                max_files=max_files,
+            )
+            repair_payload = await self.llm_engine.repair_generated_project(context)
+            changed_files = self._apply_repair_files(project_root, repair_payload.get('files', []))
+            build_after = await self._run_generated_project_build(project_root)
+            iteration = {
+                'attempt': attempt,
+                'summary': repair_payload.get('summary', ''),
+                'files_changed': changed_files,
+                'build_passed': build_after.get('success', False),
+                'build_command': build_after.get('command'),
+            }
+            iterations.append(iteration)
+            current_build = build_after
+            if build_after.get('success'):
+                break
+            if not changed_files:
+                break
+
+        self._last_repair_result = {
+            'enabled': True,
+            'attempted': True,
+            'build_passed': current_build.get('success', False),
+            'iterations': iterations,
+            'final_build': current_build,
+        }
+        self._write_repair_report(self._last_repair_result)
+        return self._last_repair_result
+
+    async def _run_generated_project_build(self, project_root: Path) -> Dict[str, Any]:
+        command = self._resolve_build_command(project_root)
+        if not command:
+            return {
+                'success': False,
+                'command': None,
+                'stdout': '',
+                'stderr': 'No supported build command found for generated project',
+                'combined_output': 'No supported build command found for generated project',
+                'error_files': [],
+            }
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(project_root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await process.communicate()
+        stdout = stdout_bytes.decode('utf-8', errors='replace')
+        stderr = stderr_bytes.decode('utf-8', errors='replace')
+        combined_output = (stdout + "\n" + stderr).strip()
+        return {
+            'success': process.returncode == 0,
+            'returncode': process.returncode,
+            'command': " ".join(command),
+            'stdout': stdout,
+            'stderr': stderr,
+            'combined_output': combined_output[-20000:],
+            'error_files': self._extract_build_error_files(combined_output, project_root),
+        }
+
+    def _resolve_build_command(self, project_root: Path) -> List[str]:
+        gradlew = project_root / 'gradlew.bat'
+        gradle = project_root / 'build.gradle'
+        mvnw = project_root / 'mvnw.cmd'
+        pom = project_root / 'pom.xml'
+
+        if gradlew.exists():
+            return [str(gradlew), 'build', '-x', 'test']
+        if gradle.exists():
+            gradle_cmd = shutil.which('gradle')
+            if gradle_cmd:
+                return [gradle_cmd, 'build', '-x', 'test']
+        if mvnw.exists():
+            return [str(mvnw), '-DskipTests', 'compile']
+        if pom.exists():
+            mvn_cmd = shutil.which('mvn')
+            if mvn_cmd:
+                return [mvn_cmd, '-DskipTests', 'compile']
+        return []
+
+    def _extract_build_error_files(self, output: str, project_root: Path) -> List[str]:
+        if not output:
+            return []
+        matches = set()
+        normalized_root = str(project_root).replace('\\', '/')
+        patterns = [
+            r'([A-Za-z]:[\\/][^\r\n:]*?\.java)',
+            r'((?:src[\\/][^\r\n:]+?\.java))',
+            r'((?:src[\\/][^\r\n:]+?\.xml))',
+            r'((?:src[\\/][^\r\n:]+?\.properties))',
+            r'((?:src[\\/][^\r\n:]+?\.yml))',
+        ]
+        for pattern in patterns:
+            for match in re.findall(pattern, output):
+                path = str(match).replace('\\', '/')
+                if re.match(r'^[A-Za-z]:/', path):
+                    try:
+                        path = str(Path(path).resolve()).replace('\\', '/')
+                        if path.startswith(normalized_root):
+                            path = path[len(normalized_root):].lstrip('/')
+                    except Exception:
+                        continue
+                matches.add(path)
+        return sorted(matches)
+
+    def _build_repair_context(
+        self,
+        project_root: Path,
+        project_structure: Dict[str, Any],
+        build_result: Dict[str, Any],
+        max_files: int,
+    ) -> Dict[str, Any]:
+        file_paths = build_result.get('error_files') or []
+        if not file_paths:
+            file_paths = self._collect_project_source_files(project_root)[:max_files]
+        else:
+            file_paths = file_paths[:max_files]
+
+        files = []
+        for rel_path in file_paths:
+            abs_path = project_root / rel_path
+            if abs_path.exists() and abs_path.is_file():
+                try:
+                    files.append({
+                        'path': rel_path.replace('\\', '/'),
+                        'content': abs_path.read_text(encoding='utf-8', errors='replace')
+                    })
+                except Exception:
+                    continue
+
+        config_files = []
+        for rel_path in ('pom.xml', 'build.gradle', 'settings.gradle', 'src/main/resources/application.properties', 'src/main/resources/application.yml'):
+            abs_path = project_root / rel_path
+            if abs_path.exists() and abs_path.is_file():
+                config_files.append({
+                    'path': rel_path,
+                    'content': abs_path.read_text(encoding='utf-8', errors='replace')
+                })
+
+        return {
+            'project_name': self.config.get('output', {}).get('project_name', 'converted-app'),
+            'package_name': self.config.get('output', {}).get('package_name', 'com.company.project'),
+            'build_command': build_result.get('command'),
+            'build_output': build_result.get('combined_output', ''),
+            'project_summary': project_structure.get('project_structure', {}),
+            'failing_files': files,
+            'config_files': config_files,
+        }
+
+    def _collect_project_source_files(self, project_root: Path) -> List[str]:
+        candidates = []
+        for path in sorted((project_root / 'src').rglob('*')):
+            if path.is_file() and path.suffix.lower() in {'.java', '.xml', '.properties', '.yml'}:
+                candidates.append(str(path.relative_to(project_root)).replace('\\', '/'))
+        return candidates
+
+    def _apply_repair_files(self, project_root: Path, files: List[Dict[str, str]]) -> List[str]:
+        changed = []
+        for item in files or []:
+            rel_path = item.get('path')
+            content = item.get('content')
+            if not isinstance(rel_path, str) or not isinstance(content, str):
+                continue
+            target_path = (project_root / rel_path).resolve()
+            try:
+                target_path.relative_to(project_root.resolve())
+            except ValueError:
+                logger.warning("Skipping repair write outside project root: %s", rel_path)
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(content, encoding='utf-8')
+            changed.append(str(target_path.relative_to(project_root)).replace('\\', '/'))
+        return changed
+
+    def _write_repair_report(self, repair_results: Dict[str, Any]) -> None:
+        try:
+            report_file = self.output_directory / 'reports' / 'repair_report.json'
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(report_file, 'w', encoding='utf-8') as f:
+                json.dump(repair_results, f, indent=2)
+        except Exception as exc:
+            logger.warning("Failed to write repair report: %s", exc)
     
     async def generate_migration_report(self, plsql_files: Dict[str, str],
                                       ast_results: Dict[str, Any],
@@ -365,7 +637,8 @@ class PLSQLModernizationPipeline:
                                       repositories: Dict[str, str],
                                       services: Dict[str, str],
                                       controllers: Dict[str, str],
-                                      test_results: Dict[str, Any]):
+                                      test_results: Dict[str, Any],
+                                      repair_results: Optional[Dict[str, Any]] = None):
         """
         Generate comprehensive migration report
         
@@ -396,7 +669,11 @@ class PLSQLModernizationPipeline:
             "unit_tests_generated": len(unit_tests),
             "integration_tests_generated": len(integration_tests),
             "total_tests_generated": test_results.get('total_tests', 0),
-            "validation_passed": test_results.get('validation_passed', False)
+            "validation_passed": test_results.get('validation_passed', False),
+            "backup_llm_repair_enabled": bool((repair_results or {}).get('enabled')),
+            "backup_llm_repair_attempted": bool((repair_results or {}).get('attempted')),
+            "build_validation_passed": bool((repair_results or {}).get('final_build', {}).get('success')),
+            "repair_iterations": len((repair_results or {}).get('iterations', [])),
         }
         
         # Save report to file
@@ -423,6 +700,7 @@ class PLSQLModernizationPipeline:
         services: Dict[str, str],
         controllers: Dict[str, str],
         test_results: Dict[str, Any],
+        repair_results: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build a structured result for CLI callers and API consumers."""
         unit_tests = test_results.get('unit_tests', []) if isinstance(test_results, dict) else []
@@ -440,6 +718,7 @@ class PLSQLModernizationPipeline:
             'input_files': sorted(plsql_files.keys()),
             'generated_files': output_files,
             'report_path': str(report_path) if report_path.exists() else None,
+            'repair_report_path': str(self.output_directory / 'reports' / 'repair_report.json') if (self.output_directory / 'reports' / 'repair_report.json').exists() else None,
             'summary': {
                 'plsql_files': len(plsql_files),
                 'procedures': sum(len(f.get('procedures', [])) for f in ast_results.values()),
@@ -456,6 +735,8 @@ class PLSQLModernizationPipeline:
                 'integration_tests_generated': len(integration_tests),
                 'validation_results': len(validation_results),
                 'validation_passed': test_results.get('validation_passed', False),
+                'build_validation_passed': bool((repair_results or {}).get('final_build', {}).get('success')),
+                'repair_iterations': len((repair_results or {}).get('iterations', [])),
             },
             'artifacts': {
                 'entities': sorted(entities.keys()),
@@ -465,6 +746,7 @@ class PLSQLModernizationPipeline:
                 'unit_tests': [test.test_name for test in unit_tests],
                 'integration_tests': [test.test_name for test in integration_tests],
             },
+            'repair': repair_results or {},
         }
 
     def _collect_output_files(self) -> list[Dict[str, Any]]:

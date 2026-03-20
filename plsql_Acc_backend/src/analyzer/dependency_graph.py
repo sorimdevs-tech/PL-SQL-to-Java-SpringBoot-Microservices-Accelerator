@@ -371,6 +371,15 @@ class DependencyAnalyzer:
     
     def _generate_dependency_report(self) -> Dict[str, Any]:
         """Generate comprehensive dependency report"""
+        # LCE-FIX: collect all components of type 'table' into a dedicated list.
+        # This list is consumed by llm_engine._prepare_conversion_context() to build
+        # entity_names and repository_names for the LLM prompt. Without this key,
+        # dependency_graph.get('tables', []) always returns [] and the LLM receives
+        # empty entity/repo lists, causing it to invent CrudRepository<Object, Long>.
+        table_names = sorted(
+            name for name, comp in self.components.items()
+            if comp.type == 'table'
+        )
         report = {
             'total_components': len(self.components),
             'total_dependencies': len(self.dependencies),
@@ -378,7 +387,8 @@ class DependencyAnalyzer:
             'circular_dependencies': [],
             'orphaned_components': [],
             'highly_connected_components': [],
-            'dependency_depth': {}
+            'dependency_depth': {},
+            'tables': table_names,
         }
         
         # Count dependency types

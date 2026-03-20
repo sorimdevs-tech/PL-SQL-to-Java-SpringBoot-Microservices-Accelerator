@@ -18,6 +18,134 @@ FIXES APPLIED:
   SBG-13 : build.gradle missing from summary for Gradle projects
   SBG-14 : GenerationType.IDENTITY incompatible with Oracle sequences
   SBG-15 : README.md written twice by two separate methods
+  SBG-16 : Wrong entity import in services whose class names don't match table
+             names (e.g. ManageCustomerService -> ManageCustomer,
+             OrderProcessingService -> OrderProcessing). Root causes:
+             (a) _derive_entity_name() stripped 'Service' and returned the raw
+                 remainder without ever consulting _ddl_table_map, so procedure-
+                 named services always got a non-existent entity class imported.
+             (b) _ddl_table_map was never populated before service files were
+                 processed in _generate_java_files() / generate_services(),
+                 so even the DDL-aware resolution path was always skipped.
+             Fix: _derive_entity_name() now always tries _resolve_entity_from_ddl
+             first and only falls back to the raw base when no table matches.
+             _generate_java_files() and generate_services() both pre-populate
+             _ddl_table_map from entity class names before touching any service.
+  SBG-17 : Controller files never generated — folder created but always empty.
+             Root cause: generate_controllers() is a standalone public method
+             that was never called from generate_project() / _generate_java_files().
+             Fix: _generate_java_files() now calls _generate_controllers_from_services()
+             after all service files are written. For standard CRUD services it
+             delegates to the existing _generate_controller(). For procedure-style
+             action-switch services (INSERT/UPDATE/DELETE/SELECT) that returned ""
+             from _generate_controller(), a new _generate_action_dispatch_controller()
+             generates a POST /action endpoint with an inner ActionRequest DTO.
+  SBG-19 : bootJar task fails with 'getDirMode()' error on Gradle < 8.8.
+             Root cause: io.spring.dependency-management 1.1.7 was hardcoded in
+             generateGradleBuild(). Version 1.1.7 calls the getDirMode() API
+             introduced in Gradle 8.8, so any earlier Gradle install throws
+             'java.lang.Integer getDirMode()' at the bootJar task and aborts the
+             build — even though compileJava and processResources succeed.
+             Fix: downgraded to 1.1.4, the last version compatible with both
+             Gradle 7.x and all 8.x releases. Also added _generate_gradle_wrapper()
+             called from _generate_additional_configs() for Gradle projects, which
+             writes gradle/wrapper/gradle-wrapper.properties pinned to Gradle 8.7
+             so the build is self-contained and version-stable on any machine.
+  SBG-23 : Repositories and services written in Stage 5 (generate_project) remain
+             incomplete even after Stage 6 (generate_entities) populates _ddl_columns
+             and _ddl_table_map, because Stages 7-8 skip files already on disk.
+             Root cause: the pipeline writes repos/services in Stage 5 with empty
+             state, then Stages 7-8 detect those files as "already existing" and
+             skip them entirely — _audit_and_complete_repository and
+             _inject_crud_repository_calls never get a second chance to run with
+             the fully-populated DDL data.
+             Fix (a): generate_repositories() now re-reads every .java file already
+             on disk in the repository directory, runs _normalize_repository_code()
+             (which includes the full audit) again with populated _ddl_columns, and
+             overwrites the file if anything changed — adding missing INSERT/DELETE,
+             fixing incomplete UPDATE SET clauses, and correcting missing @Param.
+             Fix (b): generate_services() now re-reads every .java file already on
+             disk in the service directory, runs _normalize_service_code() again with
+             populated _ddl_table_map, and overwrites if changed — fixing wrong entity
+             imports, injecting @Autowired repos, and replacing stub switch cases.
+             Fix (c): added _ensure_repo_params() helper that adds @Param("name")
+             to any @Query method parameter that is missing it.
+             (a) _audit_and_complete_repository silently bailed when _ddl_columns
+                 was empty. _ddl_columns is only set in generate_entities() (Stage 6)
+                 but repository normalisation runs in Stage 5 generate_project().
+                 Fix: _generate_java_files() and generate_repositories() now call
+                 the new _extract_columns_from_entity_code() helper to populate
+                 _ddl_columns from entity Java source before any repository runs.
+             (b) _inject_crud_repository_calls missed the mixed stub pattern where
+                 the LLM writes '// TODO: ...' comment followed by a throw on the
+                 next line — Pattern A needs a break;, Pattern B needs no comment.
+                 Fix: added Pattern C that matches // TODO + throw together.
+             (c) UPDATE audit regex only matched native SQL table names (e.g.
+                 'UPDATE customers SET') but LLM often generates JPQL (e.g.
+                 'UPDATE CustomersEntity c SET'). Fix: update_match now tests
+                 both the table_lower form and the EntityClass Pascal form, and
+                 rebuilds the corrected query in the same style (JPQL vs native)
+                 as the original.
+             (a) FK entity field names generated as 'customersentity'/'ordersentity'
+                 instead of 'customersEntity'/'ordersEntity'. Root cause:
+                 _generate_entity_from_ddl() used _to_lower_camel_case(ref_entity)
+                 which calls _to_camel_case() internally — this lowercases every
+                 character except the first of each underscore-split token, so
+                 'CustomersEntity' (no underscores) became 'customersentity'.
+                 Fix: use _lower_first(ref_entity) which only lowercases the very
+                 first character, preserving interior PascalCase.
+             (b) LLM generates bare entity class names ('Customer', 'Order') that
+                 don't exist instead of the correct DDL-derived names
+                 ('CustomersEntity', 'OrdersEntity') in service bodies and
+                 lowercase entity names ('paymentsEntity') in repository JPQL.
+                 Fix: _normalize_service_code() now replaces every wrong raw name
+                 with its DDL-resolved entity class after body extraction.
+                 _normalize_repository_code() now corrects any lowercase entity
+                 class name in JPQL queries and JpaRepository<> generics.
+             (1-3) Services had no @Autowired repository and no real logic.
+                   Root cause A: _inject_crud_repository_calls only triggered on
+                   '// TODO' — when LLM threw BusinessException("not implemented")
+                   instead of a TODO comment, the injector skipped the entire
+                   method body. Root cause B: @Autowired repo field was never
+                   injected into the class even when the injector did fire.
+                   Fix: _inject_crud_repository_calls now detects both TODO stubs
+                   and throw-not-implemented stubs, always injects the @Autowired
+                   repo field, and replaces both stub patterns with real repo calls.
+             (4)   OrdersRepository.updateOrderStatus() only set status, missing
+                   the amount column that the SQL procedure also updates.
+                   Root cause: LLM generated incomplete UPDATE and generator had
+                   no validation. Fix: new _audit_and_complete_repository() method
+                   called from _normalize_repository_code() rebuilds the UPDATE
+                   SET clause to include every non-PK non-CREATED_AT column.
+             (5)   PaymentsRepository had no insertPayment() or deletePayment().
+                   Root cause: LLM omitted operations and generator had no safety
+                   net. Fix: _audit_and_complete_repository() detects missing
+                   INSERT/DELETE operations and generates them from DDL column data.
+             (6)   Entities used plain Long for FK columns with no @ManyToOne/
+                   @JoinColumn. Root cause: ALTER TABLE FK constraints were never
+                   parsed — sql_table_discovery.py only reads CREATE TABLE bodies.
+                   Fix: new parse_fk_constraints() static method parses ALTER TABLE
+                   FOREIGN KEY statements; generate_entities() accepts an fk_map
+                   parameter and passes per-table FK lists to _generate_entity_from_ddl()
+                   which now emits @ManyToOne(fetch=LAZY) + @JoinColumn instead of
+                   a plain Long field for every FK column.
+             generate_controllers) produced 0 results when called standalone
+             after generate_project() because shared state was never populated.
+             Three root causes:
+             (a) generate_repositories(): _latest_java_code was only set inside
+                 generate_project(), so the referenced-repository scan always
+                 returned an empty set, and _ddl_table_map was empty so entity
+                 name resolution was skipped.
+             (b) generate_controllers(): only called _generate_controller() which
+                 returns "" for procedure-style action-switch services, so all
+                 3 services were silently skipped every time.
+             Fix (a): generate_repositories() now rebuilds _ddl_table_map from
+             on-disk entity files AND the passed entities dict, and rebuilds
+             _latest_java_code by reading already-written service/repository Java
+             files from disk before the referenced-repository scan runs.
+             Fix (b): generate_controllers() now mirrors the two-path logic of
+             _generate_controllers_from_services(): standard CRUD first, then
+             action-dispatch fallback for procedure-style services.
 """
 
 import os
@@ -61,6 +189,106 @@ class BuildDependency:
 
     def key(self) -> tuple:
         return (self.group, self.artifact)
+
+
+def _dedupe_annotation_block(code: str) -> str:
+    """
+    SBG-26 FIX: Remove duplicate @Modifying / @Transactional annotations from a
+    repository body. The LLM (and the re-audit pipeline) sometimes writes both
+    annotations twice in a row before a single @Query:
+
+        @Modifying
+        @Transactional
+            @Modifying       <- duplicate
+        @Transactional       <- duplicate
+        @Query(...)
+
+    Strategy: scan lines sequentially; track which Spring-Data annotations have
+    already appeared in the current consecutive annotation block (reset on any
+    non-annotation, non-blank line). Skip a line if its annotation was already
+    seen in this block.
+    """
+    REPO_ANNOTATIONS = {'@Modifying', '@Transactional', '@Query', '@Repository'}
+    lines = code.splitlines(keepends=True)
+    result = []
+    # Set of bare annotation names (@Modifying etc.) seen in the current block
+    block_seen: set = set()
+
+    for line in lines:
+        stripped = line.strip()
+        bare = stripped.split('(')[0].strip()  # "@Modifying" from "@Modifying(clearAutomatically=true)"
+
+        if bare in ('@Modifying', '@Transactional'):
+            if bare in block_seen:
+                continue  # drop duplicate within this consecutive annotation block
+            block_seen.add(bare)
+        else:
+            # Any non-annotation or blank line ends the current block
+            if stripped:
+                block_seen = set()
+        result.append(line)
+    return ''.join(result)
+
+
+def _collapse_repository_query_annotations(code: str) -> str:
+    """
+    Deterministically normalize any modifier/transaction annotation block that
+    appears immediately before a repository @Query method.
+
+    This is stricter than _dedupe_annotation_block(): for every consecutive
+    annotation run that ends in @Query, force the prefix to contain at most one
+    @Modifying and at most one @Transactional, in that order.
+    """
+    pattern = re.compile(
+        r'(?P<prefix>(?:[ \t]*@(?:Modifying|Transactional)[^\n]*\n)+)(?P<query>[ \t]*@Query\s*\()',
+        re.MULTILINE,
+    )
+
+    def repl(match: re.Match) -> str:
+        prefix = match.group('prefix')
+        query = match.group('query')
+        indent_match = re.search(r'(^[ \t]*)@', prefix, re.MULTILINE)
+        indent = indent_match.group(1) if indent_match else ''
+        lines = []
+        if re.search(r'^[ \t]*@Modifying\b', prefix, re.MULTILINE):
+            lines.append(f'{indent}@Modifying\n')
+        if re.search(r'^[ \t]*@Transactional\b', prefix, re.MULTILINE):
+            lines.append(f'{indent}@Transactional\n')
+        return ''.join(lines) + query
+
+    return pattern.sub(repl, code)
+
+
+def _strip_llm_trailing_garbage(code: str) -> str:
+    """
+    SBG-27 FIX: The LLM sometimes appends extra content after the closing brace
+    of the class (e.g. placeholder imports, bare @Entity annotations, comments).
+    This is illegal Java and causes compile errors.
+
+    Strategy: find the last '}' that closes a top-level class/interface declaration
+    by tracking brace depth from the first 'public class/interface' line.
+    Everything after that closing brace is discarded.
+    """
+    lines = code.splitlines(keepends=True)
+    depth = 0
+    in_class = False
+    last_close_line = -1
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Detect start of top-level type declaration
+        if not in_class:
+            if re.search(r'\b(class|interface|enum|record)\b', stripped):
+                in_class = True
+        if in_class:
+            depth += line.count('{') - line.count('}')
+            if depth <= 0 and '{'  in code[:sum(len(l) for l in lines[:i+1])]:
+                last_close_line = i
+                break  # found the closing brace of the outermost type
+
+    if last_close_line >= 0 and last_close_line < len(lines) - 1:
+        return ''.join(lines[:last_close_line + 1])
+    return code
 
 
 class SpringBootGenerator:
@@ -197,6 +425,8 @@ class SpringBootGenerator:
         self._existing_repositories: Set[str] = set()
         self._ddl_table_map: Dict[str, str] = {}
         self._entity_name_index: Dict[str, str] = {}
+        self._ddl_columns: Dict[str, List[Dict[str, str]]] = {}   # SBG-20: table -> columns
+        self._fk_map: Dict[str, List[Dict[str, str]]] = {}        # SBG-20: table -> FK list
 
         self.base_path = self.target_directory / 'src' / 'main' / 'java'
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -535,6 +765,8 @@ class SpringBootGenerator:
             BuildDependency("org.springframework.boot", "spring-boot-starter-test", scope="test", gradle_configuration="testImplementation"),
             BuildDependency("org.testcontainers", "testcontainers", scope="test", gradle_configuration="testImplementation"),
             BuildDependency("org.testcontainers", "junit-jupiter", scope="test", gradle_configuration="testImplementation"),
+            # SBG-24: H2 in-memory DB for context-load tests (avoids Oracle DDL during test)
+            BuildDependency("com.h2database", "h2", scope="test", gradle_configuration="testRuntimeOnly"),
             BuildDependency("org.springframework.boot", "spring-boot-devtools", scope="runtime", optional=True, gradle_configuration="developmentOnly"),
         ])
 
@@ -880,9 +1112,12 @@ bootWar {
     enabled = true
 }
 """
+        # SBG-19 FIX: io.spring.dependency-management 1.1.7 requires Gradle 8.8+
+        # and its getDirMode() API change breaks bootJar on older Gradle installs.
+        # 1.1.4 is the last version compatible with Gradle 7.x and all 8.x releases.
         return f"""plugins {{
     id 'org.springframework.boot' version '{self.spring_boot_version}'
-    id 'io.spring.dependency-management' version '1.1.3'
+    id 'io.spring.dependency-management' version '1.1.4'
     id 'java'
 {war_plugin}}}
 
@@ -897,6 +1132,12 @@ java {{
 
 repositories {{
     mavenCentral()
+}}
+
+configurations {{
+    compileOnly {{
+        extendsFrom annotationProcessor
+    }}
 }}
 
 dependencies {{
@@ -1016,6 +1257,33 @@ app.build-time={self._get_current_time()}
     def _generate_java_files(self, java_code: Dict[str, str]) -> Dict[str, str]:
         java_files = {}
 
+        # SBG-16 FIX: Build _ddl_table_map from entity class names BEFORE
+        # processing service files so that _derive_entity_name can resolve
+        # procedure-named services (e.g. ManageCustomerService -> CustomersEntity)
+        # against the real entity set rather than guessing from the class name.
+        # SBG-22 FIX: Also populate _ddl_columns from entity source code so that
+        # _audit_and_complete_repository has column data when it runs during this
+        # same stage — it previously bailed silently because _ddl_columns was only
+        # set inside generate_entities() which runs after generate_project().
+        if not self._ddl_table_map:
+            for filename, code in java_code.items():
+                file_type = self._classify_java_file(filename, code)
+                if file_type != 'entity':
+                    continue
+                type_name = self._extract_type_name(code)
+                if not type_name:
+                    continue
+                base = type_name[:-6] if type_name.lower().endswith('entity') else type_name
+                key = base.lower()
+                self._ddl_table_map[key] = base.upper()
+                if key.endswith('s'):
+                    self._ddl_table_map[key[:-1]] = base.upper()
+                # SBG-22: extract column info from the entity source so
+                # _audit_and_complete_repository can rebuild missing operations
+                if not self._ddl_columns.get(base.upper()):
+                    self._ddl_columns[base.upper()] = \
+                        self._extract_columns_from_entity_code(code)
+
         for filename, code in java_code.items():
             type_name = self._extract_type_name(code)
             if (type_name in {'JpaRepository', 'CrudRepository'}
@@ -1045,28 +1313,204 @@ app.build-time={self._get_current_time()}
             java_files[target_filename] = str(file_path)
 
         self._generate_additional_java_files()
+
+        # SBG-17 FIX: controllers were never generated from generate_project()
+        # because generate_controllers() is a separate public method that was
+        # never called from within the main pipeline. Fix: after all service
+        # files are written, derive and write a controller for each service.
+        self._generate_controllers_from_services(java_files)
+
         logger.info(f"Generated {len(java_files)} Java source files")
         return java_files
+
+    def _generate_controllers_from_services(self, java_files: Dict[str, str]) -> None:
+        """
+        SBG-17 FIX: Generate one controller per service and write it to the
+        controller package directory.  This is called at the end of
+        _generate_java_files() so that controllers are always produced as part
+        of the main generate_project() pipeline without requiring a separate
+        generate_controllers() call.
+
+        For procedure-style services (manageCustomer / processOrder / handlePayment)
+        the service methods are action-switch based and don't expose getAll/create
+        etc., so the guard in _generate_controller() would return "" and skip them.
+        For those we generate a thin action-dispatch controller instead.
+        """
+        controller_dir = self.package_path / 'controller'
+        controller_dir.mkdir(parents=True, exist_ok=True)
+
+        for filename, filepath in list(java_files.items()):
+            if not filename.lower().endswith('service.java'):
+                continue
+
+            service_name = filename.replace('.java', '')
+
+            # Read back the already-written service code so we can inspect it
+            try:
+                with open(filepath, encoding='utf-8') as fh:
+                    service_code = fh.read()
+            except OSError:
+                continue
+
+            # Try the standard CRUD-method based controller first
+            controller_code = self._generate_controller(service_name, service_code)
+
+            # SBG-17: if the service uses an action-switch pattern (INSERT/UPDATE/
+            # DELETE/SELECT) rather than getAll/create/etc., _generate_controller
+            # returns "" because none of its regexes match.  Generate a proper
+            # action-dispatch REST controller for those services instead.
+            if not controller_code:
+                controller_code = self._generate_action_dispatch_controller(
+                    service_name, service_code
+                )
+
+            if not controller_code:
+                continue
+
+            controller_name = service_name.replace('Service', '') + 'Controller'
+            controller_filename = f"{controller_name}.java"
+            controller_path = controller_dir / controller_filename
+
+            normalized = self._normalize_controller_code(controller_filename, controller_code)
+            with open(controller_path, 'w', encoding='utf-8') as fh:
+                fh.write(normalized)
+
+            java_files[controller_filename] = str(controller_path)
+            logger.info(f"Generated controller: {controller_filename}")
+
+    def _generate_action_dispatch_controller(self, service_name: str, service_code: str) -> str:
+        """
+        SBG-17 FIX: Generate a REST controller for procedure-style services that
+        use an action-switch (INSERT/UPDATE/DELETE/SELECT) instead of named CRUD
+        methods.  Each action is exposed as a POST endpoint so the caller can
+        pass the action and parameters as a JSON body.
+
+        Introspects the service method signature to forward the right parameters.
+        """
+        # Find the primary public method in the service
+        method_match = re.search(
+            r'public\s+\w+\s+(\w+)\s*\(([^)]*)\)', service_code
+        )
+        if not method_match:
+            return ""
+
+        method_name = method_match.group(1)
+        # Skip constructor-like or lifecycle names
+        if method_name in ('class', 'interface', 'void'):
+            return ""
+
+        entity_base = service_name.replace('Service', '')
+        service_var = service_name[0].lower() + service_name[1:]
+
+        # Parse parameter list to build the forwarding call
+        raw_params = method_match.group(2).strip()
+        param_pairs = [p.strip() for p in raw_params.split(',') if p.strip()]
+        # Each pair is "Type name"; collect names for the forwarding call
+        param_names = []
+        field_declarations = []
+        for pair in param_pairs:
+            parts = pair.split()
+            if len(parts) >= 2:
+                ptype, pname = parts[0], parts[-1]
+                param_names.append(pname)
+                field_declarations.append(f"        private {ptype} {pname};")
+
+        fields_block = '\n'.join(field_declarations)
+        call_args = ', '.join(f"request.get{p[0].upper()+p[1:]}()" for p in param_names)
+
+        needs_big_decimal = 'BigDecimal' in raw_params
+        needs_list = 'List<' in raw_params
+
+        import_extras = ''
+        if needs_big_decimal:
+            import_extras += '\nimport java.math.BigDecimal;'
+        if needs_list:
+            import_extras += '\nimport java.util.List;'
+
+        return f"""package {self.package_name}.controller;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import {self.package_name}.service.{service_name};{import_extras}
+
+@RestController
+@RequestMapping("/api/{entity_base.lower()}")
+public class {entity_base}Controller {{
+
+    @Autowired
+    private {service_name} {service_var};
+
+    /**
+     * Action-dispatch endpoint.
+     * Pass a JSON body with an "action" field (INSERT / UPDATE / DELETE / SELECT)
+     * plus the procedure parameters.
+     */
+    @PostMapping("/action")
+    public ResponseEntity<?> executeAction(@RequestBody {entity_base}ActionRequest request) {{
+        {service_var}.{method_name}({call_args});
+        return ResponseEntity.ok().build();
+    }}
+
+    /**
+     * Request DTO for action-dispatch.
+     */
+    public static class {entity_base}ActionRequest {{
+{fields_block}
+
+{self._generate_request_accessors(param_pairs)}    }}
+}}
+"""
+
+    def _generate_request_accessors(self, param_pairs: list) -> str:
+        """Generate getters and setters for the inner ActionRequest DTO."""
+        lines = []
+        for pair in param_pairs:
+            parts = pair.split()
+            if len(parts) < 2:
+                continue
+            ptype, pname = parts[0], parts[-1]
+            cap = pname[0].upper() + pname[1:]
+            lines.append(f"        public {ptype} get{cap}() {{ return {pname}; }}")
+            lines.append(f"        public void set{cap}({ptype} {pname}) {{ this.{pname} = {pname}; }}")
+        return '\n'.join(lines) + '\n' if lines else ''
 
     def _classify_java_file(self, filename: str, code: str) -> str:
         """
         SBG-10 FIX: repository/JPA check runs BEFORE entity annotation check.
-        A repository interface importing entities will not be misclassified.
+        SBG-27 FIX: Strip LLM trailing garbage before classification so that
+        @Entity / JpaRepository appearing AFTER the class closing brace (LLM
+        placeholder comments) don't misclassify service files as entity/repo.
+        Priority order: @Service/@Controller structural annotations first.
         """
+        # Strip garbage appended after the class closing brace
+        clean = _strip_llm_trailing_garbage(code)
         filename_lower = filename.lower()
 
-        # Repository check FIRST (fixes SBG-10)
-        if 'JpaRepository' in code or 'CrudRepository' in code or '@Repository' in code:
+        # PRIORITY 1: Structural annotations in clean code take precedence over everything
+        if '@Service' in clean:
+            return 'service'
+        if '@RestController' in clean or '@Controller' in clean:
+            return 'controller'
+
+        # PRIORITY 2: Repository (SBG-10: check before @Entity/@Id)
+        if ('extends JpaRepository' in clean or 'extends CrudRepository' in clean
+                or '@Repository' in clean):
+            return 'repository'
+        if 'JpaRepository' in clean or 'CrudRepository' in clean:
             return 'repository'
         if 'repository' in filename_lower or 'dao' in filename_lower:
             return 'repository'
 
-        # Then entity
-        if any(token in code for token in ('@Entity', '@Table', '@Id', '@Column')):
+        # PRIORITY 3: Entity — only from clean code (ignores stray @Entity in garbage)
+        if any(token in clean for token in ('@Entity', '@Table')):
+            return 'entity'
+        if '@Id' in clean and '@Column' in clean:
             return 'entity'
         if 'entity' in filename_lower or 'model' in filename_lower:
             return 'entity'
 
+        # PRIORITY 4: Filename heuristics
         if 'controller' in filename_lower or 'rest' in filename_lower:
             return 'controller'
         if 'service' in filename_lower:
@@ -1078,13 +1522,7 @@ app.build-time={self._get_current_time()}
         if 'config' in filename_lower:
             return 'config'
 
-        if '@RestController' in code or '@Controller' in code:
-            return 'controller'
-        if '@Service' in code:
-            return 'service'
-        if '@Entity' in code:
-            return 'entity'
-        if '@Configuration' in code:
+        if '@Configuration' in clean:
             return 'config'
 
         return 'service'
@@ -1156,15 +1594,29 @@ app.build-time={self._get_current_time()}
         logger.info(f"Generated {generated} test files")
 
     def _generate_service_test(self, service_class: str) -> str:
+        # SBG-24 FIX: @SpringBootTest with only @MockBean DataSource still lets
+        # Hibernate attempt schema validation (DdlTransactionIsolatorNonJtaImpl)
+        # against the mocked DataSource, causing NullPointerException.
+        # Fix: use @SpringBootTest(properties = {...}) to disable ddl-auto and
+        # redirect datasource to an in-memory H2 instance so the context loads
+        # cleanly without any real Oracle connection or DDL execution.
         return f"""package {self.package_name}.service;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import {self.package_name}.repository.*;
 import javax.sql.DataSource;
 
-@SpringBootTest
+@SpringBootTest(properties = {{
+    "spring.datasource.url=jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1",
+    "spring.datasource.driver-class-name=org.h2.Driver",
+    "spring.datasource.username=sa",
+    "spring.datasource.password=",
+    "spring.jpa.hibernate.ddl-auto=none",
+    "spring.jpa.database-platform=org.hibernate.dialect.H2Dialect"
+}})
 class {service_class}Test {{
 
     @MockBean
@@ -1188,7 +1640,14 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import javax.sql.DataSource;
 
-@SpringBootTest
+@SpringBootTest(properties = {{
+    "spring.datasource.url=jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1",
+    "spring.datasource.driver-class-name=org.h2.Driver",
+    "spring.datasource.username=sa",
+    "spring.datasource.password=",
+    "spring.jpa.hibernate.ddl-auto=none",
+    "spring.jpa.database-platform=org.hibernate.dialect.H2Dialect"
+}})
 class {app_class}ApplicationTests {{
 
     @MockBean
@@ -1311,6 +1770,48 @@ public class SwaggerConfig {{
     }}
 }}
 """,
+            'GlobalExceptionHandler': f"""package {self.package_name}.config;
+
+import {self.package_name}.exception.BusinessException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.time.LocalDateTime;
+import java.util.Map;
+
+/**
+ * Global exception handler — converts exceptions to clean JSON responses.
+ */
+@RestControllerAdvice
+public class GlobalExceptionHandler {{
+
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<Map<String, Object>> handleBusiness(BusinessException ex) {{
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                "error", ex.getMessage(),
+                "timestamp", LocalDateTime.now().toString()
+        ));
+    }}
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, Object>> handleIllegalArg(IllegalArgumentException ex) {{
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                "error", ex.getMessage(),
+                "timestamp", LocalDateTime.now().toString()
+        ));
+    }}
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, Object>> handleGeneral(Exception ex) {{
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                "error", "Internal server error: " + ex.getMessage(),
+                "timestamp", LocalDateTime.now().toString()
+        ));
+    }}
+}}
+""",
         }
 
     def _generate_additional_configs(self):
@@ -1322,9 +1823,37 @@ public class SwaggerConfig {{
         with open(self.target_directory / '.gitignore', 'w', encoding='utf-8') as f:
             f.write(gitignore)
 
+        # SBG-19 FIX: generate Gradle wrapper for Gradle projects so the build
+        # always uses a pinned, compatible Gradle version regardless of what is
+        # installed on the developer's machine.
+        if self.build_tool == 'gradle':
+            self._generate_gradle_wrapper()
+
         # SBG-15: _generate_additional_configs no longer writes README
         # README is written exclusively by _generate_readme() called from generate_project()
         logger.info("Additional configuration files generated")
+
+    def _generate_gradle_wrapper(self):
+        """
+        SBG-19 FIX: Write gradle/wrapper/gradle-wrapper.properties pinned to
+        Gradle 8.7, which is the latest release fully compatible with
+        io.spring.dependency-management 1.1.4 and Spring Boot 3.2.x.
+        This prevents the getDirMode() API breakage introduced in Gradle 8.8.
+        """
+        wrapper_dir = self.target_directory / 'gradle' / 'wrapper'
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        props = (
+            "distributionBase=GRADLE_USER_HOME\n"
+            "distributionPath=wrapper/dists\n"
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.7-bin.zip\n"
+            "networkTimeout=10000\n"
+            "validateDistributionUrl=true\n"
+            "zipStoreBase=GRADLE_USER_HOME\n"
+            "zipStorePath=wrapper/dists\n"
+        )
+        with open(wrapper_dir / 'gradle-wrapper.properties', 'w', encoding='utf-8') as f:
+            f.write(props)
+        logger.info("Gradle wrapper properties generated (Gradle 8.7)")
 
     def _generate_dockerfile(self) -> str:
         return f"""FROM openjdk:{self.java_version}-jdk-slim
@@ -1490,16 +2019,34 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
             return "BigDecimal"
         return "String"
 
-    def _generate_entity_from_ddl(self, entity_name: str, table_name: str, columns: List[Dict[str, str]]) -> str:
+    def _generate_entity_from_ddl(self, entity_name: str, table_name: str, columns: List[Dict[str, str]], fk_list: Optional[List[Dict[str, str]]] = None) -> str:
+        """
+        SBG-20 FIX (Issue 6): accepts fk_list (list of dicts with keys
+        'column', 'ref_table', 'ref_column') and emits @ManyToOne + @JoinColumn
+        for every FK column instead of a plain Long field.
+        """
         import_lines = ['import jakarta.persistence.*;']
         field_lines = []
         accessor_lines = []
+        fk_list = fk_list or []
+
+        # Build a quick lookup: fk_column_name (upper) -> ref_table_name
+        fk_lookup: Dict[str, str] = {
+            fk['column'].upper(): fk['ref_table']
+            for fk in fk_list
+            if 'column' in fk and 'ref_table' in fk
+        }
 
         id_column = None
         for col in columns:
             if col["name"].upper() == "ID":
                 id_column = col["name"]
                 break
+        if not id_column:
+            for col in columns:
+                if col["name"].upper().endswith("_ID") and col["name"].upper() not in fk_lookup:
+                    id_column = col["name"]
+                    break
         if not id_column:
             for col in columns:
                 if col["name"].upper().endswith("_ID"):
@@ -1518,18 +2065,55 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
 
             field_name = self._to_lower_camel_case(col_name)
             annotations = []
-            if col_name == id_column:
+
+            # ── PK column ───────────────────────────────────────────────────
+            if col_name == id_column.upper():
                 annotations.append("@Id")
                 if self._is_numeric_type(col.get("type", "")):
-                    # SBG-14: use SEQUENCE strategy for Oracle compatibility
                     seq_name = f"{table_name.lower()}_seq"
                     annotations.append(
                         f'@SequenceGenerator(name = "seq_{field_name}", sequenceName = "{seq_name}", allocationSize = 1)'
                     )
-                    annotations.append('@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "seq_' + field_name + '")')
-            annotations.append(f'@Column(name = "{col_name}")')
-            field_lines.append("\n".join(f"    {a}" for a in annotations))
-            field_lines.append(f"    private {java_type} {field_name};\n")
+                    annotations.append(
+                        f'@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "seq_{field_name}")'
+                    )
+                annotations.append(f'@Column(name = "{col_name}")')
+                field_lines.append("\n".join(f"    {a}" for a in annotations))
+                field_lines.append(f"    private {java_type} {field_name};\n")
+
+            # ── FK column → @ManyToOne / @JoinColumn ────────────────────────
+            elif col_name in fk_lookup:
+                ref_table = fk_lookup[col_name]
+                ref_entity = f"{self._to_camel_case(ref_table.lower())}Entity"
+                ref_entity = self._normalize_entity_name(ref_entity)
+                # SBG-21 FIX: use lower_first() not _to_lower_camel_case() here.
+                # _to_lower_camel_case() calls _to_camel_case() which lowercases
+                # every character except the first of each underscore-split word,
+                # so 'CustomersEntity' (no underscores) becomes 'customersentity'.
+                # lower_first() preserves the interior PascalCase: 'customersEntity'.
+                ref_field = self._lower_first(ref_entity)
+                annotations.append("@ManyToOne(fetch = FetchType.LAZY)")
+                annotations.append(f'@JoinColumn(name = "{col_name}")')
+                field_lines.append("\n".join(f"    {a}" for a in annotations))
+                field_lines.append(f"    private {ref_entity} {ref_field};\n")
+                # Getter/setter use the entity type, not Long
+                accessor_lines.append(
+                    f"""    public {ref_entity} get{self._capitalize_first(ref_field)}() {{
+        return {ref_field};
+    }}
+
+    public void set{self._capitalize_first(ref_field)}({ref_entity} {ref_field}) {{
+        this.{ref_field} = {ref_field};
+    }}
+"""
+                )
+                continue  # accessor already appended
+
+            # ── Regular column ───────────────────────────────────────────────
+            else:
+                annotations.append(f'@Column(name = "{col_name}")')
+                field_lines.append("\n".join(f"    {a}" for a in annotations))
+                field_lines.append(f"    private {java_type} {field_name};\n")
 
             accessor_lines.append(
                 f"""    public {java_type} get{self._capitalize_first(field_name)}() {{
@@ -1615,6 +2199,54 @@ public class {normalized_entity_name} {{
 """
 
     def generate_repositories(self, entities: Dict[str, str]) -> Dict[str, str]:
+        # SBG-18 FIX: when called standalone (Stage 7 in the pipeline, after
+        # generate_project/generate_entities), _latest_java_code and
+        # _ddl_table_map may be empty because they are only set inside
+        # generate_project().  Rebuild both from the already-written entity
+        # files on disk and from the entities dict passed in.
+        #
+        # (a) Rebuild _ddl_table_map from entity filenames so that repository
+        #     generation can resolve entity names correctly.
+        if not self._ddl_table_map:
+            entity_dir = self.package_path / 'entity'
+            if entity_dir.exists():
+                for ef in entity_dir.glob('*.java'):
+                    ename = ef.stem
+                    base = ename[:-6] if ename.lower().endswith('entity') else ename
+                    key = base.lower()
+                    self._ddl_table_map[key] = base.upper()
+                    if key.endswith('s'):
+                        self._ddl_table_map[key[:-1]] = base.upper()
+                    # SBG-22: extract columns so _audit_and_complete_repository works
+                    if not self._ddl_columns.get(base.upper()):
+                        try:
+                            code = ef.read_text(encoding='utf-8')
+                            self._ddl_columns[base.upper()] = \
+                                self._extract_columns_from_entity_code(code)
+                        except OSError:
+                            pass
+            # Also index from the entities dict itself
+            for fname in entities:
+                ename = fname.replace('.java', '')
+                base = ename[:-6] if ename.lower().endswith('entity') else ename
+                key = base.lower()
+                self._ddl_table_map.setdefault(key, base.upper())
+                if key.endswith('s'):
+                    self._ddl_table_map.setdefault(key[:-1], base.upper())
+
+        # (b) Rebuild _latest_java_code by reading every already-written Java
+        #     file from the service directory so referenced-repository scanning works.
+        if not getattr(self, '_latest_java_code', None):
+            self._latest_java_code = {}
+            for sub in ('service', 'repository', 'controller'):
+                sub_dir = self.package_path / sub
+                if sub_dir.exists():
+                    for jf in sub_dir.glob('*.java'):
+                        try:
+                            self._latest_java_code[jf.name] = jf.read_text(encoding='utf-8')
+                        except OSError:
+                            pass
+
         repositories = {}
 
         repo_dir = self.package_path / 'repository'
@@ -1623,6 +2255,32 @@ public class {normalized_entity_name} {{
             for repo_file in repo_dir.glob('*.java'):
                 existing_repo_names.add(repo_file.stem)
         existing_repo_names.update(self._existing_repositories)
+
+        # SBG-23 FIX: Re-audit repositories that were already written to disk
+        # during Stage 5 (generate_project). At that point _ddl_columns was empty
+        # so _audit_and_complete_repository bailed silently leaving repos incomplete
+        # (missing INSERT/DELETE, incomplete UPDATE columns, missing @Param).
+        # Now that Stage 6 (generate_entities) has populated _ddl_columns and
+        # _ddl_table_map, re-read every existing repo, run the full audit/complete
+        # pipeline on it, and overwrite the file if anything changed.
+        if repo_dir.exists() and self._ddl_columns:
+            for repo_file in sorted(repo_dir.glob('*.java')):
+                try:
+                    original = repo_file.read_text(encoding='utf-8')
+                except OSError:
+                    continue
+
+                # Strip package+imports then run normalize (which calls audit)
+                audited = self._normalize_repository_code(
+                    repo_file.name, original, self._ddl_table_map
+                )
+                # Also ensure every @Query method has @Param on all its parameters
+                audited = self._ensure_repo_params(audited)
+
+                if audited != original:
+                    repo_file.write_text(audited, encoding='utf-8')
+                    repositories[repo_file.name] = audited
+                    logger.info(f"Re-audited repository: {repo_file.name}")
 
         referenced_repo_names: Set[str] = set()
         for code in (getattr(self, "_latest_java_code", {}) or {}).values():
@@ -1696,7 +2354,45 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 """
 
     def generate_services(self, java_code: Dict[str, str]) -> Dict[str, str]:
+        # SBG-16 FIX: ensure _ddl_table_map is populated from entity sources
+        # before normalising any service, so that _derive_entity_name can map
+        # procedure-named services to the correct entity class.
+        if not self._ddl_table_map:
+            for filename, code in java_code.items():
+                file_type = self._classify_java_file(filename, code)
+                if file_type != 'entity':
+                    continue
+                type_name = self._extract_type_name(code)
+                if not type_name:
+                    continue
+                base = type_name[:-6] if type_name.lower().endswith('entity') else type_name
+                key = base.lower()
+                self._ddl_table_map[key] = base.upper()
+                if key.endswith('s'):
+                    self._ddl_table_map[key[:-1]] = base.upper()
+
         services = {}
+        service_dir = self.package_path / 'service'
+
+        # SBG-23 FIX: Re-normalise service files that were already written during
+        # Stage 5 (generate_project). At that point _ddl_table_map was empty so
+        # _derive_entity_name fell back to raw class names, entity imports were wrong,
+        # and _inject_crud_repository_calls had no repository names to inject.
+        # Now that Stage 6 has populated _ddl_table_map, re-read each service,
+        # run the full normalisation pipeline, and overwrite if anything changed.
+        if service_dir.exists() and self._ddl_table_map:
+            for svc_file in sorted(service_dir.glob('*.java')):
+                if svc_file.stem.endswith('Test'):
+                    continue
+                try:
+                    original = svc_file.read_text(encoding='utf-8')
+                except OSError:
+                    continue
+                normalised = self._normalize_service_code(svc_file.name, original)
+                if normalised != original:
+                    svc_file.write_text(normalised, encoding='utf-8')
+                    services[svc_file.name] = normalised
+                    logger.info(f"Re-normalised service: {svc_file.name}")
 
         for filename, code in java_code.items():
             class_name = None
@@ -1713,13 +2409,11 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             )
             if looks_like_service:
                 target_filename = f"{class_name}.java" if class_name else filename
-                services[target_filename] = self._normalize_service_code(target_filename, code)
-
-        service_dir = self.package_path / 'service'
-        for filename, code in services.items():
-            file_path = service_dir / filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
+                normalised = self._normalize_service_code(target_filename, code)
+                services[target_filename] = normalised
+                file_path = service_dir / target_filename
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(normalised)
 
         logger.info(f"Generated {len(services)} service classes")
         return services
@@ -1758,6 +2452,21 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.List;')
         if 'Optional<' in code:
             import_lines.append('import java.util.Optional;')
+        # FIX: add all commonly LLM-generated types that were missing
+        if 'BigDecimal' in code:
+            import_lines.append('import java.math.BigDecimal;')
+        if 'DataAccessException' in code:
+            import_lines.append('import org.springframework.dao.DataAccessException;')
+        if 'EntityManager' in code or '@PersistenceContext' in code:
+            import_lines.append('import jakarta.persistence.EntityManager;')
+            import_lines.append('import jakarta.persistence.PersistenceContext;')
+        if re.search(r'\bQuery\b', code) and 'EntityManager' in code:
+            import_lines.append('import jakarta.persistence.Query;')
+        if 'PersistenceException' in code:
+            import_lines.append('import jakarta.persistence.PersistenceException;')
+        if 'LoggerFactory' in code or re.search(r'\bLogger\b', code):
+            import_lines.append('import org.slf4j.Logger;')
+            import_lines.append('import org.slf4j.LoggerFactory;')
 
         for entity_name in entity_names:
             normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
@@ -1767,6 +2476,10 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append(f'import {self.package_name}.repository.{repository_name};')
         import_lines.append(f'import {self.package_name}.exception.BusinessException;')
         imports = '\n'.join(dict.fromkeys(import_lines))
+
+        # SBG-27 FIX: Strip any LLM-appended garbage after the class closing brace
+        # BEFORE stripping imports/package — otherwise we'd emit garbage as Java code.
+        code = _strip_llm_trailing_garbage(code)
 
         body_lines = [
             line for line in code.splitlines()
@@ -1783,8 +2496,111 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         if '@Service' not in body:
             body = body.replace(f"public class {service_name}", f"@Service\npublic class {service_name}")
 
+        # FIX: if LLM used EntityManager/createNativeQuery instead of a repository,
+        # strip the EntityManager field and force the body through the repository injector.
+        if 'createNativeQuery' in body and repository_names:
+            # Remove @PersistenceContext + EntityManager field declaration
+            body = re.sub(
+                r'\s*@PersistenceContext\s*\n\s*private\s+EntityManager\s+\w+\s*;',
+                '',
+                body,
+            )
+            # Remove any executeCreate/executeUpdate/executeDelete private helper methods
+            body = re.sub(
+                r'\s*private\s+void\s+execute\w+\([^)]*\)\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)?\}',
+                '',
+                body,
+                flags=re.DOTALL,
+            )
+            # Remove nested static exception class if present
+            body = re.sub(
+                r'\s*public\s+static\s+class\s+\w+Exception\s+extends\s+RuntimeException\s*\{[^}]*\}',
+                '',
+                body,
+            )
+            # Force inject correct repository calls now that stubs are cleared
+            body = self._inject_crud_repository_calls(body, entity_names, repository_names)
+
+        # FIX: deduplicate consecutive identical case labels produced when
+        # the CREATE→INSERT substitution fires on a body that already has INSERT.
+        body = re.sub(r'(case "[A-Z]+":\s*)\n(\s*\1)', r'\1', body)
+
+        # SBG-21 FIX: Replace wrong entity class names that the LLM invents.
+        # The LLM sometimes uses:
+        #   (a) Bare names: "Customer", "Order" instead of "CustomersEntity"
+        #   (b) ALLCAPS names: "CUSTOMERSEntity" because entity_names list was
+        #       built with a broken _to_pascal_case that didn't lowercase input.
+        # Both cause "cannot find symbol" compile errors.
+        #
+        # Two-pass replacement:
+        # Pass A (DDL-map-independent): fix ALLCAPS entity names using regex —
+        #   any token matching [A-Z]{2,}[a-z]*Entity is normalised to PascalCase.
+        #   e.g. CUSTOMERSEntity -> CustomersEntity, ORDERSEntity -> OrdersEntity
+        # Pass B (DDL-map-dependent): fix bare/wrong names using _resolve_entity_from_ddl.
+
+        # Pass A — normalise ALLCAPS entity names without needing _ddl_table_map
+        allcaps_entity_pat = re.compile(r'\b([A-Z]{2,}[A-Za-z]*)Entity\b')
+        def _normalise_allcaps_entity(m: re.Match) -> str:
+            raw = m.group(1)   # e.g. "CUSTOMERS"
+            # capitalize() lowercases then uppercases first char
+            parts = [p.capitalize() for p in re.split(r'[^A-Za-z0-9]+', raw) if p]
+            base = ''.join(parts)
+            return f'{base}Entity'
+        body = allcaps_entity_pat.sub(_normalise_allcaps_entity, body)
+
+        # Pass B — replace bare/wrong names using DDL map (only when populated)
+        if entity_names and self._ddl_table_map:
+            for raw_name in entity_names:
+                resolved, _ = self._resolve_entity_from_ddl(raw_name, self._ddl_table_map)
+                resolved = self._normalize_entity_name(resolved)
+                if resolved and resolved != raw_name:
+                    # Replace usages like "Customer var" / "new Customer()" but NOT
+                    # inside import/package lines (already stripped) or comments.
+                    wrong_pat = re.compile(r'\b' + re.escape(raw_name) + r'\b')
+                    body = wrong_pat.sub(resolved, body)
+
+        # SBG-28 FIX: Replace entity constructor calls with args with no-arg + setters.
+        # The LLM sometimes generates: new CustomersEntity(id, name, email, status)
+        # but entity classes only have no-arg constructors, causing compile errors.
+        # Detect pattern: new SomeEntity(args) and replace with no-arg constructor.
+        if self._ddl_table_map:
+            for table_key, table_val in self._ddl_table_map.items():
+                entity_pascal = f"{self._to_camel_case(table_val.lower())}Entity"
+                entity_pascal = self._normalize_entity_name(entity_pascal)
+                # Pattern: new EntityClass(one or more args)
+                ctor_pat = re.compile(
+                    r'new\s+' + re.escape(entity_pascal) + r'\s*\([^)]+\)'
+                )
+                if ctor_pat.search(body):
+                    body = ctor_pat.sub(f'new {entity_pascal}()', body)
+                    logger.debug("SBG-28: replaced parameterised %s constructor with no-arg", entity_pascal)
+
+        # SBG-25 FIX: Replace .setId( with the correct PK setter name.
+        # The LLM sometimes calls .setId(pCustomerId) on an entity whose PK field
+        # is named customerId (not id), causing "cannot find symbol: method setId()".
+        # Derive the real PK setter from _ddl_columns for each entity in scope.
+        if self._ddl_columns and entity_names and self._ddl_table_map:
+            for raw_name in entity_names:
+                _, table = self._resolve_entity_from_ddl(raw_name, self._ddl_table_map)
+                if not table:
+                    continue
+                columns = self._ddl_columns.get(table.upper(), [])
+                pk_col = next(
+                    (c for c in columns if c['name'].upper().endswith('_ID')),
+                    columns[0] if columns else None
+                )
+                if pk_col and pk_col['name'].upper() != 'ID':
+                    pk_setter = 'set' + self._capitalize_first(
+                        self._lower_first(self._to_camel_case(pk_col['name'].upper()))
+                    )
+                    # Replace .setId( -> .setPkSetter( only when .setId is NOT a real method
+                    if pk_setter != 'setId':
+                        body = re.sub(r'\b\.setId\(', f'.{pk_setter}(', body)
+
         # SBG-11: inject real repository calls if all switch cases are TODO stubs
         body = self._inject_crud_repository_calls(body, entity_names, repository_names)
+        # Deterministically correct insertXxx argument order from repository signatures.
+        body = self._rewrite_insert_calls_from_repo_signature(body, repository_names)
 
         return f"""package {self.package_name}.service;
 
@@ -1793,14 +2609,160 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 {body}
 """
 
+    def _resolve_repo_method_names(self, repo_name: str) -> dict:
+        """
+        FIX C1/C2: Scan the actual repository .java file on disk and extract the
+        real insertXxx / updateXxx / deleteXxx / findXxx method names so that
+        _inject_crud_repository_calls uses the exact declared names rather than
+        constructing them from the table name.  Falls back to constructed names
+        if the file does not exist yet (e.g. Stage 5 before Stage 7).
+
+        Returns a dict with keys: insert, update, delete, select
+        e.g. {'insert': 'insertCustomer', 'update': 'updateCustomer',
+              'delete': 'deleteCustomer', 'select': 'findNameByCustomerId'}
+        """
+        methods = {'insert': None, 'update': None, 'delete': None, 'select': None}
+        # Use self.base_path which is target_directory/src/main/java
+        repo_path = getattr(self, 'base_path', None)
+        if not repo_path:
+            return methods
+        # Locate the repo file anywhere under the java source root
+        repo_file = None
+        for candidate in repo_path.rglob(f'{repo_name}.java'):
+            repo_file = candidate
+            break
+        if not repo_file or not repo_file.exists():
+            return methods
+        try:
+            src = repo_file.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            return methods
+
+        # Extract method names from signatures: void/int methodName(@Param...)
+        method_pat = re.compile(
+            r'(?:void|int|\w+)\s+(\w+)\s*\(', re.MULTILINE
+        )
+        for m in method_pat.finditer(src):
+            name = m.group(1)
+            nl = name.lower()
+            if nl.startswith('insert') and methods['insert'] is None:
+                methods['insert'] = name
+            elif nl.startswith('update') and methods['update'] is None:
+                methods['update'] = name
+            elif nl.startswith('delete') and methods['delete'] is None:
+                methods['delete'] = name
+            elif (nl.startswith('find') or nl.startswith('select') or nl.startswith('get'))                     and methods['select'] is None:
+                methods['select'] = name
+        return methods
+
+    def _get_insert_params(self, repo_name: str) -> Optional[str]:
+        """
+        FIX D1/D2: Scan the repo file on disk to get the real parameter list of
+        the insertXxx method.  Returns a formatted Java args string using the
+        service method's parameter names mapped by position.
+        Returns None if the repo file is not found or has no insert method.
+        """
+        param_names = self._get_insert_param_names(repo_name)
+        return ', '.join(param_names) if param_names else None
+
+    def _get_insert_param_names(self, repo_name: str) -> List[str]:
+        """Return insert-method @Param names in declared repository order."""
+        repo_path = getattr(self, 'base_path', None)
+        if not repo_path:
+            return []
+        repo_file = None
+        for candidate in repo_path.rglob(f'{repo_name}.java'):
+            repo_file = candidate
+            break
+        if not repo_file or not repo_file.exists():
+            return []
+        try:
+            src = repo_file.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            return []
+        # Find insertXxx method signature and extract @Param names.
+        # The parameter list may span multiple lines, so match up to the
+        # closing ); using DOTALL. [^;]+ stops at the semicolon safely.
+        m = re.search(r'(?:void|int)\s+insert\w+\s*\(([^;]+)\)\s*;', src, re.DOTALL)
+        if not m:
+            return []
+        param_block = m.group(1)
+        return re.findall(r'@Param\("(\w+)"\)', param_block)
+
+    def _resolve_service_argument_name(self, body: str, repo_param: str) -> Optional[str]:
+        """Resolve a repository param to the most likely service variable name."""
+        raw = (repo_param or '').strip()
+        if not raw:
+            return None
+
+        candidates: List[str] = []
+        parts = [p for p in re.split(r'[_\W]+', raw) if p]
+        pascal = ''.join(p.capitalize() for p in parts) or raw[:1].upper() + raw[1:]
+        camel = pascal[:1].lower() + pascal[1:] if pascal else raw
+
+        for candidate in (f'p{pascal}', camel, raw, raw.lower()):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        if raw.lower().startswith('p_'):
+            trimmed = raw[2:]
+            trim_parts = [p for p in re.split(r'[_\W]+', trimmed) if p]
+            trimmed_pascal = ''.join(p.capitalize() for p in trim_parts)
+            trimmed_camel = trimmed_pascal[:1].lower() + trimmed_pascal[1:] if trimmed_pascal else trimmed
+            for candidate in (f'p{trimmed_pascal}', trimmed_camel, trimmed):
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+
+        for candidate in candidates:
+            if re.search(r'\b' + re.escape(candidate) + r'\b', body):
+                return candidate
+        return None
+
+    def _rewrite_insert_calls_from_repo_signature(self, body: str, repository_names: List[str]) -> str:
+        """Rewrite repo.insertXxx(...) calls to the exact repository signature order."""
+        for repo_name in repository_names:
+            repo_var = repo_name[0].lower() + repo_name[1:]
+            insert_method = self._resolve_repo_method_names(repo_name).get('insert')
+            if not insert_method:
+                continue
+            param_names = self._get_insert_param_names(repo_name)
+            if not param_names:
+                continue
+
+            resolved_args: List[str] = []
+            for param_name in param_names:
+                resolved = self._resolve_service_argument_name(body, param_name)
+                if not resolved:
+                    resolved_args = []
+                    break
+                resolved_args.append(resolved)
+            if not resolved_args:
+                continue
+
+            call_pat = re.compile(
+                r'\b' + re.escape(repo_var) + r'\s*\.\s*' + re.escape(insert_method) + r'\s*\([^;]*\)\s*;',
+                re.DOTALL,
+            )
+            body = call_pat.sub(f'{repo_var}.{insert_method}({", ".join(resolved_args)});', body)
+
+        return body
+
     def _inject_crud_repository_calls(
         self, body: str, entity_names: List[str], repository_names: List[str]
     ) -> str:
         """
-        SBG-11 FIX: Replace // TODO stubs in action-based switch/if-else blocks
-        with actual JPA repository calls.
+        SBG-11 / SBG-20 FIX: Replace stub cases in action-based switch blocks
+        with real JPA repository calls, and ensure the repository field is
+        @Autowired into the service class.
+
+        Handles two stub patterns the LLM produces:
+          (a) // TODO comment stubs  (original SBG-11 case)
+          (b) throw new BusinessException("... not implemented") stubs
+              (SBG-20: LLM throws instead of using TODO, bypassing the old check)
+
+        Also always injects the @Autowired repository field if it is missing.
         """
-        if not repository_names or '// TODO' not in body:
+        if not repository_names:
             return body
 
         entity_name = entity_names[0] if entity_names else "Entity"
@@ -1811,48 +2773,109 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         entity_var = normalized_entity[0].lower() + normalized_entity[1:]
         id_type = "Long"
 
+        # FIX C1/C2: Resolve actual method names from the repo file on disk.
+        # This prevents the LLM from inventing names like .insert()/.update() that
+        # don't exist, and ensures the generated service matches whatever the repo
+        # file actually declares (insertCustomer, updateCustomer, etc.).
+        real_methods = self._resolve_repo_method_names(repo_name)
+        insert_method = real_methods.get('insert') or f'insert{normalized_entity.replace("Entity", "")}'
+        update_method = real_methods.get('update') or f'update{normalized_entity.replace("Entity", "")}'
+        delete_method = real_methods.get('delete') or 'deleteById'
+        select_method = real_methods.get('select') or 'findById'
+
+        # FIX D1/D2: Build INSERT call using actual @Param names from repo method.
+        # The PK column is sequence-generated so must NOT be passed to insertXxx.
+        insert_params_str = self._get_insert_params(repo_name)
+
+        # SBG-20: inject @Autowired repo field if not already present
+        autowired_field = f'    @Autowired\n    private {repo_name} {repo_var};'
+        if repo_name not in body:
+            # Insert after the opening brace of the class
+            body = re.sub(
+                r'(public\s+class\s+\w+\s*\{)',
+                r'\1\n\n' + autowired_field,
+                body,
+                count=1
+            )
+
+        # SBG-20: stub detection — both TODO comments and throw-not-implemented patterns
+        has_todo = '// TODO' in body
+        has_throw_stub = bool(re.search(
+            r'case\s+"(?:INSERT|UPDATE|DELETE|SELECT|CREATE)"\s*:\s*'
+            r'(?://[^\n]*)?\s*throw\s+new\s+\w+Exception\s*\([^)]*not\s+implement',
+            body, re.IGNORECASE
+        ))
+
+        if not has_todo and not has_throw_stub:
+            return body
+
+        # FIX C1/C2/D1/D2: Build switch cases using real repo method names and
+        # real @Param names from the repo file on disk.  Fall back to constructed
+        # names when the repo file isn't on disk yet (early pipeline stages).
+        if insert_params_str:
+            insert_call = f'{repo_var}.{insert_method}({insert_params_str});'
+        else:
+            insert_call = (
+                f'{normalized_entity} {entity_var} = new {normalized_entity}();\n'
+                f'                    // TODO: set fields from parameters\n'
+                f'                    {repo_var}.save({entity_var});'
+            )
+
         replacements = {
             'case "INSERT":': (
                 f'case "INSERT":\n'
-                f'                    {normalized_entity} {entity_var} = new {normalized_entity}();\n'
-                f'                    // TODO: set fields from parameters\n'
-                f'                    {repo_var}.save({entity_var});\n'
+                f'                    {insert_call}\n'
                 f'                    break;'
             ),
             'case "UPDATE":': (
                 f'case "UPDATE":\n'
-                f'                    {repo_var}.findById(({id_type}) customerId).ifPresent(e -> {{\n'
-                f'                        // TODO: update fields from parameters\n'
-                f'                        {repo_var}.save(e);\n'
-                f'                    }});\n'
+                f'                    {normalized_entity} existing{normalized_entity} = '
+                f'{repo_var}.findById(pId != null ? pId : 0L)\n'
+                f'                            .orElseThrow(() -> new BusinessException("{normalized_entity} not found"));\n'
+                f'                    // TODO: update fields from parameters\n'
+                f'                    {repo_var}.save(existing{normalized_entity});\n'
                 f'                    break;'
             ),
             'case "DELETE":': (
                 f'case "DELETE":\n'
-                f'                    {repo_var}.deleteById(({id_type}) customerId);\n'
+                f'                    {repo_var}.deleteById(pId != null ? pId : 0L);\n'
                 f'                    break;'
             ),
             'case "SELECT":': (
                 f'case "SELECT":\n'
-                f'                    return {repo_var}.findById(({id_type}) customerId)\n'
-                f'                        .orElseThrow(() -> new BusinessException("Not found: " + customerId));\n'
+                f'                    {repo_var}.findById(pId != null ? pId : 0L)\n'
+                f'                        .orElseThrow(() -> new BusinessException("{normalized_entity} not found"));\n'
+                f'                    break;'
             ),
             'case "CREATE":': (
                 f'case "CREATE":\n'
-                f'                    {normalized_entity} {entity_var}Create = new {normalized_entity}();\n'
+                f'                    {normalized_entity} {entity_var}New = new {normalized_entity}();\n'
                 f'                    // TODO: set fields from parameters\n'
-                f'                    {repo_var}.save({entity_var}Create);\n'
+                f'                    {repo_var}.save({entity_var}New);\n'
                 f'                    break;'
             ),
         }
 
         for placeholder, replacement in replacements.items():
-            # Only replace the stub pattern (case + TODO + break or just case + TODO)
-            stub_pat = re.compile(
-                re.escape(placeholder) + r'\s*// TODO[^\n]*\n\s*break;',
+            # Pattern A: case label followed by any number of comment lines then break.
+            # SBG-24 FIX: old regex only matched a SINGLE // TODO line before break.
+            # The LLM often writes multiple comment lines (// TODO + // Example: ...)
+            # before the break, causing the single-line pattern to never match.
+            # New: consume the case label then greedily eat any whitespace/comment
+            # lines until the break statement.
+            stub_pat_todo = re.compile(
+                re.escape(placeholder) + r'(?:\s*//[^\n]*)*\s*break\s*;',
                 re.DOTALL
             )
-            body = stub_pat.sub(replacement, body)
+            body = stub_pat_todo.sub(replacement, body)
+
+            # Pattern B: case + any number of comment lines + throw new XxxException(...)
+            # SBG-24 FIX: also made greedy for multiple comment lines before throw.
+            stub_pat_throw = re.compile(
+                re.escape(placeholder) + r'(?:\s*//[^\n]*)*\s*throw\s+new\s+\w+Exception\s*\([^)]*\)\s*;',
+                re.DOTALL | re.IGNORECASE
+            )
+            body = stub_pat_throw.sub(replacement, body)
 
         return body
 
@@ -1882,6 +2905,12 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append(f'import {self.package_name}.service.{service_name};')
         if 'List<' in code:
             import_lines.append('import java.util.List;')
+        if 'BigDecimal' in code:
+            import_lines.append('import java.math.BigDecimal;')
+        if 'LocalDateTime' in code:
+            import_lines.append('import java.time.LocalDateTime;')
+        if 'Optional<' in code:
+            import_lines.append('import java.util.Optional;')
 
         import_lines = list(dict.fromkeys(import_lines))
         # SBG-8 FIX: actual newline character
@@ -1895,6 +2924,15 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 """
 
     def _normalize_repository_code(self, filename: str, code: str, ddl_map: Optional[Dict[str, str]] = None) -> str:
+        # SBG-26 / SBG-28 FIX: Unconditionally strip duplicate @Modifying/@Transactional
+        # annotations HERE, at the very start of normalisation — before imports are
+        # rebuilt and before the audit runs. This catches duplicates that the LLM
+        # writes in its initial output regardless of whether _ddl_columns is populated.
+        # Previously the dedup only ran inside _audit_and_complete_repository which
+        # requires _ddl_columns to be non-empty, so Stage-5 repos were never cleaned.
+        code = _dedupe_annotation_block(code)
+        code = _collapse_repository_query_annotations(code)
+
         type_name = self._extract_type_name(code) or filename.replace('.java', '')
         if type_name in {'JpaRepository', 'CrudRepository'}:
             return code
@@ -1939,9 +2977,32 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             and not line.strip().startswith('import ')
         ]
         body = '\n'.join(body_lines).strip()
+        body = _collapse_repository_query_annotations(body)
 
         if '@Repository' not in body:
             body = re.sub(r'public\s+interface', '@Repository\npublic interface', body, count=1)
+
+        # SBG-21 FIX: correct lowercase entity class names the LLM produces in
+        # JPQL queries and JpaRepository<> generics.
+        # e.g. "JpaRepository<paymentsEntity, Long>" -> "JpaRepository<PaymentsEntity, Long>"
+        # e.g. "FROM paymentsEntity p" -> "FROM PaymentsEntity p"
+        # Scan every known entity name and fix any occurrence with wrong capitalisation.
+        if self._ddl_table_map:
+            for table_key, table_val in self._ddl_table_map.items():
+                entity_pascal = f"{self._to_camel_case(table_val.lower())}Entity"
+                entity_pascal = self._normalize_entity_name(entity_pascal)
+                # Build a pattern that matches the same word with any first-char case
+                wrong_lower = entity_pascal[0].lower() + entity_pascal[1:]
+                if wrong_lower != entity_pascal and wrong_lower in body:
+                    body = body.replace(wrong_lower, entity_pascal)
+
+        # SBG-20 FIX: ensure all 4 CRUD operations exist and UPDATE covers all columns
+        body, extra_imports = self._audit_and_complete_repository(body, filename)
+        body = _collapse_repository_query_annotations(body)
+        for imp in extra_imports:
+            if imp not in import_lines:
+                import_lines.append(imp)
+        imports = '\n'.join(dict.fromkeys(import_lines))
 
         return f"""package {self.package_name}.repository;
 
@@ -1949,6 +3010,360 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 
 {body}
 """
+
+    def _extract_columns_from_entity_code(self, code: str) -> List[Dict[str, str]]:
+        """
+        SBG-22 FIX: Reverse-engineer column name+type info from an already-generated
+        entity Java file so that _audit_and_complete_repository can use it even when
+        generate_entities() hasn't run yet (i.e. during Stage 5 generate_project).
+
+        Handles both the multi-line format the generator produces:
+            @Column(name = "CUSTOMER_ID")
+            private Long customerId;
+        and the single-line format the LLM sometimes produces:
+            @Column(name = "CUSTOMER_ID") private Long customerId;
+        """
+        columns: List[Dict[str, str]] = []
+        lines = code.splitlines()
+        pending_col_name: Optional[str] = None
+
+        java_to_sql = {
+            'BigDecimal': 'NUMBER(10,2)',
+            'Long':       'NUMBER',
+            'Integer':    'NUMBER',
+            'String':     'VARCHAR2',
+            'LocalDateTime': 'DATE',
+            'Date':       'DATE',
+        }
+
+        for line in lines:
+            stripped = line.strip()
+            # Detect @Column(name = "COL_NAME") — may be followed by private on same line
+            col_match = re.search(r'@Column\s*\([^)]*name\s*=\s*"([^"]+)"', stripped)
+            if col_match:
+                pending_col_name = col_match.group(1).upper()
+                # Same-line: @Column(name = "X") private Long x;
+                field_match = re.search(r'private\s+(\S+)\s+\w+\s*;', stripped)
+                if field_match:
+                    java_type = field_match.group(1).split('.')[-1]  # strip java.time. prefix
+                    sql_type = java_to_sql.get(java_type, 'VARCHAR2')
+                    columns.append({'name': pending_col_name, 'type': sql_type})
+                    pending_col_name = None
+                continue
+
+            # Multi-line: @Column on previous line, private field on this line
+            if pending_col_name:
+                field_match = re.match(r'private\s+(\S+)\s+\w+\s*;', stripped)
+                if field_match:
+                    java_type = field_match.group(1).split('.')[-1]
+                    sql_type = java_to_sql.get(java_type, 'VARCHAR2')
+                    columns.append({'name': pending_col_name, 'type': sql_type})
+                    pending_col_name = None
+                elif stripped and not stripped.startswith('//') \
+                        and not stripped.startswith('*') \
+                        and not stripped.startswith('@'):
+                    # A non-annotation, non-comment line that isn't a field resets pending
+                    pending_col_name = None
+
+        return columns
+
+    def _ensure_repo_params(self, code: str) -> str:
+        """
+        SBG-23 FIX: Ensure every @Query method parameter has a @Param annotation.
+        SBG-24 FIX: Previous implementation placed @Param BETWEEN the Java type and
+        the parameter name (e.g. "Long @Param("x") x") which is illegal Java syntax.
+        Java requires parameter annotations BEFORE the type: "@Param("x") Long x".
+
+        This rewrite uses a single, correct substitution: find "Type paramName" where
+        the param name appears in the query as :paramName, and prefix the whole pair
+        with @Param("paramName") only when the annotation is not already present.
+        """
+        # Build a mapping from query :paramName -> (type, paramName) from method sigs
+        # Strategy: for each @Query block, extract :params, then fix the method sig
+        # by replacing "SomeType paramName" with "@Param("paramName") SomeType paramName"
+
+        def fix_signature(sig: str, named_params: set) -> str:
+            for pname in sorted(named_params):
+                # Skip if already annotated correctly
+                if f'@Param("{pname}")' in sig or f"@Param('{pname}')" in sig:
+                    continue
+                # Match "TypeName paramName" or "Type<Generic> paramName" followed
+                # by comma or closing paren, and prefix with @Param("paramName").
+                # Pattern: word-boundary + one or more type tokens + whitespace + pname
+                # We look for the pattern where pname is a standalone word at a param
+                # position (after type, before , or )).
+                # Correct placement: @Param("x") TypeName x
+                sig = re.sub(
+                    r'(\b(?:[A-Z][\w.<>\[\]]*|[a-z][\w.<>\[\]]*)\s+)' +
+                    r'(\b' + re.escape(pname) + r'\b)(\s*[,)])',
+                    lambda m: f'@Param("{pname}") ' + m.group(1) + m.group(2) + m.group(3),
+                    sig
+                )
+            return sig
+
+        # Process the code: find each @Query block and fix the following method sig
+        result = []
+        lines = code.splitlines(keepends=True)
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if not re.search(r'@Query\s*\(', line):
+                result.append(line)
+                i += 1
+                continue
+
+            # Collect full @Query annotation (may span multiple lines)
+            query_block = line
+            j = i + 1
+            open_parens = query_block.count('(') - query_block.count(')')
+            while open_parens > 0 and j < len(lines):
+                query_block += lines[j]
+                open_parens += lines[j].count('(') - lines[j].count(')')
+                j += 1
+
+            # Extract :paramName placeholders from the query string
+            named_params = set(re.findall(r':([a-zA-Z]\w*)', query_block))
+
+            # Emit the @Query block lines unchanged
+            for k in range(i, j):
+                result.append(lines[k])
+            i = j
+
+            # Skip any intervening annotations (@Modifying, @Transactional, etc.)
+            while i < len(lines) and re.match(r'\s*@', lines[i].strip()):
+                result.append(lines[i])
+                i += 1
+
+            # Collect the method signature (may span multiple lines)
+            if i < len(lines):
+                sig = lines[i]
+                open_p = sig.count('(') - sig.count(')')
+                i += 1
+                while open_p > 0 and i < len(lines):
+                    sig += lines[i]
+                    open_p += lines[i].count('(') - lines[i].count(')')
+                    i += 1
+                result.append(fix_signature(sig, named_params))
+
+        return ''.join(result)
+
+    def _audit_and_complete_repository(self, body: str, filename: str) -> tuple:
+        """
+        SBG-20 FIX: Issues 4 & 5 — ensure every repository generated from a
+        procedure-style service has all 4 CRUD operations and that UPDATE
+        queries include every non-PK column from the DDL table.
+
+        Returns (updated_body, extra_import_lines).
+        """
+        extra_imports: List[str] = []
+
+        # SBG-25 FIX: Strip ANY duplicate consecutive @Modifying / @Transactional
+        # annotations unconditionally. These appear when:
+        #  (a) The LLM writes them twice in its own output, OR
+        #  (b) The re-audit (SBG-23) re-runs _normalize_repository_code on a file
+        #      that already has the annotations, and the UPDATE rebuild injects them
+        #      again without removing the originals first.
+        # Strategy: wherever we see @Modifying or @Transactional appearing more than
+        # once consecutively (with only whitespace between repetitions), collapse to one.
+        # SBG-25 FIX: Collapse any consecutive duplicate @Modifying / @Transactional
+        # annotations down to one of each. Uses a simple line-by-line dedup so no
+        # newline-in-regex issues arise.
+        body = _dedupe_annotation_block(body)
+
+        # Derive table name from the interface name (e.g. CustomersRepository -> CUSTOMERS)
+        iface_match = re.search(r'public\s+interface\s+(\w+)', body)
+        if not iface_match:
+            return body, extra_imports
+        iface_name = iface_match.group(1)  # e.g. "CustomersRepository"
+
+        # Derive entity class from JpaRepository<EntityClass, ...>
+        entity_match = re.search(
+            r'extends\s+JpaRepository\s*<\s*(\w+)\s*,', body
+        )
+        entity_class = entity_match.group(1) if entity_match else None
+
+        # Get table name and columns from _ddl_table_map + stored column info
+        table_name = None
+        columns: List[Dict[str, str]] = []
+        if self._ddl_table_map:
+            base = iface_name.replace('Repository', '')
+            key = base.replace('_', '').lower()
+            table_name = self._ddl_table_map.get(key) or self._ddl_table_map.get(
+                key[:-1] if key.endswith('s') else key + 's'
+            )
+        if table_name and hasattr(self, '_ddl_columns'):
+            columns = self._ddl_columns.get(table_name.upper(), [])
+
+        if not table_name or not columns:
+            return body, extra_imports
+
+        table_lower = table_name.lower()
+
+        # Identify the PK column (first _ID column or first column)
+        pk_col = next(
+            (c for c in columns if c['name'].upper().endswith('_ID')),
+            columns[0] if columns else None
+        )
+        if not pk_col:
+            return body, extra_imports
+
+        pk_name = pk_col['name'].upper()
+        pk_java = self._to_lower_camel_case(pk_name)
+        non_pk_cols = [c for c in columns if c['name'].upper() != pk_name
+                       and c['name'].upper() != 'CREATED_AT']
+
+        def needs_big_decimal():
+            return any(self._map_sql_type_to_java(c.get('type', '')) == 'BigDecimal'
+                       for c in non_pk_cols)
+
+        # ── Issue 5: detect missing INSERT ────────────────────────────────────
+        has_insert = bool(re.search(r'(?i)\bINSERT\s+INTO\b', body))
+        if not has_insert:
+            # Build column list and value placeholders
+            insert_cols = [c['name'].upper() for c in columns]
+            # Use sequence for PK, SYSDATE for created_at, params for rest
+            value_parts = []
+            param_parts = []
+            for c in columns:
+                cn = c['name'].upper()
+                if cn == pk_name:
+                    value_parts.append(f'{table_lower}_seq.NEXTVAL')
+                elif cn == 'CREATED_AT':
+                    value_parts.append('SYSDATE')
+                else:
+                    pname = self._to_lower_camel_case(cn)
+                    value_parts.append(f':{pname}')
+                    jtype = self._map_sql_type_to_java(c.get('type', ''))
+                    param_parts.append((pname, jtype))
+            cols_str = ', '.join(insert_cols)
+            vals_str = ', '.join(value_parts)
+            params_decl = '\n'.join(
+                f'                      @Param("{p}") {t} {p},'
+                for p, t in param_parts
+            ).rstrip(',')
+            insert_method = (
+                f'\n    @Modifying\n'
+                f'    @Transactional\n'
+                f'    @Query(value = "INSERT INTO {table_lower} ({cols_str}) '
+                f'VALUES ({vals_str})", nativeQuery = true)\n'
+                f'    void insert{self._to_camel_case(table_lower)}(\n'
+                f'{params_decl});\n'
+            )
+            # Inject before the closing brace of the interface
+            body = re.sub(r'\}\s*$', insert_method + '\n}', body)
+            extra_imports += [
+                'import org.springframework.data.jpa.repository.Modifying;',
+                'import org.springframework.transaction.annotation.Transactional;',
+                'import org.springframework.data.jpa.repository.Query;',
+                'import org.springframework.data.repository.query.Param;',
+            ]
+            if needs_big_decimal():
+                extra_imports.append('import java.math.BigDecimal;')
+
+        # ── Issue 5: detect missing DELETE ────────────────────────────────────
+        has_delete = bool(re.search(r'(?i)\bDELETE\s+FROM\b', body))
+        if not has_delete:
+            delete_method = (
+                f'\n    @Modifying\n'
+                f'    @Transactional\n'
+                # SBG-24 FIX: was missing '=' in WHERE clause -> "WHERE order_id :orderId"
+                f'    @Query(value = "DELETE FROM {table_lower} WHERE {pk_name.lower()} = :{pk_java}",'
+                f' nativeQuery = true)\n'
+                f'    int delete{self._to_camel_case(table_lower)}By{self._to_camel_case(pk_name)}'
+                f'(@Param("{pk_java}") Long {pk_java});\n'
+            )
+            body = re.sub(r'\}\s*$', delete_method + '\n}', body)
+            extra_imports += [
+                'import org.springframework.data.jpa.repository.Modifying;',
+                'import org.springframework.transaction.annotation.Transactional;',
+                'import org.springframework.data.jpa.repository.Query;',
+                'import org.springframework.data.repository.query.Param;',
+            ]
+
+        # ── Issue 4: ensure UPDATE covers all non-PK, non-CREATED_AT columns ─
+        # SBG-24 FIX: Previous JPQL rebuild used entity field names like 'o.customerId'
+        # but when the column is a FK the entity has an object field ('customersEntity')
+        # not a primitive Long — JPQL on such tables throws a QuerySyntaxException.
+        # Fix: always rebuild incomplete UPDATE queries as native SQL, which uses
+        # column names directly and is immune to FK object mapping issues.
+        # Also fix: after replacing the @Query annotation, update the method's
+        # @Param declarations to match the new parameter set, and replace the
+        # method signature if it is missing params.
+        entity_pascal = f"{self._to_camel_case(table_lower)}Entity"
+        entity_pascal = self._normalize_entity_name(entity_pascal)
+        update_match = re.search(
+            r'(@Query\s*\([^)]*?(?:UPDATE\s+' + re.escape(table_lower) +
+            r'|UPDATE\s+' + re.escape(entity_pascal) +
+            r')[\s\S]*?\))',
+            body, re.IGNORECASE
+        )
+        if update_match and non_pk_cols:
+            existing_update = update_match.group(1)
+            # Check whether all non-PK columns are represented in the SET clause
+            missing_cols = [
+                c for c in non_pk_cols
+                if self._lower_first(self._to_camel_case(c['name'])) not in existing_update
+                and c['name'].lower() not in existing_update.lower()
+            ]
+            if missing_cols:
+                # Always rebuild as native SQL — safe for both plain columns and FK columns
+                set_parts = ', '.join(
+                    f'{c["name"].lower()} = :{self._lower_first(self._to_camel_case(c["name"]))}'
+                    for c in non_pk_cols
+                )
+                # Build new @Query annotation
+                new_query_ann = (
+                    f'@Query(value = "UPDATE {table_lower} SET {set_parts} '
+                    f'WHERE {pk_name.lower()} = :{pk_java}", nativeQuery = true)'
+                )
+                # Build correct method signature with all @Param declarations
+                all_params = [(pk_java, 'Long')] + [
+                    (self._lower_first(self._to_camel_case(c['name'])),
+                     self._map_sql_type_to_java(c.get('type', '')))
+                    for c in non_pk_cols
+                ]
+                params_sig = ', \n                     '.join(
+                    f'@Param("{pname}") {ptype} {pname}'
+                    for pname, ptype in all_params
+                )
+                method_name = f'update{self._to_camel_case(table_lower)}'
+                new_method = (
+                    f'    @Modifying\n'
+                    f'    @Transactional\n'
+                    f'    {new_query_ann}\n'
+                    f'    int {method_name}({params_sig});'
+                )
+                # RC3 FIX: strip any duplicate @Modifying/@Transactional annotations
+                # that the LLM wrote immediately before the matched @Query block,
+                # so the rebuilt new_method doesn't produce duplicates.
+                dup_prefix_pat = re.compile(
+                    r'((?:\s*@Modifying\s*\n|\s*@Transactional\s*\n)+)' +
+                    re.escape(existing_update),
+                    re.DOTALL
+                )
+                body = dup_prefix_pat.sub(existing_update, body)
+
+                # Replace the existing @Query block AND the entire method signature that follows it
+                # Match from the @Query annotation up to and including the method declaration line
+                update_method_pat = re.compile(
+                    re.escape(existing_update) +
+                    r'[\s\S]*?;(?=\s*\n)',
+                    re.DOTALL
+                )
+                if update_method_pat.search(body):
+                    body = update_method_pat.sub(new_method, body, count=1)
+                else:
+                    body = body.replace(existing_update, new_query_ann)
+                extra_imports += [
+                    'import org.springframework.data.jpa.repository.Modifying;',
+                    'import org.springframework.transaction.annotation.Transactional;',
+                    'import org.springframework.data.jpa.repository.Query;',
+                    'import org.springframework.data.repository.query.Param;',
+                ]
+                if needs_big_decimal():
+                    extra_imports.append('import java.math.BigDecimal;')
+
+        return body, list(dict.fromkeys(extra_imports))
 
     def _normalize_entity_code(self, filename: str, code: str) -> str:
         type_name = self._extract_type_name(code) or filename.replace('.java', '')
@@ -2018,19 +3433,93 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         return ordered
 
     def _derive_entity_name(self, filename: str, class_name: Optional[str]) -> Optional[str]:
+        """
+        SBG-16 FIX: Resolve the derived base name against _ddl_table_map using
+        both a direct lookup AND a camel-case suffix search before falling back
+        to the raw stripped name.
+
+        Problem: procedure-named service classes such as ManageCustomerService
+        or OrderProcessingService strip to "ManageCustomer" / "OrderProcessing"
+        after removing the "Service" suffix.  These multi-word bases don't match
+        any DDL table key directly, so the old code silently used the raw value
+        and generated "import ...entity.ManageCustomer" which does not exist.
+
+        Resolution order:
+          1. Strip the 'Service' suffix to get a raw base (e.g. "ManageCustomer").
+          2. Direct lookup via _resolve_entity_from_ddl (works when base == table,
+             e.g. "Payment" -> "payments").
+          3. Camel-case segment suffix search: split the base into PascalCase
+             words and try progressively shorter right-hand suffixes against the
+             DDL map, longest match wins.
+             e.g. "ManageCustomer" -> try "ManageCustomer", then "Customer"
+                  "OrderProcessing" -> try "OrderProcessing", then "Processing"
+             "Customer" matches "customer" -> "CUSTOMERS" -> "CustomersEntity".
+          4. Fall back to the raw base only when the DDL map has no match at all
+             (no DDL provided, or this is genuinely a new entity).
+        """
         if class_name and class_name.lower().endswith('service'):
             base = class_name[:-7]
-            return base if base else None
-        if filename.lower().endswith('service.java'):
-            base = filename[:-12]
-            return self._to_camel_case(base) if base else None
-        stem = filename.replace('.java', '')
-        return self._to_camel_case(stem) if stem else None
+        elif filename.lower().endswith('service.java'):
+            base = self._to_camel_case(filename[:-12])
+        else:
+            base = self._to_camel_case(filename.replace('.java', ''))
+
+        if not base:
+            return None
+
+        if self._ddl_table_map:
+            # Step 2: direct resolution (handles "PaymentService" -> "Payment" -> payments)
+            resolved, table = self._resolve_entity_from_ddl(base, self._ddl_table_map)
+            if table is not None:
+                return resolved
+
+            # Step 3: split PascalCase into words and try each right-hand suffix
+            # AND each individual word, longest/leftmost match first.
+            # e.g. "ManageCustomer"  -> ["Manage","Customer"]
+            #      try: "Customer"                          -> matches customers
+            # e.g. "OrderProcessing" -> ["Order","Processing"]
+            #      try: "OrderProcessing", "Processing",    <- right suffixes
+            #           "Order"                             <- individual words
+            words = re.findall(r'[A-Z][a-z0-9]*', base)
+            # Collect candidates: right-anchored suffixes then individual words
+            # (deduplicated, preserving order)
+            candidates = []
+            seen_cands: set = set()
+            # Right-anchored suffixes from length 2 down to 1 (full base tried above)
+            for start in range(1, len(words)):
+                suffix = ''.join(words[start:])
+                if suffix not in seen_cands:
+                    candidates.append(suffix)
+                    seen_cands.add(suffix)
+            # Individual words (catches "Order" in "OrderProcessing")
+            for w in words:
+                if w not in seen_cands:
+                    candidates.append(w)
+                    seen_cands.add(w)
+
+            for candidate in candidates:
+                resolved, table = self._resolve_entity_from_ddl(candidate, self._ddl_table_map)
+                if table is not None:
+                    return resolved
+
+        return base
 
     def _is_entity_candidate_name(self, candidate: str) -> bool:
+        # SBG-27 FIX: also block JPA/Spring framework class names that the LLM
+        # sometimes uses as repository base names (JpaRepository, CrudRepository,
+        # Customer, etc.) causing bogus imports like com.example.demo.entity.Jpa.
         blocked_suffixes = ('Exception', 'Result', 'Response', 'Request', 'DTO', 'Config', 'Controller', 'Service')
-        blocked_names = {'BusinessException', 'IllegalArgumentException', 'ProcessOrderResult', 'TABLE'}
-        return bool(candidate) and candidate not in blocked_names and not candidate.endswith(blocked_suffixes)
+        blocked_names = {
+            'BusinessException', 'IllegalArgumentException', 'ProcessOrderResult', 'TABLE',
+            # JPA / Spring framework names that are never user-defined entities:
+            'Jpa', 'JpaRepository', 'CrudRepository', 'Repository', 'Entity',
+            'Optional', 'List', 'Map', 'Set', 'Collection', 'Object',
+        }
+        return (bool(candidate)
+                and candidate not in blocked_names
+                and not candidate.endswith(blocked_suffixes)
+                and not candidate.startswith('javax.')
+                and not candidate.startswith('jakarta.'))
 
     def _entity_has_meaningful_fields(self, code: str) -> bool:
         field_lines = [l for l in code.splitlines() if l.strip().startswith("private ")]
@@ -2112,32 +3601,54 @@ public class {entity_name}Controller {{
 """
 
     def generate_controllers(self, services: Dict[str, str]) -> Dict[str, str]:
+        # SBG-18 FIX: the pipeline calls this method (Stage 9) with a dict of
+        # filename -> Java source code produced by generate_services().
+        # The old implementation only delegated to _generate_controller() which
+        # returns "" for procedure-style action-switch services (no getAll/create
+        # etc.), producing 0 controllers.
+        # Fix: mirror the same two-path logic as _generate_controllers_from_services():
+        #   1. Try the standard CRUD-method controller.
+        #   2. Fall back to the action-dispatch controller for procedure services.
         controllers = {}
+        controller_dir = self.package_path / 'controller'
+        controller_dir.mkdir(parents=True, exist_ok=True)
+
         for filename, code in services.items():
             service_name = filename.replace('.java', '')
-            if service_name.endswith('Service'):
-                controller_name = service_name[:-7] + 'Controller.java'
-            else:
-                controller_name = service_name + 'Controller.java'
-            controller_content = self._generate_controller(service_name, code)
-            if not controller_content:
-                continue
-            controllers[controller_name] = self._normalize_controller_code(controller_name, controller_content)
 
-        controller_dir = self.package_path / 'controller'
-        for filename, code in controllers.items():
-            file_path = controller_dir / filename
+            # Try standard CRUD controller first
+            controller_code = self._generate_controller(service_name, code)
+
+            # Fall back to action-dispatch for procedure-style services
+            if not controller_code:
+                controller_code = self._generate_action_dispatch_controller(service_name, code)
+
+            if not controller_code:
+                continue
+
+            if service_name.endswith('Service'):
+                controller_filename = service_name[:-7] + 'Controller.java'
+            else:
+                controller_filename = service_name + 'Controller.java'
+
+            normalized = self._normalize_controller_code(controller_filename, controller_code)
+            controllers[controller_filename] = normalized
+
+            file_path = controller_dir / controller_filename
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
+                f.write(normalized)
 
         logger.info(f"Generated {len(controllers)} controller classes")
         return controllers
 
-    def generate_entities(self, java_code: Dict[str, str], ddl_columns: Optional[Dict[str, List[Dict[str, str]]]] = None) -> Dict[str, str]:
+    def generate_entities(self, java_code: Dict[str, str], ddl_columns: Optional[Dict[str, List[Dict[str, str]]]] = None, fk_map: Optional[Dict[str, List[Dict[str, str]]]] = None) -> Dict[str, str]:
         entities = {}
         ddl_columns = ddl_columns or {}
         ddl_map = {table.replace("_", "").lower(): table for table in ddl_columns.keys()}
         self._ddl_table_map = ddl_map
+        # SBG-20: persist for use by _audit_and_complete_repository and FK injection
+        self._ddl_columns = ddl_columns
+        self._fk_map = fk_map or {}
 
         for filename, code in java_code.items():
             if '@Entity' in code or 'extends BaseEntity' in code:
@@ -2154,7 +3665,11 @@ public class {entity_name}Controller {{
             target_filename = f"{normalized_entity_name}.java"
             if target_filename in entities:
                 continue
-            entities[target_filename] = self._generate_entity_from_ddl(normalized_entity_name, table_name, columns)
+            # SBG-20: pass FK relationships for this table
+            table_fks = self._fk_map.get(table_name.upper(), [])
+            entities[target_filename] = self._generate_entity_from_ddl(
+                normalized_entity_name, table_name, columns, table_fks
+            )
 
         if not entities:
             for filename, code in java_code.items():
@@ -2189,6 +3704,57 @@ public class {entity_name}Controller {{
             'BigDecimal', 'LocalDate', 'LocalDateTime', 'Instant', 'UUID',
         }
         return bool(field_type) and field_type not in scalar_types and field_type[:1].isupper()
+
+    @staticmethod
+    def parse_fk_constraints(sql_text: str) -> Dict[str, List[Dict[str, str]]]:
+        """
+        SBG-20 FIX (Issue 6): Parse ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY
+        statements and return a map of table_name (upper) -> list of FK dicts.
+
+        Each FK dict has keys:
+          'column'     - the FK column on the source table (upper)
+          'ref_table'  - the referenced table name (upper)
+          'ref_column' - the referenced column name (upper)
+
+        Example SQL handled:
+          ALTER TABLE orders
+          ADD CONSTRAINT fk_orders_customer
+          FOREIGN KEY (customer_id)
+          REFERENCES customers(customer_id);
+
+        Returns: {'ORDERS': [{'column': 'CUSTOMER_ID',
+                               'ref_table': 'CUSTOMERS',
+                               'ref_column': 'CUSTOMER_ID'}], ...}
+        """
+        fk_map: Dict[str, List[Dict[str, str]]] = {}
+        if not sql_text:
+            return fk_map
+
+        # Remove comments
+        cleaned = re.sub(r'--[^\r\n]*', ' ', sql_text)
+        cleaned = re.sub(r'/\*.*?\*/', ' ', cleaned, flags=re.DOTALL)
+
+        pattern = re.compile(
+            r'ALTER\s+TABLE\s+(?:"?[\w$#]+"?\s*\.\s*)?(?P<table>"?[\w$#]+"?)'
+            r'.*?'
+            r'FOREIGN\s+KEY\s*\(\s*(?P<fk_col>"?[\w$#]+"?)\s*\)'
+            r'\s*REFERENCES\s+(?:"?[\w$#]+"?\s*\.\s*)?(?P<ref_table>"?[\w$#]+"?)'
+            r'\s*\(\s*(?P<ref_col>"?[\w$#]+"?)\s*\)',
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        for m in pattern.finditer(cleaned):
+            table = m.group('table').strip('"').upper()
+            fk_col = m.group('fk_col').strip('"').upper()
+            ref_table = m.group('ref_table').strip('"').upper()
+            ref_col = m.group('ref_col').strip('"').upper()
+            fk_map.setdefault(table, []).append({
+                'column': fk_col,
+                'ref_table': ref_table,
+                'ref_column': ref_col,
+            })
+
+        return fk_map
 
 
 def create_spring_boot_generator(config: Dict[str, Any]) -> SpringBootGenerator:

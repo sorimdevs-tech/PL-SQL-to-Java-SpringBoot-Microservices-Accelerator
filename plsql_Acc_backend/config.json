@@ -16,6 +16,18 @@
       "api_key": "${OPENROUTER_API_KEY}"
     }
   },
+  "backup_llm": {
+    "enabled": true,
+    "provider": "openrouter",
+    "model": "openai/gpt-oss-120b",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key": "${OPENROUTER_API_KEY}",
+    "temperature": 0.0,
+    "max_tokens": 6000,
+    "timeout": 180,
+    "max_repair_loops": 2,
+    "max_files_per_attempt": 8
+  },
   "database": {
     "type": "oracle",
     "connection_string": "oracle://user:pass@host:port/service",

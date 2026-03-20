@@ -37,6 +37,34 @@ class LLMConfig(BaseModel):
         return v
 
 
+class BackupLLMConfig(BaseModel):
+    """Backup LLM configuration for post-generation project repair."""
+    enabled: bool = False
+    provider: str = "openrouter"
+    model: str = "openai/gpt-oss-120b"
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    temperature: float = 0.0
+    max_tokens: int = 6000
+    timeout: int = 180
+    max_repair_loops: int = 2
+    max_files_per_attempt: int = 8
+
+    @validator('api_key', always=True)
+    def validate_api_key(cls, v, values):
+        if not values.get('enabled'):
+            return v
+        if v is None:
+            v = (
+                os.getenv('OPENROUTER_API_KEY')
+                or os.getenv('OPENAI_API_KEY')
+                or os.getenv('ANTHROPIC_API_KEY')
+            )
+        if v is None:
+            raise ValueError("Backup LLM API key must be provided either in config or environment variables")
+        return v
+
+
 class DatabaseConfig(BaseModel):
     """Database configuration settings"""
     type: str = "oracle"
@@ -54,7 +82,7 @@ class OutputConfig(BaseModel):
     description: str = "PL/SQL to Java Modernization Project"
     target_directory: str = "./output"
     java_version: str = "17"
-    spring_boot_version: str = "3.1.0"
+    spring_boot_version: str = "3.2.5"
     build_tool: str = "maven"
     packaging: str = "jar"
     config_format: str = "properties"
@@ -121,6 +149,7 @@ class LoggingConfig(BaseModel):
 class PlatformConfig(BaseModel):
     """Main platform configuration"""
     llm: LLMConfig = LLMConfig()
+    backup_llm: BackupLLMConfig = BackupLLMConfig()
     database: DatabaseConfig = DatabaseConfig()
     output: OutputConfig = OutputConfig()
     validation: ValidationConfig = ValidationConfig()
@@ -206,6 +235,20 @@ class ConfigManager:
             fallback_cfg['api_key'] = self._resolve_env_placeholder(fallback_cfg.get('api_key'))
             llm_config['fallback'] = fallback_cfg
             config_data['llm'] = llm_config
+
+        backup_llm_config = config_data.get('backup_llm', {})
+        if isinstance(backup_llm_config, dict):
+            backup_api_key = self._resolve_env_placeholder(backup_llm_config.get('api_key'))
+            backup_llm_config['api_key'] = backup_api_key
+            if backup_llm_config.get('enabled') and backup_api_key in (None, "", "your-api-key-here"):
+                api_key = (
+                    os.getenv('OPENROUTER_API_KEY')
+                    or os.getenv('OPENAI_API_KEY')
+                    or os.getenv('ANTHROPIC_API_KEY')
+                )
+                if api_key:
+                    backup_llm_config['api_key'] = api_key
+            config_data['backup_llm'] = backup_llm_config
         
         # Load database connection string from environment
         db_config = config_data.get('database', {})
@@ -364,6 +407,8 @@ class ConfigManager:
         # Remove sensitive data before saving
         if 'llm' in config_dict and 'api_key' in config_dict['llm']:
             config_dict['llm']['api_key'] = "your-api-key-here"
+        if 'backup_llm' in config_dict and 'api_key' in config_dict['backup_llm']:
+            config_dict['backup_llm']['api_key'] = "your-api-key-here"
         
         with open(save_path, 'w') as f:
             json.dump(config_dict, f, indent=2)

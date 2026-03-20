@@ -251,34 +251,77 @@ class PromptTemplate:
 
     def _get_procedure_template(self) -> str:
         return """
-Convert the following PL/SQL procedure to a Java Spring Boot service method.
+Convert the following PL/SQL procedure to a Java Spring Boot service class.
 
 PL/SQL Procedure:
 {plsql_code}
 
 Requirements:
-1. Create a Spring Boot service class with proper annotations (@Service, @Transactional)
-2. Use JPA repositories for database operations
-3. Implement proper exception handling
-4. Use dependency injection
-5. Follow Java naming conventions
-6. Use the package name: {package_name}
+1. Create a Spring Boot @Service class with @Transactional on the method
+2. Inject the repository with @Autowired field — ONE @Autowired field per repository
+3. Use the injected repository for ALL DB operations (save/findById/deleteById/insertXxx)
+4. Implement exception handling using BusinessException (already exists in the project)
+5. Use the package name: {package_name}
+6. Use Long for NUMBER ID/count parameters; BigDecimal ONLY for NUMBER(p,s) decimal params
 
 Context:
-- Tables involved: {tables}
+- Tables: {tables}
 - Allowed Entities: {entity_names}
 - Allowed Repositories: {repository_names}
 
-Allowed Entity Fields (USE ONLY THESE — do not invent fields):
+Allowed Entity Fields (USE ONLY THESE):
 {entity_fields}
 
-Output: ONE complete compilable Java file. Package declaration + imports + class only.
-No explanations, no markdown, no multiple classes.
+STRICT OUTPUT RULES — violating any of these causes compile errors:
+1. Output EXACTLY ONE Java file: package declaration, then imports, then ONE public class.
+2. The file MUST end with the closing brace of the class: last character must be }}.
+3. Do NOT add ANY content after the class closing brace — no comments, no imports,
+   no placeholder classes, no @Entity annotations, nothing whatsoever.
+4. Do NOT duplicate @Autowired fields — inject each repository EXACTLY ONCE.
+5. Entity classes have ONLY no-arg constructors. NEVER call new EntityClass(arg1, arg2,...).
+   WRONG: new CustomersEntity(id, name, email)
+   RIGHT: CustomersEntity e = new CustomersEntity(); e.setName(name); e.setEmail(email);
+6. Do NOT use @Modifying or @Transactional in a @Service class — only in @Repository.
+7. Do NOT use EntityManager, @PersistenceContext, or createNativeQuery.
+8. Do NOT generate duplicate case labels in switch statements.
+9. Implement ALL four switch cases (INSERT/UPDATE/DELETE/SELECT) with real repository calls.
+   NEVER leave TODO stubs or throw "not implemented" exceptions.
+10. For INSERT: call the repository insertXxx() native-SQL method, NOT save().
+    The PK is Oracle-sequence-generated — do NOT pass the PK as a parameter.
+    WRONG: customersRepository.insertCustomer(pCustomerId, pName, pEmail, pStatus)
+    RIGHT: customersRepository.insertCustomer(pName, pEmail, pStatus)
+11. When calling any repository method, the Java argument order MUST match the repository
+    method signature EXACTLY. Never reorder parameters based on SQL column order or guesswork.
+    Example repository signature:
+    int insertOrder(Long customerId, BigDecimal amount, String status);
+    WRONG call: ordersRepository.insertOrder(pAmount, pStatus, pCustomerId);
+    RIGHT call: ordersRepository.insertOrder(pCustomerId, pAmount, pStatus);
+12. Before emitting an insertXxx()/updateXxx()/deleteXxx() call, inspect the repository
+    method name and copy its parameter list in the exact declared order and Java types.
+    If the repository method accepts BigDecimal, pass BigDecimal in that exact slot.
+13. For UPDATE: findById(id).orElseThrow(), then setters, then save(entity).
+    Do NOT call a generic .update() method — it does not exist.
+14. FK fields in entities are mapped as entity OBJECTS, not Long IDs.
+    WRONG: order.setCustomerId(pCustomerId)   // no such setter exists
+    RIGHT: CustomersEntity c = customersRepository.findById(pCustomerId).orElseThrow(...);
+           order.setCustomersEntity(c);
+15. The service method return type MUST be void. The controller handles the response.
+16. Use BigDecimal for ALL decimal/monetary NUMBER columns. NEVER use Double or Float.
+    NUMBER(10,2) -> BigDecimal.   Any NUMBER(p,s) where s > 0 -> BigDecimal.
+17. Entity and Repository class names are PascalCase. NEVER use ALLCAPS.
+    WRONG: CUSTOMERSEntity, ORDERSEntity, PAYMENTSEntity, CUSTOMERSRepository
+    RIGHT: CustomersEntity, OrdersEntity, PaymentsEntity, CustomersRepository
+18. Import only classes that actually exist in the project.
+    NEVER import: com.example.demo.entity.Crud, com.example.demo.repository.CrudRepository,
+    or any ALLCAPS entity/repository class name.
+
+Output: ONE complete compilable Java file ending with exactly one closing }}.
+No markdown, no explanations, no extra text before or after the Java code.
 """
 
     def _get_function_template(self) -> str:
         return """
-Convert the following PL/SQL function to a Java Spring Boot service method.
+Convert the following PL/SQL function to a Java Spring Boot service class.
 
 PL/SQL Function:
 {plsql_code}
@@ -289,7 +332,18 @@ Allowed Repositories: {repository_names}
 Entity Fields (ONLY these):
 {entity_fields}
 
+STRICT OUTPUT RULES:
+- NEVER use EntityManager, @PersistenceContext, or createNativeQuery
+- ALWAYS use the injected @Autowired repository for all DB operations
+- Use Long for NUMBER ID/count params; BigDecimal ONLY for NUMBER(p,s) decimal params
+- If calling any repository method, the Java argument order MUST match the repository
+  method signature exactly. Never reorder arguments by SQL column order.
+- For insertXxx() methods, do NOT pass the PK when the query uses sequence.NEXTVAL.
+- Output EXACTLY ONE Java file. The LAST character must be the class closing brace }}.
+- Do NOT add any content after the class closing brace.
+
 Output: ONE complete compilable Java file. Package + imports + single class.
+No markdown, no explanations, no extra text after the closing }}.
 """
 
     def _get_trigger_template(self) -> str:
@@ -322,7 +376,12 @@ Allowed Entities: {entity_names}
 Entity Fields:
 {entity_fields}
 
+STRICT OUTPUT RULES:
+- Output EXACTLY ONE Java file ending with the class closing brace }}.
+- Do NOT add any content after the closing brace.
+
 Output: ONE complete compilable Java file (primary service class).
+No markdown, no explanations, no extra text.
 """
 
     def _get_sql_template(self) -> str:
@@ -337,7 +396,43 @@ Table: {table}
 Columns: {columns}
 Package: {package_name}
 
-Output: ONE complete compilable Java repository interface file.
+STRICT OUTPUT RULES — violating any causes compile errors:
+1. Output EXACTLY ONE Java interface file: package + imports + ONE public interface.
+2. The file MUST end with the closing brace of the interface: last character is }}.
+3. Do NOT add ANY content after the interface closing brace.
+4. Each @Query method needs EXACTLY ONE @Modifying (if modifying) and EXACTLY ONE
+   @Transactional — NEVER repeat the same annotation twice on a single method.
+   The correct order is: @Modifying (line 1), @Transactional (line 2), @Query (line 3),
+   then the method signature. Never write @Modifying @Transactional @Modifying @Transactional.
+   NEVER emit a second annotation block before the same @Query method.
+   WRONG:
+   @Modifying
+   @Transactional
+   @Modifying
+   @Transactional
+   @Query(...)
+   int updateX(...);
+   RIGHT:
+   @Modifying
+   @Transactional
+   @Query(...)
+   int updateX(...);
+5. Every named parameter :paramName in a @Query MUST have a matching @Param("paramName")
+   annotation BEFORE the Java type: @Param("name") String name — NOT String @Param("name") name.
+6. Use native SQL (nativeQuery = true) for INSERT/DELETE and for UPDATE on tables with FK columns.
+7. All column names in native SQL must be real SQL column names (lowercase), not Java field names.
+8. INSERT method signatures must match the non-PK bind parameters in the SQL in the same order.
+   If SQL uses sequence.NEXTVAL for the PK, do NOT include the PK in the Java method parameters.
+   Example:
+   INSERT INTO orders (order_id, customer_id, amount, status, created_at)
+   VALUES (orders_seq.NEXTVAL, :customerId, :amount, :status, SYSDATE)
+   REQUIRED signature:
+   int insertOrder(@Param("customerId") Long customerId,
+                   @Param("amount") BigDecimal amount,
+                   @Param("status") String status);
+
+Output: ONE complete compilable Java interface file ending with }}.
+No markdown, no explanations, no extra text.
 """
 
     def _get_entity_template(self) -> str:
@@ -400,6 +495,7 @@ class LLMConversionEngine:
         self.retry_base_delay = float(config.get('retry_base_delay_seconds', 0.5))
         self.provider = self._create_provider()
         self.fallback_provider = self._create_fallback_provider()
+        self.repair_provider = self._create_repair_provider()
         self.prompt_template = PromptTemplate()
 
         # LCE-15 FIX: conversion_cache is now actually used (keyed by prompt hash)
@@ -420,64 +516,82 @@ class LLMConversionEngine:
         return self._semaphore
 
     def _create_provider(self) -> LLMProvider:
-        provider_name = self.config.get('provider', 'openai')
-        if provider_name.lower() == 'openai':
+        return self._create_provider_from_config(self.config)
+
+    def _create_provider_from_config(self, provider_cfg: Dict[str, Any]) -> LLMProvider:
+        provider_name = (provider_cfg.get('provider') or 'openai').lower()
+        if provider_name == 'openai':
             return OpenAIProvider(
-                api_key=self.config.get('api_key'),
-                model=self.config.get('model', 'gpt-4'),
-                base_url=self.config.get('base_url'),
-                timeout=self.config.get('timeout', 60)
+                api_key=provider_cfg.get('api_key'),
+                model=provider_cfg.get('model', 'gpt-4'),
+                base_url=provider_cfg.get('base_url'),
+                timeout=provider_cfg.get('timeout', 60)
             )
-        elif provider_name.lower() == 'anthropic':
+        if provider_name == 'anthropic':
             return AnthropicProvider(
-                api_key=self.config.get('api_key'),
-                # LCE-1 FIX: default to current model
-                model=self.config.get('model', 'claude-sonnet-4-6'),
-                timeout=self.config.get('timeout', 60)
+                api_key=provider_cfg.get('api_key'),
+                model=provider_cfg.get('model', 'claude-sonnet-4-6'),
+                timeout=provider_cfg.get('timeout', 60)
             )
-        elif provider_name.lower() == 'openrouter':
+        if provider_name == 'openrouter':
             return OpenRouterProvider(
-                api_key=self.config.get('api_key'),
-                # LCE-12 FIX: real default model
-                model=self.config.get('model', 'openai/gpt-4o-mini'),
-                base_url=self.config.get('base_url') or 'https://openrouter.ai/api/v1',
-                timeout=self.config.get('timeout', 60)
+                api_key=provider_cfg.get('api_key'),
+                model=provider_cfg.get('model', 'openai/gpt-4o-mini'),
+                base_url=provider_cfg.get('base_url') or 'https://openrouter.ai/api/v1',
+                timeout=provider_cfg.get('timeout', 60)
             )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {provider_name}")
+        raise ValueError(f"Unsupported LLM provider: {provider_name}")
 
     def _create_fallback_provider(self) -> Optional[LLMProvider]:
         fallback_cfg = self.config.get('fallback')
         if not fallback_cfg or not isinstance(fallback_cfg, dict):
             return None
+        fallback_cfg = dict(fallback_cfg)
         provider_name = (fallback_cfg.get('provider') or '').lower()
         if not provider_name:
             return None
         try:
             if provider_name == 'openai':
-                return OpenAIProvider(
-                    api_key=fallback_cfg.get('api_key') or os.getenv('OPENAI_API_KEY') or self.config.get('api_key'),
-                    model=fallback_cfg.get('model', 'gpt-4o-mini'),
-                    base_url=fallback_cfg.get('base_url'),
-                    timeout=fallback_cfg.get('timeout', self.request_timeout),
-                )
-            if provider_name == 'anthropic':
-                return AnthropicProvider(
-                    api_key=fallback_cfg.get('api_key') or os.getenv('ANTHROPIC_API_KEY') or self.config.get('api_key'),
-                    model=fallback_cfg.get('model', 'claude-sonnet-4-6'),
-                    timeout=fallback_cfg.get('timeout', self.request_timeout),
-                )
-            if provider_name == 'openrouter':
-                return OpenRouterProvider(
-                    api_key=fallback_cfg.get('api_key') or os.getenv('OPENROUTER_API_KEY') or self.config.get('api_key'),
-                    model=fallback_cfg.get('model', 'openai/gpt-4o-mini'),
-                    base_url=fallback_cfg.get('base_url') or 'https://openrouter.ai/api/v1',
-                    timeout=fallback_cfg.get('timeout', self.request_timeout),
-                )
-            logger.warning(f"Ignoring unsupported fallback provider: {provider_name}")
-            return None
+                fallback_cfg['api_key'] = fallback_cfg.get('api_key') or os.getenv('OPENAI_API_KEY') or self.config.get('api_key')
+            elif provider_name == 'anthropic':
+                fallback_cfg['api_key'] = fallback_cfg.get('api_key') or os.getenv('ANTHROPIC_API_KEY') or self.config.get('api_key')
+            elif provider_name == 'openrouter':
+                fallback_cfg['api_key'] = fallback_cfg.get('api_key') or os.getenv('OPENROUTER_API_KEY') or self.config.get('api_key')
+                fallback_cfg['base_url'] = fallback_cfg.get('base_url') or 'https://openrouter.ai/api/v1'
+            else:
+                logger.warning(f"Ignoring unsupported fallback provider: {provider_name}")
+                return None
+            fallback_cfg['timeout'] = fallback_cfg.get('timeout', self.request_timeout)
+            return self._create_provider_from_config(fallback_cfg)
         except Exception as e:
             logger.warning(f"Failed to initialize fallback provider: {e}")
+            return None
+
+    def _create_repair_provider(self) -> Optional[LLMProvider]:
+        repair_cfg = self.config.get('backup_llm')
+        if not repair_cfg or not isinstance(repair_cfg, dict) or not repair_cfg.get('enabled'):
+            return None
+        resolved = dict(repair_cfg)
+        provider_name = (resolved.get('provider') or self.config.get('provider') or '').lower()
+        if not provider_name:
+            return None
+        resolved['provider'] = provider_name
+        if provider_name == 'openrouter':
+            resolved['api_key'] = resolved.get('api_key') or os.getenv('OPENROUTER_API_KEY') or self.config.get('api_key')
+            resolved['base_url'] = resolved.get('base_url') or 'https://openrouter.ai/api/v1'
+            resolved.setdefault('model', 'openai/gpt-oss-120b')
+        elif provider_name == 'openai':
+            resolved['api_key'] = resolved.get('api_key') or os.getenv('OPENAI_API_KEY') or self.config.get('api_key')
+        elif provider_name == 'anthropic':
+            resolved['api_key'] = resolved.get('api_key') or os.getenv('ANTHROPIC_API_KEY') or self.config.get('api_key')
+        else:
+            logger.warning("Ignoring unsupported repair provider: %s", provider_name)
+            return None
+        resolved['timeout'] = resolved.get('timeout', max(self.request_timeout, 180))
+        try:
+            return self._create_provider_from_config(resolved)
+        except Exception as e:
+            logger.warning(f"Failed to initialize repair provider: {e}")
             return None
 
     def _extract_entity_fields_from_files(self, base_path: str, package_name: str) -> Dict[str, List[str]]:
@@ -644,6 +758,25 @@ class LLMConversionEngine:
             context['entity_fields'] = self._extract_entity_fields_from_files(output_base, package_name)
 
         tables = context.get('tables') or []
+
+        # LCE-FIX: if the dependency graph provided no tables, extract them from
+        # the AST's SQL statements as a fallback. This ensures entity_names and
+        # repository_names are never empty when the SQL parser resolved table refs.
+        if not tables:
+            seen_tables: set = set()
+            for section in ('procedures', 'functions', 'triggers'):
+                for obj in ast_results.get(section, []):
+                    for stmt in obj.get('statements', []):
+                        if stmt.get('type') == 'sql_statement':
+                            inferred = self._infer_tables_from_sql(stmt.get('text', ''))
+                            for t in inferred:
+                                if t.upper() not in seen_tables:
+                                    seen_tables.add(t.upper())
+                                    tables.append(t.upper())
+            if tables:
+                logger.info(f"LCE-FIX: inferred {len(tables)} tables from AST SQL statements: {tables}")
+            context['tables'] = tables
+
         entity_names: List[str] = []
         repository_names: List[str] = []
         for table in tables:
@@ -855,15 +988,28 @@ Errors:
 Code:
 {code}
 
-Rules:
-- Use ONLY entities: {context.get('entity_names', [])}
-- Use ONLY repositories: {context.get('repository_names', [])}
+STRICT FIX RULES:
+- Use ONLY these entities: {context.get('entity_names', [])}
+- Use ONLY these repositories: {context.get('repository_names', [])}
 - Fix ALL missing imports
-- Fix type mismatches
-- If service returns void: call service.method(); return ResponseEntity.ok("Success");
-- NEVER: return ResponseEntity.ok(service.method());
+- Fix type mismatches: BigDecimal for NUMBER(p,s) decimal columns, Long for IDs/counts
+- NEVER use Double or Float for monetary/decimal values — always BigDecimal
+- Service methods must return void — NEVER return an entity type
+- NEVER use EntityManager, @PersistenceContext, or createNativeQuery in a @Service class
+- ALWAYS inject the repository with @Autowired and use it for all DB operations
+- Do NOT generate duplicate case labels in switch statements
+- File MUST end with the closing brace — nothing after it (no comments, no imports, no @Entity)
+- Repository interfaces: each method gets EXACTLY ONE @Modifying and ONE @Transactional
+- @Param annotation goes BEFORE the Java type: @Param("id") Long id — NOT Long @Param("id") id
+- Implement ALL switch cases (INSERT/UPDATE/DELETE/SELECT) with real repository calls — no TODOs
+- Entity classes have ONLY no-arg constructors — never new EntityClass(arg1, arg2, ...)
+- For INSERT: call repository insertXxx() method; do NOT pass the PK — it's Oracle-sequence-generated
+- For UPDATE: findById().orElseThrow(), then setters, then save() — no generic .update() method
+- FK fields are entity OBJECTS, not Long IDs: use setCustomersEntity(entity) not setCustomerId(id)
+- Entity/Repository names are PascalCase — NEVER ALLCAPS (CustomersEntity not CUSTOMERSEntity)
+- Do NOT import non-existent classes: no CrudRepository<Object,Long>, no ALLCAPS entity imports
 
-Return ONLY corrected FULL Java code.
+Return ONLY the corrected complete Java code. No markdown, no explanations.
 """
 
     def _extract_sql_queries(self, ast_results: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -943,6 +1089,14 @@ Return ONLY corrected FULL Java code.
         if re.search(r'return\s+ResponseEntity\.ok\s*\(\s*\w+\.\w+\(', code):
             errors.append("CRITICAL: Controller returning service call directly")
 
+        # FIX: detect EntityManager / native query usage in a service — must use repository instead
+        if 'createNativeQuery' in code or (
+            '@PersistenceContext' in code and '@Service' in code
+        ):
+            errors.append(
+                "Service uses EntityManager/createNativeQuery — MUST use injected @Autowired repository instead"
+            )
+
         return errors
 
     def _force_fix_controller(self, code: str) -> str:
@@ -1000,9 +1154,43 @@ Return ONLY corrected FULL Java code.
         if start_idx is not None:
             body = lines[start_idx:]
             cleaned = "\n".join(package_lines + import_lines + body).strip()
+            # SBG-27 / LCE prompt FIX: strip any content the LLM appended after the
+            # class/interface closing brace (placeholder imports, bare @Entity, comments).
+            cleaned = self._strip_trailing_garbage(cleaned)
             return self._ensure_spring_stereotype(cleaned)
 
+        text = self._strip_trailing_garbage(text)
         return self._ensure_spring_stereotype(text)
+
+
+    def _strip_trailing_garbage(self, code: str) -> str:
+        """
+        LCE prompt FIX: Strip any content appended after the outermost class/interface
+        closing brace. The LLM occasionally outputs placeholder imports, bare @Entity
+        annotations, or comments after the closing }}, which are illegal Java syntax.
+
+        Tracks brace depth from the first top-level type declaration and returns only
+        through (and including) the final closing brace of that type.
+        """
+        if not code:
+            return code
+        lines = code.splitlines(keepends=True)
+        depth = 0
+        in_type = False
+        close_line = -1
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not in_type:
+                if re.search(r'\b(class|interface|enum|record)\b', stripped):
+                    in_type = True
+            if in_type:
+                depth += line.count('{') - line.count('}')
+                if depth <= 0 and '{' in ''.join(lines[:i+1]):
+                    close_line = i
+                    break
+        if close_line >= 0 and close_line < len(lines) - 1:
+            return ''.join(lines[:close_line + 1]).rstrip()
+        return code
 
     def _ensure_spring_stereotype(self, code: str) -> str:
         if not code:
@@ -1178,9 +1366,18 @@ public class {service_name} {{
         if 'BOOLEAN' in type_name:
             return 'Boolean'
         if 'NUMBER' in type_name:
-            if normalized_name.endswith('id'):
+            # LCE-8 FIX: NUMBER with scale (e.g. NUMBER(10,2)) -> BigDecimal for decimal precision.
+            # NUMBER without scale used as an ID -> Long.
+            # NUMBER without scale used as any other numeric param -> Long (not Integer).
+            # Rationale: JPA repository keys are always Long; using Integer for IN params
+            # caused 'incompatible types: Integer cannot be converted to Long' compile errors
+            # when the param was passed to findById/deleteById/existsById.
+            if ',' in type_name:
+                return 'BigDecimal'
+            if normalized_name.endswith('id') or normalized_name.endswith('_id'):
                 return 'Long'
-            return 'Long' if (mode or '').upper() == 'OUT' else 'Integer'
+            # Default non-ID NUMBER to Long for consistency with JPA key type
+            return 'Long'
         return 'String'
 
     def _default_value_for_java_type(self, java_type: str) -> str:
@@ -1194,8 +1391,11 @@ public class {service_name} {{
         return defaults.get(java_type, 'null')
 
     def _to_pascal_case(self, value: str) -> str:
+        # LCE-FIX A1: use .capitalize() not p[:1].upper() + p[1:] so that
+        # ALLCAPS input like 'CUSTOMERS' becomes 'Customers' not 'CUSTOMERS'.
+        # .capitalize() lowercases the whole word then uppercases the first char.
         parts = [p for p in re.split(r'[^A-Za-z0-9]+', value or '') if p]
-        return ''.join(p[:1].upper() + p[1:] for p in parts) or 'Generated'
+        return ''.join(p.capitalize() for p in parts) or 'Generated'
 
     def _to_camel_case(self, value: str) -> str:
         pascal = self._to_pascal_case(value)
@@ -1231,6 +1431,93 @@ public class {service_name} {{
             logger.error(f"Dependency suggestion failed: {exc}")
             return []
         return self._parse_dependency_suggestions(raw or "")
+
+    async def repair_generated_project(self, repair_context: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.repair_provider:
+            return {"success": False, "reason": "repair_provider_disabled", "files": []}
+
+        prompt = self._build_repair_prompt(repair_context)
+        try:
+            raw = await self.repair_provider.generate_code(
+                prompt,
+                max_tokens=int(self.config.get('backup_llm', {}).get('max_tokens', 6000)),
+                temperature=float(self.config.get('backup_llm', {}).get('temperature', 0.0)),
+            )
+        except Exception as exc:
+            logger.error("Backup LLM repair call failed: %s", exc)
+            return {"success": False, "reason": str(exc), "files": []}
+
+        parsed = self._parse_repair_response(raw or "")
+        if not parsed.get("files"):
+            parsed["success"] = False
+            parsed.setdefault("reason", "no_files_returned")
+        return parsed
+
+    def _build_repair_prompt(self, repair_context: Dict[str, Any]) -> str:
+        return (
+            "You are repairing a generated Java Spring Boot project so it compiles successfully.\n"
+            "Return JSON only. No markdown. No prose outside JSON.\n\n"
+            "Required schema:\n"
+            "{\n"
+            "  \"summary\": \"short reasoned summary\",\n"
+            "  \"files\": [\n"
+            "    {\n"
+            "      \"path\": \"relative/path/from/project/root\",\n"
+            "      \"content\": \"full replacement file content\"\n"
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "Rules:\n"
+            "1. Only include files you are changing.\n"
+            "2. Every file entry must contain the ENTIRE replacement file content.\n"
+            "3. Do not invent files unless required for compilation.\n"
+            "4. Keep package names and project structure consistent.\n"
+            "5. Fix the reported build/compiler errors directly.\n"
+            "6. If one fix requires import changes or method signature changes, include them in the full file content.\n"
+            "7. Prefer minimal edits.\n\n"
+            f"Repair context JSON:\n{json.dumps(repair_context, ensure_ascii=True, indent=2)}"
+        )
+
+    def _parse_repair_response(self, raw: str) -> Dict[str, Any]:
+        text = (raw or "").strip()
+        if not text:
+            return {"success": False, "reason": "empty_response", "files": []}
+
+        fence_match = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            text = fence_match.group(1).strip()
+
+        decoder = json.JSONDecoder()
+        parsed = None
+        for token in ("{", "["):
+            start = text.find(token)
+            if start == -1:
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(text[start:])
+                break
+            except Exception:
+                parsed = None
+
+        if isinstance(parsed, list):
+            parsed = {"summary": "", "files": parsed}
+        if not isinstance(parsed, dict):
+            return {"success": False, "reason": "invalid_json", "files": []}
+
+        files = []
+        for item in parsed.get("files", []):
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            content = item.get("content")
+            if isinstance(path, str) and path.strip() and isinstance(content, str):
+                files.append({"path": path.strip().replace("\\", "/"), "content": content})
+
+        return {
+            "success": bool(files),
+            "summary": parsed.get("summary", ""),
+            "files": files,
+        }
 
     def _parse_dependency_suggestions(self, raw: str) -> List[Dict[str, str]]:
         if not raw:

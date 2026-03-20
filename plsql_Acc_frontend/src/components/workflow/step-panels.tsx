@@ -1879,7 +1879,7 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
           <CardTitle>Business Logic Summary</CardTitle>
           <CardDescription>Functional interpretation of selected PL/SQL scope</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           <div className="rounded-xl text-center border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Selected Logic Units</p>
             <p className="text-sm font-semibold text-slate-900">{props.selectedProcedures.length} procedures</p>
@@ -1890,10 +1890,10 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
               {dominantDomains.length > 0 ? dominantDomains.join(", ") : "Not inferred yet"}
             </p>
           </div>
-          {/* <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Applied Strategy</p>
-            <p className="text-sm font-semibold text-slate-900">{props.selectedStrategy}</p>
-          </div> */}
+          <div className="rounded-xl border text-center border-slate-200/80 bg-slate-50/70 p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-500">Conversion Time</p>
+            <p className="text-sm font-semibold text-slate-900">{formatDuration(props.conversionSnapshot?.conversionDurationMs)}</p>
+          </div>
           <div className="rounded-xl text-center border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Target Runtime</p>
             <p className="text-sm font-semibold text-slate-900">
