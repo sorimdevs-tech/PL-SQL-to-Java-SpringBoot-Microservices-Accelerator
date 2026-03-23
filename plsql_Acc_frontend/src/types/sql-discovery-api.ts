@@ -42,6 +42,12 @@ export interface SqlDiscoveryObject {
   transaction?: SqlTransactionSummary
   issues?: SqlProcedureIssue[]
   dependencyChain?: string[]
+  bulkOperations?: SqlBulkOperation[]
+  cursor?: SqlCursorPattern
+  retryLogic?: SqlRetryLogic
+  errorHandling?: SqlErrorHandling
+  performancePatterns?: string[]
+  collections?: SqlCollectionVariable[]
 }
 
 export interface SqlComplexityMetrics {
@@ -49,6 +55,8 @@ export interface SqlComplexityMetrics {
   numberOfQueries: number
   numberOfConditions: number
   numberOfLoops: number
+  level?: string
+  type?: string
 }
 
 export interface SqlDependencyGraph {
@@ -93,10 +101,12 @@ export interface SqlBusinessRule {
 }
 
 export interface SqlDataFlow {
+  type?: string
   variable: string
   source: string
   source_table?: string
   source_column?: string
+  target?: string
   used?: boolean
   semantic_type?: string
 }
@@ -111,6 +121,7 @@ export interface SqlUnusedVariable {
 export interface SqlExceptionSource {
   statement: string
   exceptions: string[]
+  certainty?: string
   reason: string
 }
 
@@ -123,7 +134,9 @@ export interface SqlIdGeneration {
   uses_sequence: boolean
   input_id_provided: boolean
   conflict: boolean
+  pattern?: string
   strategy?: string
+  impact?: string
   details: string
 }
 
@@ -131,11 +144,58 @@ export interface SqlTransactionSummary {
   required: boolean
   type?: string
   reason: string
+  features?: string[]
+  risk?: string
+  has_savepoint?: boolean
+  has_partial_rollback?: boolean
+  has_commit?: boolean
+  has_rollback?: boolean
 }
 
 export interface SqlProcedureIssue {
   type: string
   details: string
+  impact?: string
+}
+
+export interface SqlBulkOperation {
+  type: string
+  operation?: string
+  cursor?: string
+  target?: string
+  table?: string
+  source?: string
+  limit?: string
+  batch_size?: string
+  save_exceptions?: boolean
+}
+
+export interface SqlCursorPattern {
+  type: string
+  locking?: string
+  purpose?: string
+}
+
+export interface SqlRetryLogic {
+  enabled: boolean
+  uses_goto?: boolean
+  max_attempts?: number | null
+  pattern?: string
+}
+
+export interface SqlErrorHandling {
+  type: string
+  mechanism?: string
+  behavior?: string
+}
+
+export interface SqlCollectionVariable {
+  name: string
+  type: string
+  declared_type?: string
+  element_type?: string
+  index_by?: string
+  source_table?: string
 }
 
 export interface SqlSchemaColumn {
@@ -214,6 +274,12 @@ export interface SqlDiscoveryProcedure {
   transaction?: SqlTransactionSummary
   issues?: SqlProcedureIssue[]
   dependency_chain?: string[]
+  bulk_operations?: SqlBulkOperation[]
+  cursor?: SqlCursorPattern
+  retry_logic?: SqlRetryLogic
+  error_handling?: SqlErrorHandling
+  performance_patterns?: string[]
+  collections?: SqlCollectionVariable[]
 }
 
 export interface SqlDiscoveryModel {
@@ -274,6 +340,12 @@ export interface SqlDiscoveryAnalyzeResponse {
   transaction?: SqlTransactionSummary
   issues?: SqlProcedureIssue[]
   dependencyChain?: string[]
+  bulkOperations?: SqlBulkOperation[]
+  cursor?: SqlCursorPattern
+  retryLogic?: SqlRetryLogic
+  errorHandling?: SqlErrorHandling
+  performancePatterns?: string[]
+  collections?: SqlCollectionVariable[]
   discovery?: SqlDiscoveryModel
   objects?: SqlDiscoveryObject[]
   count?: number

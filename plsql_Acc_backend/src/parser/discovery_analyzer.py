@@ -308,6 +308,75 @@ def _extract_table_definitions(sql_text: str) -> List[Dict[str, Any]]:
     return table_defs
 
 
+def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
+    cleaned = _prepare_sql_text(sql_text)
+    objects = _extract_objects(cleaned)
+    blocks = [item.block_text for item in objects] or [cleaned]
+    inferred_tables: Set[str] = set()
+    inferred_columns: Dict[str, Set[str]] = {}
+
+    def add_table(raw_name: str) -> None:
+        normalized = _normalize_identifier(raw_name).upper()
+        if not normalized or normalized in {"DUAL", "TABLE"}:
+            return
+        inferred_tables.add(normalized)
+        inferred_columns.setdefault(normalized, set())
+
+    for block_text in blocks:
+        operations_tables = _extract_operations_and_tables(block_text)
+        operations_by_table = _extract_operations_by_table(block_text)
+        block_tables: Set[str] = set()
+
+        for table_name in operations_tables.get("tables", []):
+            normalized_table = _normalize_identifier(table_name).upper()
+            add_table(normalized_table)
+            if normalized_table and normalized_table not in {"DUAL", "TABLE"}:
+                block_tables.add(normalized_table)
+        for table_name in operations_by_table:
+            normalized_table = _normalize_identifier(table_name).upper()
+            add_table(normalized_table)
+            if normalized_table and normalized_table not in {"DUAL", "TABLE"}:
+                block_tables.add(normalized_table)
+
+        bulk_operations = detect_bulk_operations({"block_text": block_text})
+        for operation in bulk_operations:
+            op_type = str(operation.get("type", "")).upper()
+            if op_type == "BULK_COLLECT":
+                source_table = _normalize_identifier(str(operation.get("source", ""))).upper()
+                add_table(source_table)
+                if source_table and source_table not in {"DUAL", "TABLE"}:
+                    block_tables.add(source_table)
+            elif op_type == "FORALL":
+                target_table = _normalize_identifier(str(operation.get("table", ""))).upper()
+                add_table(target_table)
+                if target_table and target_table not in {"DUAL", "TABLE"}:
+                    block_tables.add(target_table)
+
+        table_columns = _extract_table_columns(block_text, sorted(block_tables))
+        for table_name, columns in table_columns.items():
+            normalized_table = _normalize_identifier(table_name).upper()
+            inferred_columns.setdefault(normalized_table, set()).update(
+                _normalize_identifier(column).upper()
+                for column in columns
+                if column
+            )
+
+    return [
+        {
+            "name": table_name,
+            "table_name": table_name,
+            "columns": [
+                {"name": column_name, "type": "UNKNOWN"}
+                for column_name in sorted(inferred_columns.get(table_name, set()))
+            ],
+            "primary_keys": [],
+            "foreign_keys": [],
+            "source": "inferred_from_procedure",
+        }
+        for table_name in sorted(inferred_tables)
+    ]
+
+
 def _extract_alter_table_foreign_keys(sql_text: str) -> List[Dict[str, str]]:
     pattern = re.compile(
         r'alter\s+table\s+([`"\w$#\.]+).*?foreign\s+key\s*\(([^)]+)\)\s+references\s+([`"\w$#\.]+)\s*\(([^)]+)\)',
@@ -441,14 +510,14 @@ def _extract_operations_and_tables(block_text: str) -> Dict[str, Any]:
             return
         tables.add(normalized)
 
-    for pattern, operation in (
-        (r"\bselect\b", "SELECT"),
-        (r"\binsert\b", "INSERT"),
-        (r"\bupdate\b", "UPDATE"),
-        (r"\bdelete\b", "DELETE"),
-    ):
-        if re.search(pattern, block_text, flags=re.IGNORECASE):
-            operations.add(operation)
+    if re.search(r"\bselect\b", block_text, flags=re.IGNORECASE):
+        operations.add("SELECT")
+    if re.search(r"\binsert\s+into\b", block_text, flags=re.IGNORECASE):
+        operations.add("INSERT")
+    if re.search(r"(?<!\bfor\s)\bupdate\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
+        operations.add("UPDATE")
+    if re.search(r"\bdelete\s+from\b", block_text, flags=re.IGNORECASE):
+        operations.add("DELETE")
 
     for match in re.finditer(r"\bfrom\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         _add_table(match.group(1))
@@ -456,7 +525,7 @@ def _extract_operations_and_tables(block_text: str) -> Dict[str, Any]:
         _add_table(match.group(1))
     for match in re.finditer(r"\binsert\s+into\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         _add_table(match.group(1))
-    for match in re.finditer(r"\bupdate\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
+    for match in re.finditer(r"(?<!\bfor\s)\bupdate\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         _add_table(match.group(1))
     for match in re.finditer(r"\bdelete\s+from\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         _add_table(match.group(1))
@@ -477,7 +546,7 @@ def _extract_operations_by_table(block_text: str) -> Dict[str, List[str]]:
         add(match.group(1), "SELECT")
     for match in re.finditer(r"\binsert\s+into\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         add(match.group(1), "INSERT")
-    for match in re.finditer(r"\bupdate\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
+    for match in re.finditer(r"(?<!\bfor\s)\bupdate\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         add(match.group(1), "UPDATE")
     for match in re.finditer(r"\bdelete\s+from\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         add(match.group(1), "DELETE")
@@ -545,12 +614,7 @@ def _extract_table_relationships(block_text: str) -> List[Dict[str, str]]:
 
 
 def _extract_local_variables(block_text: str) -> List[Dict[str, str]]:
-    declaration_section = ""
-    header_end = re.search(r"\b(?:is|as)\b", block_text, flags=re.IGNORECASE)
-    if header_end:
-        remainder = block_text[header_end.end() :]
-        begin_match = re.search(r"\bbegin\b", remainder, flags=re.IGNORECASE)
-        declaration_section = remainder[: begin_match.start()] if begin_match else remainder
+    declaration_section = _extract_declaration_section(block_text)
 
     local_vars: List[Dict[str, str]] = []
     for line in declaration_section.splitlines():
@@ -567,6 +631,101 @@ def _extract_local_variables(block_text: str) -> List[Dict[str, str]]:
         name, data_type = match.groups()
         local_vars.append({"name": _normalize_identifier(name), "type": data_type.upper()})
     return local_vars
+
+
+def _extract_declaration_section(block_text: str) -> str:
+    header_end = re.search(r"\b(?:is|as)\b", block_text, flags=re.IGNORECASE)
+    if not header_end:
+        return ""
+    remainder = block_text[header_end.end() :]
+    begin_match = re.search(r"\bbegin\b", remainder, flags=re.IGNORECASE)
+    return remainder[: begin_match.start()] if begin_match else remainder
+
+
+def _extract_collection_definitions(
+    block_text: str,
+    local_variables: Sequence[Dict[str, str]],
+) -> Dict[str, Any]:
+    declaration_section = _extract_declaration_section(block_text)
+    type_definitions: Dict[str, Dict[str, Any]] = {}
+    type_pattern = re.compile(
+        r"\btype\s+([A-Za-z_][\w$#]*)\s+is\s+table\s+of\s+(.+?)(?:\s+index\s+by\s+(.+?))?\s*;",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in type_pattern.finditer(declaration_section):
+        type_name = _normalize_identifier(match.group(1)).upper()
+        element_type = _normalize_statement_text(match.group(2))
+        index_by = _normalize_statement_text(match.group(3)) if match.group(3) else ""
+        source_table = ""
+        rowtype_match = re.search(r"([`\"\w$#\.]+)\s*%ROWTYPE", element_type, flags=re.IGNORECASE)
+        if rowtype_match:
+            source_table = _normalize_identifier(rowtype_match.group(1)).upper()
+        type_definitions[type_name] = {
+            "type_name": type_name,
+            "element_type": element_type.upper(),
+            "index_by": index_by.upper(),
+            "source_table": source_table,
+        }
+
+    collection_variables: Dict[str, Dict[str, Any]] = {}
+    for variable in local_variables:
+        variable_name = variable.get("name", "")
+        declared_type = variable.get("type", "").upper()
+        if not variable_name:
+            continue
+        metadata = type_definitions.get(declared_type)
+        if metadata:
+            collection_variables[variable_name.upper()] = {
+                "name": variable_name,
+                "declared_type": declared_type,
+                **metadata,
+            }
+            continue
+        if re.search(r"(?:ODCI\w+LIST|\bTABLE\b|\bARRAY\b|\bLIST\b)", declared_type, flags=re.IGNORECASE):
+            collection_variables[variable_name.upper()] = {
+                "name": variable_name,
+                "declared_type": declared_type,
+                "type_name": declared_type,
+                "element_type": declared_type,
+                "index_by": "",
+                "source_table": "",
+            }
+
+    return {
+        "type_definitions": list(type_definitions.values()),
+        "variables": collection_variables,
+    }
+
+
+def _extract_cursor_definitions(block_text: str) -> List[Dict[str, Any]]:
+    declaration_section = _extract_declaration_section(block_text)
+    cursor_pattern = re.compile(
+        r"\bcursor\s+([A-Za-z_][\w$#]*)\s+is\s+(select\b.*?);",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    cursors: List[Dict[str, Any]] = []
+    for match in cursor_pattern.finditer(declaration_section):
+        cursor_name = _normalize_identifier(match.group(1))
+        statement = _normalize_statement_text(match.group(2))
+        tables: List[str] = []
+        for table_match in re.finditer(r"\b(?:from|join)\s+([`\"\w$#\.]+)", match.group(2), flags=re.IGNORECASE):
+            table_name = _normalize_identifier(table_match.group(1)).upper()
+            if table_name not in {"DUAL", "TABLE"} and table_name not in tables:
+                tables.append(table_name)
+        locking_match = re.search(
+            r"\bfor\s+update(?:\s+of\s+[\w\s,.$#\"]+)?(?:\s+skip\s+locked)?",
+            match.group(2),
+            flags=re.IGNORECASE,
+        )
+        cursors.append(
+            {
+                "name": cursor_name,
+                "statement": statement,
+                "tables": tables,
+                "locking": _normalize_statement_text(locking_match.group(0)).upper() if locking_match else "",
+            }
+        )
+    return cursors
 
 
 def _normalize_statement_text(statement: str) -> str:
@@ -723,13 +882,13 @@ def _extract_business_rules(block_text: str) -> List[Dict[str, Any]]:
             return ", ".join(ordered)
         return " ".join(action_block.split())[:200]
 
-    def build_rule(condition: str, action: str, false_action: str = "") -> Dict[str, Any]:
+    def build_rule(condition: str, action: str) -> Dict[str, Any]:
         rule_type = _classify_rule_type(condition, action)
         rule: Dict[str, Any] = {
             "condition": condition,
             "action": action,
             "true_action": action,
-            "false_action": false_action,
+            "false_action": "",
             "type": rule_type,
         }
         if rule_type == "conditional_delete":
@@ -755,13 +914,10 @@ def _extract_business_rules(block_text: str) -> List[Dict[str, Any]]:
         split_points.sort(key=lambda item: item[1])
 
         true_block = body if not split_points else body[: split_points[0][1]]
-        tail_start = split_points[0][1] if split_points else len(body)
-        false_block = body[tail_start:] if tail_start < len(body) else ""
         rules.append(
             build_rule(
                 primary_condition,
                 summarize_action(true_block),
-                summarize_action(false_block) if false_block.strip() else "",
             )
         )
 
@@ -777,7 +933,6 @@ def _extract_business_rules(block_text: str) -> List[Dict[str, Any]]:
                 build_rule(
                     " ".join(elsif_match.group(1).split()),
                     summarize_action(elsif_match.group(2)),
-                    summarize_action(else_block) if else_block.strip() else "",
                 )
             )
         if else_block.strip():
@@ -785,7 +940,6 @@ def _extract_business_rules(block_text: str) -> List[Dict[str, Any]]:
                 build_rule(
                     "ELSE",
                     summarize_action(else_block),
-                    "",
                 )
             )
 
@@ -864,7 +1018,7 @@ def _extract_unused_variables(
             {
                 "name": variable_names.get(variable_name, variable_name),
                 "type": variable_types.get(variable_name, ""),
-                "reason": "assigned but never used",
+                "reason": "value assigned but never used",
                 "source": event.get("source", ""),
             }
         )
@@ -917,6 +1071,51 @@ def _build_dependencies(
     return sorted({*tables_used, *sequence_dependencies})
 
 
+def _clean_dependencies(
+    tables_used: Sequence[str],
+    sequence_dependencies: Sequence[str],
+    known_tables: Sequence[str],
+    known_sequences: Sequence[str],
+) -> List[str]:
+    table_set = {table.upper() for table in known_tables}
+    sequence_set = {sequence.upper() for sequence in known_sequences}
+    cleaned: Set[str] = set()
+    cleaned.update(table.upper() for table in tables_used if table.upper() in table_set)
+    cleaned.update(sequence.upper() for sequence in sequence_dependencies if sequence.upper() in sequence_set)
+    return sorted(cleaned)
+
+
+def _merge_bulk_operations_into_operations(
+    operations_by_table: Dict[str, List[str]],
+    bulk_operations: Sequence[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    merged: Dict[str, Set[str]] = {
+        table.upper(): {operation.upper() for operation in operations}
+        for table, operations in operations_by_table.items()
+    }
+    for operation in bulk_operations:
+        op_type = str(operation.get("type", "")).upper()
+        if op_type == "BULK_COLLECT":
+            table_name = str(operation.get("source", "")).upper()
+            if table_name:
+                merged.setdefault(table_name, set()).add("SELECT")
+        elif op_type == "FORALL":
+            table_name = str(operation.get("table", "")).upper()
+            action = str(operation.get("operation", "")).upper()
+            if table_name and action:
+                merged.setdefault(table_name, set()).add(action)
+    return {table: sorted(operations) for table, operations in merged.items()}
+
+
+def _synchronize_tables_used(
+    tables_used: Sequence[str],
+    operations_by_table: Dict[str, List[str]],
+) -> List[str]:
+    normalized = {table.upper() for table in tables_used}
+    normalized.update(table.upper() for table in operations_by_table)
+    return sorted(normalized)
+
+
 def _extract_exceptions(block_text: str) -> List[str]:
     found: Set[str] = set()
     for match in re.finditer(r"\bwhen\s+([A-Za-z_][\w$#]*)\s+then\b", block_text, flags=re.IGNORECASE):
@@ -964,13 +1163,36 @@ def _extract_procedure_calls(
 
 def _complexity_metrics(block_text: str) -> Dict[str, int]:
     non_empty_lines = [line for line in block_text.splitlines() if line.strip()]
+    matched_spans: List[Tuple[int, int]] = []
+
+    def count_pattern(pattern: str) -> int:
+        count = 0
+        for match in re.finditer(pattern, block_text, flags=re.IGNORECASE | re.DOTALL):
+            matched_spans.append(match.span())
+            count += 1
+        return count
+
+    number_of_loops = 0
+    number_of_loops += count_pattern(r"\bfor\s+[A-Za-z_][\w$#]*\s+in\b.*?\bloop\b")
+    number_of_loops += count_pattern(r"\bwhile\b.*?\bloop\b")
+    number_of_loops += count_pattern(r"\bforall\s+[A-Za-z_][\w$#]*\s+in\b")
+
+    for match in re.finditer(r"\bloop\b", block_text, flags=re.IGNORECASE):
+        start, _ = match.span()
+        prefix = block_text[max(0, start - 8) : start].lower()
+        if "end " in prefix:
+            continue
+        if any(span_start <= start < span_end for span_start, span_end in matched_spans):
+            continue
+        number_of_loops += 1
+
     return {
         "linesOfCode": len(non_empty_lines),
         "numberOfQueries": len(
             re.findall(r"\b(?:select|insert|update|delete)\b", block_text, flags=re.IGNORECASE)
         ),
         "numberOfConditions": len(re.findall(r"\b(?:if|elsif|else)\b", block_text, flags=re.IGNORECASE)),
-        "numberOfLoops": len(re.findall(r"\bloop\b", block_text, flags=re.IGNORECASE)),
+        "numberOfLoops": number_of_loops,
     }
 
 
@@ -1006,6 +1228,339 @@ def _extract_insert_statements(block_text: str) -> List[Dict[str, Any]]:
             }
         )
     return statements
+
+
+def detect_bulk_collect(code: str) -> List[Dict[str, Any]]:
+    bulk_collects: List[Dict[str, Any]] = []
+    cursor_lookup = {
+        cursor.get("name", "").upper(): cursor
+        for cursor in _extract_cursor_definitions(code)
+    }
+
+    select_bulk_pattern = re.compile(
+        r"\bselect\b.*?\bbulk\s+collect\s+into\s+([A-Za-z_][\w$#]*)(?:\s*,\s*[A-Za-z_][\w$#]*)*\s+\bfrom\s+([`\"\w$#\.]+).*?;",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in select_bulk_pattern.finditer(code):
+        target = _normalize_identifier(match.group(1))
+        source = _normalize_identifier(match.group(2)).upper()
+        bulk_collects.append(
+            {
+                "type": "BULK_COLLECT",
+                "cursor": "",
+                "target": target,
+                "limit": "",
+                "batch_size": "",
+                "source": source,
+            }
+        )
+
+    fetch_bulk_pattern = re.compile(
+        r"\bfetch\s+([A-Za-z_][\w$#]*)\s+bulk\s+collect\s+into\s+([A-Za-z_][\w$#]*)(?:\s*,\s*[A-Za-z_][\w$#]*)*(?:\s+limit\s+(.+?))?\s*;",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in fetch_bulk_pattern.finditer(code):
+        cursor_name = _normalize_identifier(match.group(1))
+        target = _normalize_identifier(match.group(2))
+        limit_value = _normalize_statement_text(match.group(3)) if match.group(3) else ""
+        cursor_meta = cursor_lookup.get(cursor_name.upper(), {})
+        cursor_tables = cursor_meta.get("tables") or []
+        bulk_collects.append(
+            {
+                "type": "BULK_COLLECT",
+                "cursor": cursor_name,
+                "target": target,
+                "limit": limit_value,
+                "batch_size": limit_value,
+                "source": cursor_tables[0] if cursor_tables else "",
+            }
+        )
+
+    return bulk_collects
+
+
+def detect_forall(code: str) -> List[Dict[str, Any]]:
+    forall_operations: List[Dict[str, Any]] = []
+    forall_pattern = re.compile(
+        r"\bforall\s+([A-Za-z_][\w$#]*)\s+in\s+.*?(save\s+exceptions\s+)?(insert\s+into|update|delete\s+from|merge\s+into)\s+([`\"\w$#\.]+).*?;",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in forall_pattern.finditer(code):
+        operation_keyword = match.group(3).upper()
+        operation = operation_keyword.split()[0]
+        forall_operations.append(
+            {
+                "type": "FORALL",
+                "operation": operation,
+                "table": _normalize_identifier(match.group(4)).upper(),
+                "save_exceptions": bool(match.group(2)),
+            }
+        )
+    return forall_operations
+
+
+def detect_cursor(code: str) -> Dict[str, Any]:
+    cursor_definitions = _extract_cursor_definitions(code)
+    if cursor_definitions:
+        locking_values = [cursor.get("locking", "") for cursor in cursor_definitions if cursor.get("locking")]
+        locking = locking_values[0] if locking_values else ""
+        result: Dict[str, Any] = {
+            "type": "explicit_cursor",
+            "locking": locking,
+        }
+        if locking:
+            result["purpose"] = "concurrent-safe processing" if "SKIP LOCKED" in locking else "cursor-driven processing"
+        return result
+
+    locking_match = re.search(
+        r"\bfor\s+update(?:\s+skip\s+locked)?",
+        code,
+        flags=re.IGNORECASE,
+    )
+    if not locking_match:
+        return {}
+    locking = _normalize_statement_text(locking_match.group(0)).upper()
+    return {
+        "type": "explicit_cursor",
+        "locking": locking,
+        "purpose": "concurrent-safe processing" if "SKIP LOCKED" in locking else "locked row processing",
+    }
+
+
+def detect_transaction(code: str) -> Dict[str, Any]:
+    return {
+        "has_savepoint": bool(re.search(r"\bsavepoint\b", code, flags=re.IGNORECASE)),
+        "has_partial_rollback": bool(re.search(r"\brollback\s+to(?:\s+savepoint)?\b", code, flags=re.IGNORECASE)),
+        "has_commit": bool(re.search(r"\bcommit\b", code, flags=re.IGNORECASE)),
+        "has_rollback": bool(re.search(r"\brollback\b", code, flags=re.IGNORECASE)),
+    }
+
+
+def detect_retry(code: str) -> Dict[str, Any]:
+    goto_match = re.search(r"\bgoto\s+([A-Za-z_][\w$#]*)\s*;", code, flags=re.IGNORECASE)
+    if not goto_match:
+        return {
+            "uses_goto": False,
+            "pattern": "",
+        }
+    return {
+        "uses_goto": True,
+        "pattern": _normalize_identifier(goto_match.group(1)),
+    }
+
+
+def detect_collections(code: str) -> List[Dict[str, Any]]:
+    local_variables = _extract_local_variables(code)
+    collection_definitions = _extract_collection_definitions(code, local_variables)
+    collections: List[Dict[str, Any]] = []
+    for metadata in collection_definitions.get("variables", {}).values():
+        collections.append(
+            {
+                "name": metadata.get("name", ""),
+                "type": "collection",
+                "declared_type": metadata.get("declared_type", ""),
+                "element_type": metadata.get("element_type", ""),
+                "index_by": metadata.get("index_by", ""),
+                "source_table": metadata.get("source_table", ""),
+            }
+        )
+    return collections
+
+
+def detect_bulk_operations(ast: Dict[str, Any]) -> List[Dict[str, Any]]:
+    block_text = ast.get("block_text", "")
+    return [*detect_bulk_collect(block_text), *detect_forall(block_text)]
+
+
+def detect_cursor_patterns(ast: Dict[str, Any]) -> Dict[str, Any]:
+    return detect_cursor(ast.get("block_text", ""))
+
+
+def detect_retry_logic(ast: Dict[str, Any]) -> Dict[str, Any]:
+    block_text = ast.get("block_text", "")
+    retry_summary = detect_retry(block_text)
+    if not retry_summary.get("uses_goto"):
+        return {"enabled": False, "max_attempts": None, "pattern": ""}
+
+    labels = {
+        _normalize_identifier(match.group(1))
+        for match in re.finditer(r"<<\s*([A-Za-z_][\w$#]*)\s*>>", block_text, flags=re.IGNORECASE)
+    }
+    goto_labels = [
+        _normalize_identifier(match.group(1))
+        for match in re.finditer(r"\bgoto\s+([A-Za-z_][\w$#]*)\s*;", block_text, flags=re.IGNORECASE)
+    ]
+    max_attempts: Optional[int] = None
+    for label in goto_labels:
+        retry_pattern = re.compile(
+            rf"\bif\s+.*?(?:<|<=)\s*(\d+)\s+then\b.*?\bgoto\s+{re.escape(label)}\s*;",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        match = retry_pattern.search(block_text)
+        if match:
+            max_attempts = int(match.group(1))
+            break
+
+    target_label = next((label for label in goto_labels if label in labels), goto_labels[0])
+    return {
+        "enabled": True,
+        "max_attempts": max_attempts,
+        "pattern": f"GOTO {target_label}",
+        "uses_goto": True,
+    }
+
+
+def detect_bulk_exception_handling(ast: Dict[str, Any]) -> Dict[str, Any]:
+    block_text = ast.get("block_text", "")
+    bulk_operations = ast.get("bulk_operations", [])
+    has_save_exceptions = any(operation.get("save_exceptions") for operation in bulk_operations)
+    if not has_save_exceptions and not re.search(r"\bSQL%BULK_EXCEPTIONS\b", block_text, flags=re.IGNORECASE):
+        return {}
+    return {
+        "type": "bulk_exception_handling",
+        "mechanism": "SQL%BULK_EXCEPTIONS",
+        "behavior": "continue_on_error",
+    }
+
+
+def detect_transaction_patterns(ast: Dict[str, Any]) -> Dict[str, Any]:
+    block_text = ast.get("block_text", "")
+    base_transaction = _build_transaction_summary(ast.get("operations", {}))
+    transaction_flags = detect_transaction(block_text)
+    features: List[str] = []
+
+    loop_commit_pattern = re.compile(
+        r"\b(?:for\s+\w+\s+in\b.*?\bloop\b|\bwhile\b.*?\bloop\b|\bloop\b).*?\bcommit\b.*?\bend\s+loop\b",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if loop_commit_pattern.search(block_text):
+        features.append("COMMIT inside loop")
+    elif re.search(r"\bcommit\b", block_text, flags=re.IGNORECASE):
+        features.append("COMMIT")
+
+    if re.search(r"\bsavepoint\b", block_text, flags=re.IGNORECASE):
+        features.append("SAVEPOINT")
+    if re.search(r"\brollback\s+to(?:\s+savepoint)?\b", block_text, flags=re.IGNORECASE):
+        features.append("ROLLBACK TO SAVEPOINT")
+        features.append("partial rollback")
+    elif re.search(r"\brollback\b", block_text, flags=re.IGNORECASE):
+        features.append("ROLLBACK")
+
+    features = list(dict.fromkeys(features))
+    has_savepoint = any(feature in {"SAVEPOINT", "ROLLBACK TO SAVEPOINT", "partial rollback"} for feature in features)
+    risk = "high" if has_savepoint or "COMMIT inside loop" in features else ("medium" if features else "low")
+
+    if has_savepoint:
+        tx_type = "batch_with_savepoint"
+        reason = "batch processing with explicit savepoint control"
+    elif base_transaction.get("required"):
+        tx_type = base_transaction.get("type", "multi_step_mutation")
+        reason = "multiple dependent DML operations"
+    elif features:
+        tx_type = "explicit_transaction_control"
+        reason = "explicit transaction control statements detected"
+    else:
+        tx_type = base_transaction.get("type", "single_step")
+        reason = base_transaction.get("reason", "")
+
+    return {
+        "required": base_transaction.get("required", False) or bool(features),
+        "type": tx_type,
+        "reason": reason,
+        "features": features,
+        "risk": risk,
+        **transaction_flags,
+    }
+
+
+def detect_collection_data_flow(ast: Dict[str, Any]) -> List[Dict[str, Any]]:
+    block_text = ast.get("block_text", "")
+    collection_variables = ast.get("collection_definitions", {}).get("variables", {})
+    flows: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+
+    for operation in ast.get("bulk_operations", []):
+        if operation.get("type") != "BULK_COLLECT":
+            continue
+        target = operation.get("target", "")
+        source = operation.get("source", "")
+        key = ("bulk_collection", source, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        flows.append(
+            {
+                "type": "bulk_collection",
+                "source": source,
+                "variable": target,
+                "target": target,
+            }
+        )
+
+    for variable_name, metadata in collection_variables.items():
+        collection_name = metadata.get("name", variable_name)
+        assignment_pattern = re.compile(
+            rf"(?<![\w$#]){re.escape(collection_name)}\s*\([^)]*\)\s*:=|(?<![\w$#]){re.escape(collection_name)}\.(?:extend|trim|delete)\b",
+            flags=re.IGNORECASE,
+        )
+        if assignment_pattern.search(block_text):
+            key = ("computed_collection", "", collection_name)
+            if key not in seen:
+                seen.add(key)
+                flows.append(
+                    {
+                        "type": "computed_collection",
+                        "source": "",
+                        "variable": collection_name,
+                        "target": collection_name,
+                    }
+                )
+
+    assignment_pattern = re.compile(
+        r"([A-Za-z_][\w$#]*)(?:\s*\([^)]*\))?(?:\s*\.\s*[A-Za-z_][\w$#]*)?\s*:=\s*(.*?);",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in assignment_pattern.finditer(block_text):
+        target_name = _normalize_identifier(match.group(1))
+        if target_name.upper() not in collection_variables:
+            continue
+        expression = _normalize_statement_text(match.group(2))
+        source_match = re.search(
+            r"([A-Za-z_][\w$#]*)\s*\([^)]*\)\s*\.\s*([A-Za-z_][\w$#]*)",
+            expression,
+            flags=re.IGNORECASE,
+        )
+        source = ""
+        if source_match:
+            source_collection = _normalize_identifier(source_match.group(1))
+            source_field = _normalize_identifier(source_match.group(2)).upper()
+            source = f"{source_collection}.{source_field}"
+        key = ("computed_collection", source, target_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        flows.append(
+            {
+                "type": "computed_collection",
+                "source": source,
+                "variable": target_name,
+                "target": target_name,
+            }
+        )
+
+    return flows
+
+
+def classify_complexity(ast: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = _complexity_metrics(ast.get("block_text", ""))
+    has_advanced_patterns = bool(
+        ast.get("cursor")
+        or ast.get("bulk_operations")
+        or ast.get("transaction", {}).get("features")
+    )
+    metrics["level"] = "high" if has_advanced_patterns else ("medium" if metrics["numberOfQueries"] > 2 else "low")
+    metrics["type"] = "enterprise_batch_processing" if has_advanced_patterns else "standard_procedural_logic"
+    return metrics
 
 
 def _build_id_generation_summary(
@@ -1062,7 +1617,9 @@ def _build_id_generation_summary(
         "uses_sequence": uses_sequence,
         "input_id_provided": input_id_provided,
         "conflict": conflict,
+        "pattern": strategy,
         "strategy": strategy,
+        "impact": "input parameter ignored" if conflict else "",
         "details": "Input parameter ignored in INSERT" if conflict else "",
     }
 
@@ -1210,6 +1767,7 @@ def detect_exception_sources(ast: Dict[str, Any]) -> List[Dict[str, Any]]:
             {
                 "statement": assignment.get("statement", ""),
                 "exceptions": ["NO_DATA_FOUND", "TOO_MANY_ROWS"],
+                "certainty": "guaranteed",
                 "reason": "SELECT INTO requires exactly one row",
             }
         )
@@ -1231,8 +1789,17 @@ def detect_id_generation_conflict(ast: Dict[str, Any], schema: Dict[str, Any]) -
     )
 
 
-def detect_transaction(ast: Dict[str, Any]) -> Dict[str, Any]:
-    return _build_transaction_summary(ast.get("operations", {}))
+def detect_id_conflict(ast: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    return detect_id_generation_conflict(ast, schema)
+
+
+def detect_transaction(code: str) -> Dict[str, Any]:
+    return {
+        "has_savepoint": bool(re.search(r"\bsavepoint\b", code, flags=re.IGNORECASE)),
+        "has_partial_rollback": bool(re.search(r"\brollback\s+to(?:\s+savepoint)?\b", code, flags=re.IGNORECASE)),
+        "has_commit": bool(re.search(r"\bcommit\b", code, flags=re.IGNORECASE)),
+        "has_rollback": bool(re.search(r"\brollback\b", code, flags=re.IGNORECASE)),
+    }
 
 
 def detect_logic_gaps(ast: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -1266,10 +1833,84 @@ def detect_logic_gaps(ast: Dict[str, Any]) -> List[Dict[str, str]]:
     return issues
 
 
+def _enhance_business_rules(
+    block_text: str,
+    base_rules: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    begin_match = re.search(r"\bbegin\b", block_text, flags=re.IGNORECASE)
+    executable_section = block_text[begin_match.end() :] if begin_match else block_text
+
+    def normalize_rule_expression(expression: str) -> str:
+        collapsed = _normalize_statement_text(expression)
+        return re.sub(
+            r"([A-Za-z_][\w$#]*)\s*\([^)]*\)\s*\.\s*([A-Za-z_][\w$#]*)",
+            lambda match: f"{_normalize_identifier(match.group(1))}.{_normalize_identifier(match.group(2)).upper()}",
+            collapsed,
+            flags=re.IGNORECASE,
+        )
+
+    rules: List[Dict[str, Any]] = [dict(rule) for rule in base_rules]
+    seen: Set[Tuple[str, str, str]] = {
+        (
+            str(rule.get("condition", "")),
+            str(rule.get("action", "")),
+            str(rule.get("type", "")),
+        )
+        for rule in rules
+    }
+
+    retry_pattern = re.compile(
+        r"\bif\s+(.*?)\s+then\b.*?\bgoto\s+([A-Za-z_][\w$#]*)\s*;",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in retry_pattern.finditer(executable_section):
+        condition = " ".join(match.group(1).split())
+        action = f"RETRY { _normalize_identifier(match.group(2)) }"
+        key = (condition, action, "retry_condition")
+        if key in seen:
+            continue
+        seen.add(key)
+        rules.append(
+            {
+                "condition": condition,
+                "action": action,
+                "true_action": action,
+                "false_action": "",
+                "type": "retry_condition",
+            }
+        )
+
+    calc_pattern = re.compile(
+        r"([A-Za-z_][\w$#]*(?:\s*\([^)]*\))?(?:\s*\.\s*[A-Za-z_][\w$#]*)?)\s*:=\s*(.*?[+\-*/].*?);",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in calc_pattern.finditer(executable_section):
+        target = _normalize_identifier(match.group(1).split("(")[0].split(".")[0])
+        expression = normalize_rule_expression(match.group(2))
+        action = f"{target} = {expression}"
+        key = ("", action, "calculation_logic")
+        if key in seen:
+            continue
+        seen.add(key)
+        rules.append(
+            {
+                "condition": "",
+                "action": action,
+                "true_action": action,
+                "false_action": "",
+                "type": "calculation_logic",
+            }
+        )
+
+    return rules
+
+
 def build_discovery_model(sql_text: str) -> Dict[str, Any]:
     """Build a full-file discovery model for schema + procedure behavior."""
     cleaned = _prepare_sql_text(sql_text)
     table_defs = _extract_table_definitions(cleaned)
+    if not table_defs:
+        table_defs = infer_tables_from_dml(cleaned)
     table_map = {table["name"]: table for table in table_defs}
     ddl_columns = {table["name"]: [col["name"] for col in table["columns"]] for table in table_defs}
     relationships = _dedupe_relationships([
@@ -1290,9 +1931,20 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         params = _extract_parameters(item.block_text)
         parameter_names = [param["name"] for param in params["all"]]
         local_variables = _extract_local_variables(item.block_text)
+        collections = detect_collections(item.block_text)
+        collection_definitions = _extract_collection_definitions(item.block_text, local_variables)
+        cursor_definitions = _extract_cursor_definitions(item.block_text)
         operations_tables = _extract_operations_and_tables(item.block_text)
         tables_used = operations_tables["tables"]
         operations_by_table = _extract_operations_by_table(item.block_text)
+        preliminary_ast: Dict[str, Any] = {
+            "block_text": item.block_text,
+            "cursor_definitions": cursor_definitions,
+            "collection_definitions": collection_definitions,
+        }
+        bulk_operations = detect_bulk_operations(preliminary_ast)
+        operations_by_table = _merge_bulk_operations_into_operations(operations_by_table, bulk_operations)
+        tables_used = _synchronize_tables_used(tables_used, operations_by_table)
         sequence_dependencies = _extract_sequence_dependencies(item.block_text, sequence_names)
         select_assignments = _extract_select_into_assignments(item.block_text)
         scalar_assignments = _extract_scalar_assignments(
@@ -1319,12 +1971,15 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "input_parameters": params["in"],
             "output_parameters": params["out"],
             "variables": local_variables,
+            "collections": collections,
             "tables_used": tables_used,
             "operations": operations_by_table,
             "sequence_dependencies": sequence_dependencies,
             "select_assignments": select_assignments,
             "assignments": [*select_assignments, *scalar_assignments],
             "insert_statements": insert_statements,
+            "collection_definitions": collection_definitions,
+            "cursor_definitions": cursor_definitions,
             "schema": {
                 "tables": table_defs,
                 "relationships": relationships,
@@ -1332,16 +1987,34 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
                 "sequence_mapping": sequence_catalog["sequence_mapping"],
             },
         }
+        analysis_ast["bulk_operations"] = bulk_operations
+        cursor = detect_cursor_patterns(analysis_ast)
+        analysis_ast["cursor"] = cursor
+        collection_data_flow = detect_collection_data_flow(analysis_ast)
         variable_semantics = classify_variable_semantics(analysis_ast)
         analysis_ast["variable_semantics"] = variable_semantics
         data_flow = enhance_data_flow(analysis_ast)
+        data_flow.extend(collection_data_flow)
         analysis_ast["data_flow"] = data_flow
         unused_variables = detect_unused_variables(analysis_ast)
         analysis_ast["unused_variables"] = unused_variables
         exception_sources = detect_exception_sources(analysis_ast)
         id_generation = detect_id_generation_conflict(analysis_ast, analysis_ast["schema"])
-        transaction = detect_transaction(analysis_ast)
+        transaction = detect_transaction_patterns(analysis_ast)
+        analysis_ast["transaction"] = transaction
+        retry_logic = detect_retry_logic(analysis_ast)
+        error_handling = detect_bulk_exception_handling(analysis_ast)
+        performance_patterns = (
+            ["bulk_processing", "reduced_context_switching", "high_throughput_batch"]
+            if any(op.get("type") == "BULK_COLLECT" for op in bulk_operations)
+            and any(op.get("type") == "FORALL" for op in bulk_operations)
+            else []
+        )
         dependency_chain = _build_dependency_chains(tables_used, relationships)
+        business_rules = _enhance_business_rules(
+            item.block_text,
+            _extract_business_rules(item.block_text),
+        )
         issues = [
             *_validate_sequence_mapping(
                 sequence_dependencies,
@@ -1351,6 +2024,7 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         ]
         analysis_ast["issues"] = issues
         issues.extend(detect_logic_gaps(analysis_ast))
+        complexity = classify_complexity(analysis_ast)
         proc_entry: Dict[str, Any] = {
             "name": item.object_name,
             "object_type": item.object_type,
@@ -1358,14 +2032,22 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "input_parameters": params["in"],
             "output_parameters": params["out"],
             "variables": local_variables,
+            "collections": collections,
             "tables_used": tables_used,
             "operations": operations_by_table,
-            "business_rules": _extract_business_rules(item.block_text),
+            "business_rules": business_rules,
             "data_flow": data_flow,
-            "dependencies": _build_dependencies(tables_used, sequence_dependencies),
+            "dependencies": _clean_dependencies(
+                tables_used,
+                sequence_dependencies,
+                table_map.keys(),
+                sequence_names,
+            ),
             "exceptions": exceptions,
             "exception_sources": exception_sources,
             "variable_semantics": variable_semantics,
+            "bulk_operations": bulk_operations,
+            "cursor": cursor,
             "dependency_graph": {
                 "tables_used": tables_used,
                 "procedures_called": _extract_procedure_calls(
@@ -1388,10 +2070,13 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
                 ],
                 "relationships": table_relationships,
             },
-            "complexity": _complexity_metrics(item.block_text),
+            "complexity": complexity,
             "unused_variables": unused_variables,
             "id_generation": id_generation,
             "transaction": transaction,
+            "retry_logic": retry_logic,
+            "error_handling": error_handling,
+            "performance_patterns": performance_patterns,
             "issues": issues,
             "dependency_chain": dependency_chain,
         }
@@ -1425,6 +2110,7 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
             "operations": sorted({op for ops in proc.get("operations", {}).values() for op in ops}),
             "operationsByTable": proc.get("operations", {}),
             "localVariables": proc.get("variables", []),
+            "collections": proc.get("collections", []),
             "exceptions": proc.get("exceptions", []),
             "exceptionSources": proc.get("exception_sources", []),
             "businessRules": proc.get("business_rules", []),
@@ -1432,6 +2118,8 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
             "variableSemantics": proc.get("variable_semantics", []),
             "dependencies": proc.get("dependencies", []),
             "complexity": proc.get("complexity", {}),
+            "bulkOperations": proc.get("bulk_operations", []),
+            "cursor": proc.get("cursor", {}),
             "dependencyGraph": {
                 "tablesUsed": proc.get("dependency_graph", {}).get("tables_used", []),
                 "proceduresCalled": proc.get("dependency_graph", {}).get("procedures_called", []),
@@ -1442,6 +2130,9 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
             "unusedVariables": proc.get("unused_variables", []),
             "idGeneration": proc.get("id_generation", {}),
             "transaction": proc.get("transaction", {}),
+            "retryLogic": proc.get("retry_logic", {}),
+            "errorHandling": proc.get("error_handling", {}),
+            "performancePatterns": proc.get("performance_patterns", []),
             "issues": proc.get("issues", []),
             "dependencyChain": proc.get("dependency_chain", []),
         }

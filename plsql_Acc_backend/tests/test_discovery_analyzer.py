@@ -1,4 +1,4 @@
-from src.parser.discovery_analyzer import analyze_sql_source
+from src.parser.discovery_analyzer import analyze_sql_source, build_discovery_model
 
 
 def test_analyze_sql_source_extracts_metadata():
@@ -39,3 +39,35 @@ def test_analyze_sql_source_extracts_metadata():
     assert "OTHERS" in item["exceptions"]
     assert item["complexity"]["numberOfQueries"] >= 4
     assert item["conversionPreview"]["services"] == ["ProcessOrderService"]
+
+
+def test_build_discovery_model_infers_schema_from_procedure_dml():
+    sql = """
+    CREATE OR REPLACE PROCEDURE process_batch IS
+        v_order_id NUMBER;
+        v_amount NUMBER;
+    BEGIN
+        SELECT o.order_id, o.amount
+        INTO v_order_id, v_amount
+        FROM orders o
+        WHERE o.order_id = 1;
+
+        INSERT INTO payments (order_id, amount)
+        VALUES (v_order_id, v_amount);
+
+        UPDATE error_log
+        SET status = 'FAILED'
+        WHERE order_id = v_order_id;
+
+        DELETE FROM order_audit_log
+        WHERE order_id = v_order_id;
+    END;
+    /
+    """
+
+    model = build_discovery_model(sql)
+    schema_tables = {table["name"]: table for table in model["schema"]["tables"]}
+
+    assert {"ORDERS", "PAYMENTS", "ERROR_LOG", "ORDER_AUDIT_LOG"}.issubset(schema_tables)
+    assert schema_tables["ORDERS"]["source"] == "inferred_from_procedure"
+    assert {column["name"] for column in schema_tables["ORDERS"]["columns"]} == {"ORDER_ID", "AMOUNT"}

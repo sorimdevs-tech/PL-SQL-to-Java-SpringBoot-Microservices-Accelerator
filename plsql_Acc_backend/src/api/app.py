@@ -703,6 +703,7 @@ class OracleMetadataService:
             analysis_source = f"CREATE OR REPLACE {object_type.upper()} {normalized_schema}.{normalized_name}\n{ddl_text}"
 
         analyses = analyze_sql_source(analysis_source)
+        discovery_model = build_discovery_model(analysis_source)
         matches = [
             entry
             for entry in analyses
@@ -739,6 +740,7 @@ class OracleMetadataService:
                     "dtos": [],
                 },
             }
+        analysis["discovery"] = discovery_model
         analysis["schema"] = normalized_schema
         analysis["container"] = container
         analysis["sourceSql"] = analysis_source
@@ -910,12 +912,21 @@ class DiscoveryManager:
             raise KeyError(file_id)
         return record
 
-    def store_analyses(self, analyses: List[Dict[str, Any]]) -> None:
+    def store_analyses(
+        self,
+        analyses: List[Dict[str, Any]],
+        discovery_model: Optional[Dict[str, Any]] = None,
+    ) -> None:
         for item in analyses:
             name = item.get("procedureName")
             if not name:
                 continue
-            self.by_procedure[name.upper()] = item
+            stored_item = dict(item)
+            if discovery_model is not None:
+                stored_item["discovery"] = discovery_model
+            elif "discovery" in item:
+                stored_item["discovery"] = item["discovery"]
+            self.by_procedure[name.upper()] = stored_item
 
     def get_analysis(self, procedure_name: str) -> Dict[str, Any]:
         item = self.by_procedure.get(procedure_name.upper())
@@ -1102,7 +1113,7 @@ async def analyze_discovery_source(request: DiscoveryAnalyzeRequest) -> Dict[str
         discovery_model = build_discovery_model(sql_text)
         if not analyses and not discovery_model.get("schema", {}).get("tables"):
             raise HTTPException(status_code=422, detail="No PROCEDURE/FUNCTION/PACKAGE objects found")
-        discovery_manager.store_analyses(analyses)
+        discovery_manager.store_analyses(analyses, discovery_model)
 
         primary = analyses[0] if analyses else {
             "procedureName": "",
@@ -1238,7 +1249,7 @@ async def get_discovery_details(
             procedure_name,
             container_name,
         )
-        discovery_manager.store_analyses([analysis])
+        discovery_manager.store_analyses([analysis], analysis.get("discovery"))
         return analysis
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

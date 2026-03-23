@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import {
   ChevronLeft,
   ChevronRight,
@@ -29,14 +29,20 @@ import {
 import { pickOutputDirectory } from "@/lib/jobs-api"
 import type { OracleConnectionPayload } from "@/types/oracle-api"
 import type {
+  SqlBulkOperation,
   SqlBusinessRule,
+  SqlCollectionVariable,
+  SqlCursorPattern,
   SqlDataFlow,
   SqlDiscoveryAnalyzeResponse,
   SqlDiscoveryProcedure,
   SqlDiscoveryObject,
+  SqlErrorHandling,
+  SqlRetryLogic,
   SqlDiscoverySchema,
   SqlSchemaRelationship,
   SqlSchemaTable,
+  SqlTransactionSummary,
 } from "@/types/sql-discovery-api"
 
 interface StepPanelsProps {
@@ -518,6 +524,35 @@ interface ProcedureBehaviorPanelProps {
   activeAnalysis: SqlDiscoveryAnalyzeResponse | SqlDiscoveryObject | null
 }
 
+interface CollapsibleInsightSectionProps {
+  title: string
+  description: string
+  count?: number | string
+  children: ReactNode
+}
+
+function CollapsibleInsightSection(props: CollapsibleInsightSectionProps) {
+  return (
+    <details className="group rounded-xl border border-slate-200 bg-white">
+      <summary className="flex cursor-pointer list-none items-start justify-between gap-3 px-4 py-3">
+        <div>
+          <p className="text-sm font-semibold text-slate-800">{props.title}</p>
+          <p className="mt-1 text-xs text-slate-500">{props.description}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {props.count !== undefined ? (
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-[11px] font-medium text-slate-500">
+              {props.count}
+            </span>
+          ) : null}
+          <ChevronRight className="mt-0.5 h-4 w-4 shrink-0 text-slate-400 transition-transform duration-200 group-open:rotate-90" />
+        </div>
+      </summary>
+      <div className="border-t border-slate-200 px-4 py-3">{props.children}</div>
+    </details>
+  )
+}
+
 function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
   if (!props.activeProcedure && !props.activeAnalysis?.procedureName) {
     return (
@@ -532,6 +567,28 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
     )
   }
 
+  const procedureRecord = props.activeProcedure as Record<string, unknown> | null
+  const analysisRecord = props.activeAnalysis as Record<string, unknown> | null
+
+  function readField<T>(snakeKey: string, camelKey: string, fallback: T): T {
+    const procedureValue = procedureRecord?.[snakeKey]
+    if (procedureValue !== undefined && procedureValue !== null) {
+      return procedureValue as T
+    }
+
+    const camelValue = analysisRecord?.[camelKey]
+    if (camelValue !== undefined && camelValue !== null) {
+      return camelValue as T
+    }
+
+    const snakeValue = analysisRecord?.[snakeKey]
+    if (snakeValue !== undefined && snakeValue !== null) {
+      return snakeValue as T
+    }
+
+    return fallback
+  }
+
   const parametersIn = props.activeProcedure?.input_parameters ?? props.activeAnalysis?.parameters?.in ?? []
   const parametersOut = props.activeProcedure?.output_parameters ?? props.activeAnalysis?.parameters?.out ?? []
   const tablesUsed = props.activeProcedure?.tables_used ?? props.activeAnalysis?.tablesUsed ?? []
@@ -542,6 +599,17 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
   const dependencies = props.activeProcedure?.dependencies ?? props.activeAnalysis?.dependencies ?? []
   const complexity = props.activeProcedure?.complexity ?? props.activeAnalysis?.complexity
   const exceptions = props.activeProcedure?.exceptions ?? props.activeAnalysis?.exceptions ?? []
+  const sequenceUsage =
+    props.activeProcedure?.dependency_graph?.sequences_used ??
+    props.activeAnalysis?.dependencyGraph?.sequencesUsed ??
+    ((analysisRecord?.dependency_graph as { sequences_used?: string[] } | undefined)?.sequences_used ?? [])
+  const bulkOperations = readField<SqlBulkOperation[]>("bulk_operations", "bulkOperations", [])
+  const cursor = readField<SqlCursorPattern | null>("cursor", "cursor", null)
+  const transaction = readField<SqlTransactionSummary | null>("transaction", "transaction", null)
+  const retryLogic = readField<SqlRetryLogic | null>("retry_logic", "retryLogic", null)
+  const collections = readField<SqlCollectionVariable[]>("collections", "collections", [])
+  const errorHandling = readField<SqlErrorHandling | null>("error_handling", "errorHandling", null)
+  const performancePatterns = readField<string[]>("performance_patterns", "performancePatterns", [])
 
   return (
     <>
@@ -723,9 +791,9 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
             </div>
             <div>
               <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Sequence Usage</p>
-              {(props.activeAnalysis?.dependencyGraph?.sequencesUsed ?? []).length > 0 ? (
+              {sequenceUsage.length > 0 ? (
                 <ul className="space-y-1 text-slate-700">
-                  {(props.activeAnalysis?.dependencyGraph?.sequencesUsed ?? []).map((sequenceName: string) => (
+                  {sequenceUsage.map((sequenceName: string) => (
                     <li key={sequenceName}>{sequenceName}</li>
                   ))}
                 </ul>
@@ -770,6 +838,197 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
           </CardContent>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Advanced Execution Patterns</CardTitle>
+          <CardDescription>
+            Batch processing, cursor behavior, transaction semantics, retry flow, collections, and performance hints.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 lg:grid-cols-2">
+          <CollapsibleInsightSection
+            title="Bulk Operations"
+            description="Batch reads and writes such as BULK COLLECT and FORALL."
+            count={bulkOperations.length}
+          >
+            {bulkOperations.length > 0 ? (
+              <div className="space-y-2 text-sm text-slate-700">
+                {bulkOperations.map((operation, index) => {
+                  const saveExceptions =
+                    operation.save_exceptions ??
+                    ((operation as SqlBulkOperation & { saveExceptions?: boolean }).saveExceptions ?? false)
+
+                  return (
+                    <div key={`${operation.type}-${operation.table ?? operation.target ?? index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p>
+                        <span className="font-semibold">Type:</span> {operation.type}
+                      </p>
+                      <p>
+                        <span className="font-semibold">Table:</span> {operation.table ?? operation.source ?? "N/A"}
+                      </p>
+                      <p>
+                        <span className="font-semibold">Save Exceptions:</span> {saveExceptions ? "Yes" : "No"}
+                      </p>
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No bulk operations detected.</p>
+            )}
+          </CollapsibleInsightSection>
+
+          <CollapsibleInsightSection
+            title="Cursor"
+            description="Explicit cursor locking and concurrency behavior."
+            count={cursor ? 1 : 0}
+          >
+            {cursor ? (
+              <div className="space-y-2 text-sm text-slate-700">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                  <p>
+                    <span className="font-semibold">Type:</span> {cursor.type ?? "N/A"}
+                  </p>
+                  <p>
+                    <span className="font-semibold">Locking:</span> {cursor.locking ?? "N/A"}
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No cursor behavior detected.</p>
+            )}
+          </CollapsibleInsightSection>
+
+          <CollapsibleInsightSection
+            title="Transaction"
+            description="Transaction requirements, control flow features, and risk signals."
+            count={transaction?.features?.length ?? (transaction ? 1 : 0)}
+          >
+            {transaction ? (
+              <div className="space-y-2 text-sm text-slate-700">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                  <p>
+                    <span className="font-semibold">Type:</span> {transaction.type ?? "N/A"}
+                  </p>
+                  <p>
+                    <span className="font-semibold">Risk:</span> {transaction.risk ?? "N/A"}
+                  </p>
+                  <div className="mt-2">
+                    <p className="font-semibold">Features</p>
+                    {transaction.features && transaction.features.length > 0 ? (
+                      <ul className="mt-1 space-y-1">
+                        {transaction.features.map((feature) => (
+                          <li key={feature}>{feature}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-slate-500">No transaction features detected.</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No transaction behavior detected.</p>
+            )}
+          </CollapsibleInsightSection>
+
+          <CollapsibleInsightSection
+            title="Retry Logic"
+            description="Retry behavior such as GOTO-based retry blocks or bounded attempts."
+            count={retryLogic ? 1 : 0}
+          >
+            {retryLogic ? (
+              <div className="space-y-2 text-sm text-slate-700">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                  <p>
+                    <span className="font-semibold">Enabled:</span> {retryLogic.enabled ? "Yes" : "No"}
+                  </p>
+                  <p>
+                    <span className="font-semibold">Max Attempts:</span>{" "}
+                    {retryLogic.max_attempts ??
+                      ((retryLogic as SqlRetryLogic & { maxAttempts?: number | null }).maxAttempts ?? "N/A")}
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No retry logic detected.</p>
+            )}
+          </CollapsibleInsightSection>
+
+          <CollapsibleInsightSection
+            title="Collections"
+            description="Collection variables and their mapped source tables."
+            count={collections.length}
+          >
+            {collections.length > 0 ? (
+              <div className="space-y-2 text-sm text-slate-700">
+                {collections.map((collection, index) => (
+                  <div key={`${collection.name}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <p>
+                      <span className="font-semibold">Name:</span> {collection.name}
+                    </p>
+                    <p>
+                      <span className="font-semibold">Type:</span> {collection.type}
+                    </p>
+                    <p>
+                      <span className="font-semibold">Source Table:</span>{" "}
+                      {collection.source_table ??
+                        ((collection as SqlCollectionVariable & { sourceTable?: string }).sourceTable ?? "N/A")}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No collection variables detected.</p>
+            )}
+          </CollapsibleInsightSection>
+
+          <CollapsibleInsightSection
+            title="Error Handling"
+            description="Bulk or procedural error handling patterns surfaced by the analyzer."
+            count={errorHandling ? 1 : 0}
+          >
+            {errorHandling ? (
+              <div className="space-y-2 text-sm text-slate-700">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                  <p>
+                    <span className="font-semibold">Type:</span> {errorHandling.type}
+                  </p>
+                  <p>
+                    <span className="font-semibold">Mechanism:</span> {errorHandling.mechanism ?? "N/A"}
+                  </p>
+                  <p>
+                    <span className="font-semibold">Behavior:</span> {errorHandling.behavior ?? "N/A"}
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No error handling pattern detected.</p>
+            )}
+          </CollapsibleInsightSection>
+
+          <CollapsibleInsightSection
+            title="Performance"
+            description="Execution patterns that indicate throughput or context-switch reduction."
+            count={performancePatterns.length}
+          >
+            {performancePatterns.length > 0 ? (
+              <div className="space-y-2 text-sm text-slate-700">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                  <ul className="space-y-1">
+                    {performancePatterns.map((pattern) => (
+                      <li key={pattern}>{pattern}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No performance patterns detected.</p>
+            )}
+          </CollapsibleInsightSection>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
