@@ -230,6 +230,12 @@ class SQLToJPAConverter:
         if any(date_word in column_name_lower for date_word in ['date', 'time', 'created', 'updated']):
             return 'LocalDateTime'
         
+        if any(date_word in column_name_lower for date_word in ['date', 'time', 'created', 'updated']):
+            return 'LocalTime'
+        
+        if any(date_word in column_name_lower for date_word in ['date', 'time', 'created', 'updated']):
+            return 'LocalDate'
+        
         # Numeric columns
         if any(num_word in column_name_lower for num_word in ['amount', 'price', 'count', 'number', 'qty']):
             return 'BigDecimal'

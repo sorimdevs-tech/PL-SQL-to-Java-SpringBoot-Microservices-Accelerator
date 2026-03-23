@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 
 from main import PLSQLModernizationPipeline
 from src.converter.llm_engine import LLMConversionEngine
-from src.parser.discovery_analyzer import analyze_sql_source
+from src.parser.discovery_analyzer import analyze_sql_source, build_discovery_model
 from src.utils.config import load_config
 from src.parser.sql_table_discovery import SQLDiscoveryParseError, extract_create_table_names
 
@@ -1099,14 +1099,31 @@ async def analyze_discovery_source(request: DiscoveryAnalyzeRequest) -> Dict[str
             raise HTTPException(status_code=400, detail="Provide either file_id or repo_url")
 
         analyses = analyze_sql_source(sql_text)
-        if not analyses:
+        discovery_model = build_discovery_model(sql_text)
+        if not analyses and not discovery_model.get("schema", {}).get("tables"):
             raise HTTPException(status_code=422, detail="No PROCEDURE/FUNCTION/PACKAGE objects found")
         discovery_manager.store_analyses(analyses)
 
-        primary = analyses[0]
+        primary = analyses[0] if analyses else {
+            "procedureName": "",
+            "objectType": "",
+            "parameters": {"in": [], "out": []},
+            "tablesUsed": [],
+            "operations": [],
+            "operationsByTable": {},
+            "localVariables": [],
+            "exceptions": [],
+            "businessRules": [],
+            "dataFlow": [],
+            "complexity": {},
+            "dependencyGraph": {"tablesUsed": [], "proceduresCalled": []},
+            "tableDetails": {"tables": [], "relationships": []},
+            "conversionPreview": {"entities": [], "repositories": [], "services": [], "controllers": [], "dtos": []},
+        }
         return {
             **primary,
             "objects": analyses,
+            "discovery": discovery_model,
             "count": len(analyses),
             "source": source_kind,
         }
@@ -1526,4 +1543,3 @@ async def download_job_output(job_id: str) -> FileResponse:
         media_type="application/zip",
         filename=f"{job_id}.zip",
     )
-

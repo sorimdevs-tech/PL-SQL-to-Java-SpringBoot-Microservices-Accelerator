@@ -259,6 +259,45 @@ def _collapse_repository_query_annotations(code: str) -> str:
     return pattern.sub(repl, code)
 
 
+def _ensure_complete_repository_interface(body: str) -> str:
+    """
+    Remove any truncated trailing repository fragment and force the interface to
+    end with a closing brace.
+    """
+    if not body:
+        return body
+
+    lines = body.splitlines()
+
+    # If parentheses are unbalanced, trim trailing lines until they balance or
+    # until we reach a clearly complete declaration line.
+    while lines and '\n'.join(lines).count('(') > '\n'.join(lines).count(')'):
+        lines.pop()
+
+    # Drop trailing incomplete signature / annotation debris.
+    while lines:
+        stripped = lines[-1].strip()
+        if not stripped:
+            lines.pop()
+            continue
+        if stripped == '}':
+            break
+        if stripped.startswith('@'):
+            lines.pop()
+            continue
+        if stripped.endswith(';'):
+            break
+        lines.pop()
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    if not lines or lines[-1].strip() != '}':
+        lines.append('}')
+
+    return '\n'.join(lines)
+
+
 def _strip_llm_trailing_garbage(code: str) -> str:
     """
     SBG-27 FIX: The LLM sometimes appends extra content after the closing brace
@@ -1779,6 +1818,8 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.time.LocalDateTime;
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.Map;
 
 /**
@@ -2060,6 +2101,10 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
             java_type = self._map_sql_type_to_java(col.get("type", ""))
             if java_type == "LocalDateTime":
                 import_lines.append("import java.time.LocalDateTime;")
+            if java_type == "LocalDate":
+                import_lines.append("import java.time.LocalDate;")
+            if java_type == "LocalTime":
+                import_lines.append("import java.time.LocalTime;")  
             if java_type == "BigDecimal":
                 import_lines.append("import java.math.BigDecimal;")
 
@@ -2150,6 +2195,12 @@ public class {entity_name} {{
         normalized_entity_name = self._normalize_entity_name(entity_name)
         if any(field['type'] == 'LocalDateTime' for field in fields):
             import_lines.append('import java.time.LocalDateTime;')
+        if any(field['type'] == 'LocalDate' for field in fields):
+            import_lines.append('import java.time.LocalDate;')
+        if any(field['type'] == 'LocalTime' for field in fields):
+            import_lines.append('import java.time.LocalTime;')
+        if any(field['type'] == 'BigDecimal' for field in fields):
+            import_lines.append('import java.math.BigDecimal;')
         if entity_name in self.RESERVED_ENTITY_NAMES:
             entity_name += '_entity'
         field_blocks = []
@@ -2448,13 +2499,31 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         ]
         if 'LocalDateTime' in code:
             import_lines.append('import java.time.LocalDateTime;')
+        if 'LocalDate' in code:
+            import_lines.append('import java.time.LocalDate;')
+        if 'LocalTime' in code:
+            import_lines.append('import java.time.LocalTime;')
         if 'List<' in code:
             import_lines.append('import java.util.List;')
         if 'Optional<' in code:
             import_lines.append('import java.util.Optional;')
+        if 'Collections.' in code:
+            import_lines.append('import java.util.Collections;')
+        if 'Collectors.' in code:
+            import_lines.append('import java.util.stream.Collectors;')
+        if 'Stream<' in code or ' Stream ' in code:
+            import_lines.append('import java.util.stream.Stream;')
         # FIX: add all commonly LLM-generated types that were missing
         if 'BigDecimal' in code:
             import_lines.append('import java.math.BigDecimal;')
+        if 'AtomicReference' in code:
+            import_lines.append('import java.util.concurrent.atomic.AtomicReference;')
+        if 'ArrayList<' in code or 'new ArrayList<' in code or 'new ArrayList(' in code:
+            import_lines.append('import java.util.ArrayList;')
+        if 'Arrays.' in code:
+            import_lines.append('import java.util.Arrays;')
+        if 'Pattern.' in code or ' Pattern ' in code:
+            import_lines.append('import java.util.regex.Pattern;')
         if 'DataAccessException' in code:
             import_lines.append('import org.springframework.dao.DataAccessException;')
         if 'EntityManager' in code or '@PersistenceContext' in code:
@@ -2471,7 +2540,8 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         for entity_name in entity_names:
             normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
             normalized_entity = self._normalize_entity_name(normalized_entity)
-            import_lines.append(f'import {self.package_name}.entity.{normalized_entity};')
+            if self._entity_source_exists(normalized_entity):
+                import_lines.append(f'import {self.package_name}.entity.{normalized_entity};')
         for repository_name in repository_names:
             import_lines.append(f'import {self.package_name}.repository.{repository_name};')
         import_lines.append(f'import {self.package_name}.exception.BusinessException;')
@@ -2601,6 +2671,39 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         body = self._inject_crud_repository_calls(body, entity_names, repository_names)
         # Deterministically correct insertXxx argument order from repository signatures.
         body = self._rewrite_insert_calls_from_repo_signature(body, repository_names)
+        # Compile-focused cleanup for invalid placeholder vars and impossible accessors.
+        body = self._rewrite_invalid_insert_calls(body, repository_names)
+        body = self._rewrite_missing_entity_accessors(body, entity_names)
+        # Prefer actual custom repository methods over generic demo CRUD examples.
+        body = self._rewrite_generic_crud_examples_to_repo_methods(body, entity_names, repository_names)
+
+        if 'LocalDateTime' in body:
+            import_lines.append('import java.time.LocalDateTime;')
+        if 'LocalDate' in body:
+            import_lines.append('import java.time.LocalDate;')
+        if 'LocalTime' in body:
+            import_lines.append('import java.time.LocalTime;')
+        if 'List<' in body:
+            import_lines.append('import java.util.List;')
+        if 'Optional<' in body:
+            import_lines.append('import java.util.Optional;')
+        if 'BigDecimal' in body:
+            import_lines.append('import java.math.BigDecimal;')
+        if 'AtomicReference' in body:
+            import_lines.append('import java.util.concurrent.atomic.AtomicReference;')
+        if 'ArrayList<' in body or 'new ArrayList<' in body or 'new ArrayList(' in body:
+            import_lines.append('import java.util.ArrayList;')
+        if 'Arrays.' in body:
+            import_lines.append('import java.util.Arrays;')
+        if 'Collections.' in body:
+            import_lines.append('import java.util.Collections;')
+        if 'Pattern.' in body or ' Pattern ' in body:
+            import_lines.append('import java.util.regex.Pattern;')
+        if 'Collectors.' in body:
+            import_lines.append('import java.util.stream.Collectors;')
+        if 'Stream<' in body or ' Stream ' in body:
+            import_lines.append('import java.util.stream.Stream;')
+        imports = '\n'.join(dict.fromkeys(import_lines))
 
         return f"""package {self.package_name}.service;
 
@@ -2744,6 +2847,203 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                 re.DOTALL,
             )
             body = call_pat.sub(f'{repo_var}.{insert_method}({", ".join(resolved_args)});', body)
+
+        return body
+
+    def _get_repo_method_signature(self, repo_name: str, method_name: str) -> List[Tuple[str, str]]:
+        """Return [(param_name, java_type)] for a repository method signature."""
+        repo_path = getattr(self, 'base_path', None)
+        if not repo_path or not method_name:
+            return []
+        repo_file = None
+        for candidate in repo_path.rglob(f'{repo_name}.java'):
+            repo_file = candidate
+            break
+        if not repo_file or not repo_file.exists():
+            return []
+        try:
+            src = repo_file.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            return []
+        m = re.search(r'(?:void|int|\w+)\s+' + re.escape(method_name) + r'\s*\(([^;]+)\)\s*;', src, re.DOTALL)
+        if not m:
+            return []
+        params = []
+        for param_match in re.finditer(r'@Param\("(\w+)"\)\s+([A-Za-z_][\w.<>\[\]]*)\s+([A-Za-z_]\w*)', m.group(1)):
+            params.append((param_match.group(1), param_match.group(2)))
+        return params
+
+    def _get_entity_field_types(self, entity_name: str) -> Dict[str, str]:
+        """Read entity field types from the on-disk entity source."""
+        entity_path = getattr(self, 'base_path', None)
+        if not entity_path:
+            return {}
+        entity_file = None
+        for candidate in entity_path.rglob(f'{entity_name}.java'):
+            entity_file = candidate
+            break
+        if not entity_file or not entity_file.exists():
+            return {}
+        try:
+            src = entity_file.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            return {}
+        field_types: Dict[str, str] = {}
+        for match in re.finditer(r'private\s+([A-Za-z_][\w.<>\[\]]*)\s+([A-Za-z_]\w*)\s*;', src):
+            field_types[match.group(2)] = match.group(1).split('.')[-1]
+        return field_types
+
+    def _entity_source_exists(self, entity_name: str) -> bool:
+        entity_path = getattr(self, 'base_path', None)
+        if not entity_path or not entity_name:
+            return False
+        for candidate in entity_path.rglob(f'{entity_name}.java'):
+            if candidate.exists():
+                return True
+        return False
+
+    def _java_default_literal(self, java_type: str, param_name: str = "") -> str:
+        t = (java_type or '').split('.')[-1]
+        pname = (param_name or '').lower()
+        if t == 'String':
+            if 'status' in pname:
+                return '"NEW"'
+            if 'method' in pname:
+                return '"CARD"'
+            if 'email' in pname:
+                return '"generated@example.com"'
+            if 'name' in pname:
+                return '"generated"'
+            return '""'
+        if t == 'BigDecimal':
+            return 'BigDecimal.ZERO'
+        if t in {'Long', 'long'}:
+            return '0L'
+        if t in {'Integer', 'int'}:
+            return '0'
+        if t in {'Boolean', 'boolean'}:
+            return 'false'
+        return 'null'
+
+    def _rewrite_invalid_insert_calls(self, body: str, repository_names: List[str]) -> str:
+        """
+        Fix insert calls that use undefined vars or wrong arg counts/types by
+        rebuilding them from repository signatures with safe in-scope defaults.
+        """
+        for repo_name in repository_names:
+            repo_var = repo_name[0].lower() + repo_name[1:]
+            insert_method = self._resolve_repo_method_names(repo_name).get('insert')
+            if not insert_method:
+                continue
+            signature = self._get_repo_method_signature(repo_name, insert_method)
+            if not signature:
+                continue
+            args = []
+            for param_name, java_type in signature:
+                resolved = self._resolve_service_argument_name(body, param_name)
+                args.append(resolved or self._java_default_literal(java_type, param_name))
+            call_pat = re.compile(
+                r'\b' + re.escape(repo_var) + r'\s*\.\s*' + re.escape(insert_method) + r'\s*\([^;]*\)\s*;',
+                re.DOTALL,
+            )
+            body = call_pat.sub(f'{repo_var}.{insert_method}({", ".join(args)});', body)
+        return body
+
+    def _rewrite_missing_entity_accessors(self, body: str, entity_names: List[str]) -> str:
+        """
+        Replace impossible getId()/setXxx(...) calls with valid entity accessors
+        derived from the generated entity source when possible.
+        """
+        for entity_name in entity_names:
+            field_types = self._get_entity_field_types(entity_name)
+            if not field_types:
+                continue
+
+            id_fields = [name for name in field_types.keys() if name.lower().endswith('id')]
+            if id_fields:
+                pk_field = id_fields[0]
+                pk_getter = f'get{pk_field[:1].upper() + pk_field[1:]}'
+                body = re.sub(r'\.getId\(\)', f'.{pk_getter}()', body)
+
+            for field_name, field_type in field_types.items():
+                setter = f'set{field_name[:1].upper() + field_name[1:]}'
+                wrong_setter_pat = re.compile(r'(\b\w+\.)setStatus\(([^;]+)\);')
+                if setter == 'setMethod' and 'method' in field_types and 'status' not in field_types:
+                    body = wrong_setter_pat.sub(rf'\1{setter}(\2);', body)
+
+                if setter in body:
+                    arg_pat = re.compile(r'(\b\w+\.' + re.escape(setter) + r'\()([^)]+)(\);)')
+
+                    def _coerce_arg(m: re.Match) -> str:
+                        arg = m.group(2).strip()
+                        if field_type in {'Long', 'long'} and arg == 'BigDecimal.ZERO':
+                            arg = '0L'
+                        return m.group(1) + arg + m.group(3)
+
+                    body = arg_pat.sub(_coerce_arg, body)
+        return body
+
+    def _rewrite_generic_crud_examples_to_repo_methods(
+        self,
+        body: str,
+        entity_names: List[str],
+        repository_names: List[str],
+    ) -> str:
+        """
+        Replace generic demo CRUD calls (findAll/save/deleteById) with the real
+        custom repository methods when those methods already exist.
+        """
+        if not repository_names:
+            return body
+
+        entity_name = entity_names[0] if entity_names else ""
+        normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, self._ddl_table_map)
+        normalized_entity = self._normalize_entity_name(normalized_entity) if normalized_entity else entity_name
+
+        for repo_name in repository_names:
+            repo_var = repo_name[0].lower() + repo_name[1:]
+            methods = self._resolve_repo_method_names(repo_name)
+
+            select_method = methods.get('select')
+            if select_method and select_method != 'findById':
+                signature = self._get_repo_method_signature(repo_name, select_method)
+                args = [self._resolve_service_argument_name(body, p) or self._java_default_literal(t, p) for p, t in signature]
+                body = re.sub(
+                    r'\b' + re.escape(repo_var) + r'\.findAll\(\)\s*;',
+                    f'{repo_var}.{select_method}({", ".join(args)});',
+                    body,
+                )
+
+            insert_method = methods.get('insert')
+            if insert_method:
+                signature = self._get_repo_method_signature(repo_name, insert_method)
+                args = [self._resolve_service_argument_name(body, p) or self._java_default_literal(t, p) for p, t in signature]
+                body = re.sub(
+                    r'\b' + re.escape(repo_var) + r'\.save\(\s*new\s+' + re.escape(normalized_entity) + r'\s*\(\s*\)\s*\)\s*;',
+                    f'{repo_var}.{insert_method}({", ".join(args)});',
+                    body,
+                )
+
+            update_method = methods.get('update')
+            if update_method:
+                signature = self._get_repo_method_signature(repo_name, update_method)
+                args = [self._resolve_service_argument_name(body, p) or self._java_default_literal(t, p) for p, t in signature]
+                body = re.sub(
+                    r'\b' + re.escape(repo_var) + r'\.save\(\s*\w+\s*\)\s*;',
+                    f'{repo_var}.{update_method}({", ".join(args)});',
+                    body,
+                    count=1,
+                )
+
+            delete_method = methods.get('delete')
+            if delete_method and delete_method != 'deleteById':
+                signature = self._get_repo_method_signature(repo_name, delete_method)
+                args = [self._resolve_service_argument_name(body, p) or self._java_default_literal(t, p) for p, t in signature]
+                body = re.sub(
+                    r'\b' + re.escape(repo_var) + r'\.deleteById\(\s*[^)]*\)\s*;',
+                    f'{repo_var}.{delete_method}({", ".join(args)});',
+                    body,
+                )
 
         return body
 
@@ -2903,12 +3203,22 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             service_candidates.add(f"{controller_name[:-10]}Service")
         for service_name in sorted(service_candidates):
             import_lines.append(f'import {self.package_name}.service.{service_name};')
+        entity_candidates = set(re.findall(r'\b([A-Z]\w*Entity)\b', body))
+        for entity_name in sorted(entity_candidates):
+            if entity_name not in {'ResponseEntity'}:
+                import_lines.append(f'import {self.package_name}.entity.{entity_name};')
         if 'List<' in code:
             import_lines.append('import java.util.List;')
         if 'BigDecimal' in code:
             import_lines.append('import java.math.BigDecimal;')
+        if 'AtomicReference' in code:
+            import_lines.append('import java.util.concurrent.atomic.AtomicReference;')
         if 'LocalDateTime' in code:
             import_lines.append('import java.time.LocalDateTime;')
+        if 'LocalDate' in code:
+            import_lines.append('import java.time.LocalDate;')
+        if 'LocalTime' in code:
+            import_lines.append('import java.time.LocalTime;')  
         if 'Optional<' in code:
             import_lines.append('import java.util.Optional;')
 
@@ -2956,8 +3266,16 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.Optional;')
         if 'LocalDateTime' in code:
             import_lines.append('import java.time.LocalDateTime;')
+        if 'LocalDate' in code:
+            import_lines.append('import java.time.LocalDate;')  
+        if 'LocalTime' in code:
+            import_lines.append('import java.time.LocalTime;')
+        if 'Timestamp' in code:
+            import_lines.append('import java.sql.Timestamp;')
         if 'BigDecimal' in code:
             import_lines.append('import java.math.BigDecimal;')
+        if 'AtomicReference' in code:
+            import_lines.append('import java.util.concurrent.atomic.AtomicReference;')
 
         entity_matches = re.findall(
             r'extends\s+(?:JpaRepository|CrudRepository)\s*<\s*([A-Za-z_][\w$#]*)',
@@ -2996,9 +3314,18 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                 if wrong_lower != entity_pascal and wrong_lower in body:
                     body = body.replace(wrong_lower, entity_pascal)
 
+        # Force repository generic/entity references to the normalized entity name
+        # even when the LLM emits snake_case names like doctor_available_daysEntity.
+        for entity_name in entity_matches:
+            normalized_entity, _ = self._resolve_entity_from_ddl(entity_name, ddl_map or self._ddl_table_map)
+            normalized_entity = self._normalize_entity_name(normalized_entity)
+            if entity_name != normalized_entity:
+                body = re.sub(r'\b' + re.escape(entity_name) + r'\b', normalized_entity, body)
+
         # SBG-20 FIX: ensure all 4 CRUD operations exist and UPDATE covers all columns
         body, extra_imports = self._audit_and_complete_repository(body, filename)
         body = _collapse_repository_query_annotations(body)
+        body = _ensure_complete_repository_interface(body)
         for imp in extra_imports:
             if imp not in import_lines:
                 import_lines.append(imp)
@@ -3372,6 +3699,8 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.time.LocalDateTime;')
         if 'BigDecimal' in code:
             import_lines.append('import java.math.BigDecimal;')
+        if 'AtomicReference' in code:
+            import_lines.append('import java.util.concurrent.atomic.AtomicReference;')
 
         imports = '\n'.join(dict.fromkeys(import_lines))
         body_lines = [

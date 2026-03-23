@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, List, Set
+from typing import Dict, Iterable, List, Set
 
 
 CREATE_TABLE_PATTERN = re.compile(

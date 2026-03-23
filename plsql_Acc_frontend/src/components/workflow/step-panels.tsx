@@ -29,11 +29,14 @@ import {
 import { pickOutputDirectory } from "@/lib/jobs-api"
 import type { OracleConnectionPayload } from "@/types/oracle-api"
 import type {
+  SqlBusinessRule,
+  SqlDataFlow,
   SqlDiscoveryAnalyzeResponse,
+  SqlDiscoveryProcedure,
   SqlDiscoveryObject,
-  SqlLocalVariable,
-  SqlTableDetail,
-  SqlTableRelationship,
+  SqlDiscoverySchema,
+  SqlSchemaRelationship,
+  SqlSchemaTable,
 } from "@/types/sql-discovery-api"
 
 interface StepPanelsProps {
@@ -296,6 +299,505 @@ function ConnectPanel(props: ConnectPanelProps) {
   )
 }
 
+interface GlobalSchemaPanelProps {
+  schema: SqlDiscoverySchema
+  selectedTable: string | null
+  onSelectTable: (tableName: string) => void
+}
+
+function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
+  const globalTables = props.schema.tables ?? []
+  const selectedSchemaTable = globalTables.find((table) => table.name === props.selectedTable) ?? null
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>File-Level Global Schema Model</CardTitle>
+        <CardDescription>
+          Global pass across the full SQL file: all tables, foreign-key relationships, sequences, and sequence-to-table
+          mappings.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-4 lg:grid-cols-[220px_1fr_260px]">
+        <div className="rounded-xl border border-slate-200 bg-white p-3">
+          <p className="text-xs uppercase tracking-wide text-slate-500">Tables ({globalTables.length})</p>
+          <div className="mt-2 space-y-1">
+            {globalTables.map((table) => (
+              <button
+                key={table.name}
+                onClick={() => props.onSelectTable(table.name)}
+                className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left text-sm transition ${
+                  props.selectedTable === table.name ? "bg-cyan-50 text-cyan-900" : "text-slate-700 hover:bg-slate-50"
+                }`}
+              >
+                <span className="flex-1 truncate">{table.name}</span>
+                <span className="w-8 shrink-0 text-right text-xs text-slate-400">{table.columns.length}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-white">
+            <div className="absolute inset-0 bg-grid-pattern opacity-30" />
+            <div className="relative h-full min-h-[320px] overflow-auto p-6">
+              {(() => {
+                const relationships: SqlSchemaRelationship[] = props.schema.relationships ?? []
+                const cardWidth = 220
+                const cardHeight = 152
+                const gapX = 80
+                const gapY = 90
+                const columns = 2
+                const rows = Math.ceil(globalTables.length / columns)
+                const width = columns * cardWidth + (columns - 1) * gapX + 40
+                const height = rows * cardHeight + (rows - 1) * gapY + 40
+                const positions = new Map<string, { x: number; y: number }>()
+
+                globalTables.forEach((table, index) => {
+                  const col = index % columns
+                  const row = Math.floor(index / columns)
+                  positions.set(table.name, {
+                    x: 20 + col * (cardWidth + gapX),
+                    y: 20 + row * (cardHeight + gapY),
+                  })
+                })
+
+                return (
+                  <div className="relative" style={{ width, height }}>
+                    <svg className="absolute inset-0 h-full w-full">
+                      <defs>
+                        <marker
+                          id="arrow"
+                          viewBox="0 0 10 10"
+                          refX="9"
+                          refY="5"
+                          markerWidth="6"
+                          markerHeight="6"
+                          orient="auto-start-reverse"
+                        >
+                          <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8" />
+                        </marker>
+                      </defs>
+                      {relationships.map((rel, idx) => {
+                        const from = positions.get(rel.source_table)
+                        const to = positions.get(rel.target_table)
+                        if (!from || !to) {
+                          return null
+                        }
+                        const startX = from.x + cardWidth
+                        const startY = from.y + cardHeight / 2
+                        const endX = to.x
+                        const endY = to.y + cardHeight / 2
+                        const midX = (startX + endX) / 2
+                        return (
+                          <path
+                            key={`${rel.source_table}-${rel.target_table}-${idx}`}
+                            d={`M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`}
+                            stroke="#94a3b8"
+                            strokeWidth="1.5"
+                            fill="none"
+                            markerEnd="url(#arrow)"
+                          />
+                        )
+                      })}
+                    </svg>
+
+                    {globalTables.map((table) => {
+                      const pos = positions.get(table.name)
+                      if (!pos) {
+                        return null
+                      }
+                      return (
+                        <div
+                          key={table.name}
+                          className="absolute overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
+                          style={{ width: cardWidth, height: cardHeight, left: pos.x, top: pos.y }}
+                        >
+                          <div className="rounded-t-xl border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
+                            {table.name}
+                          </div>
+                          <div className="flex h-[108px] flex-col overflow-auto px-3 py-2 text-xs text-slate-600">
+                            {table.columns.length > 0 ? (
+                              <ul className="space-y-1">
+                                {table.columns.slice(0, 5).map((col) => (
+                                  <li key={`${table.name}-${col.name}`}>
+                                    {col.name} <span className="text-slate-400">({col.type})</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="text-slate-400">No columns detected</p>
+                            )}
+                            {table.columns.length > 5 ? (
+                              <p className="mt-1 text-[11px] text-slate-400">+{table.columns.length - 5} more</p>
+                            ) : null}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )
+              })()}
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-500">Sequences</p>
+            {(props.schema.sequences ?? []).length > 0 ? (
+              <div className="mt-2 space-y-2 text-sm text-slate-700">
+                {(props.schema.sequences ?? []).map((sequence) => (
+                  <div key={sequence.name} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <p className="font-semibold">{sequence.name}</p>
+                    <p className="text-xs text-slate-500">
+                      {(props.schema.sequence_mapping ?? [])
+                        .filter((mapping) => mapping.sequence_name === sequence.name)
+                        .map((mapping) => mapping.mapped_table)
+                        .join(", ") || "No table mapping detected"}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-2 text-sm text-slate-400">No sequences detected</p>
+            )}
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-slate-200 bg-white p-3">
+          <p className="text-xs uppercase tracking-wide text-slate-500">Table Properties</p>
+          <div className="mt-3 space-y-3">
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-800">
+              {props.selectedTable ?? "Select a table"}
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide text-slate-500">Columns</p>
+              <div className="mt-2 space-y-1 text-sm text-slate-700">
+                {(selectedSchemaTable?.columns ?? []).map((col) => (
+                  <p key={`${selectedSchemaTable?.name}-${col.name}`}>
+                    {col.name} <span className="text-slate-400">({col.type})</span>
+                  </p>
+                ))}
+                {props.selectedTable && (selectedSchemaTable?.columns.length ?? 0) === 0 ? (
+                  <p className="text-sm text-slate-400">No columns detected</p>
+                ) : null}
+              </div>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide text-slate-500">Primary Keys</p>
+              <div className="mt-2 space-y-1 text-sm text-slate-700">
+                {(selectedSchemaTable?.primary_keys ?? []).length > 0 ? (
+                  (selectedSchemaTable?.primary_keys ?? []).map((key) => <p key={key}>{key}</p>)
+                ) : (
+                  <p className="text-sm text-slate-400">No primary keys detected</p>
+                )}
+              </div>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide text-slate-500">Foreign Keys</p>
+              <div className="mt-2 space-y-1 text-sm text-slate-700">
+                {(selectedSchemaTable?.foreign_keys ?? []).length > 0 ? (
+                  (selectedSchemaTable?.foreign_keys ?? []).map((rel, index) => (
+                    <p key={`${rel.source_column}-${rel.target_table}-${index}`}>
+                      {selectedSchemaTable?.name}.{rel.source_column} {"->"} {rel.target_table}.{rel.target_column}
+                    </p>
+                  ))
+                ) : (
+                  <p className="text-sm text-slate-400">No foreign keys detected</p>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+interface ProcedureBehaviorPanelProps {
+  activeProcedure: SqlDiscoveryProcedure | null
+  activeAnalysis: SqlDiscoveryAnalyzeResponse | SqlDiscoveryObject | null
+}
+
+function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
+  if (!props.activeProcedure && !props.activeAnalysis?.procedureName) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Procedure-Level Behavior Model</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-slate-500">No procedures detected in the analyzed SQL source.</p>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  const parametersIn = props.activeProcedure?.input_parameters ?? props.activeAnalysis?.parameters?.in ?? []
+  const parametersOut = props.activeProcedure?.output_parameters ?? props.activeAnalysis?.parameters?.out ?? []
+  const tablesUsed = props.activeProcedure?.tables_used ?? props.activeAnalysis?.tablesUsed ?? []
+  const operationsByTable = props.activeProcedure?.operations ?? props.activeAnalysis?.operationsByTable ?? {}
+  const variables = props.activeProcedure?.variables ?? props.activeAnalysis?.localVariables ?? []
+  const dataFlow = props.activeProcedure?.data_flow ?? props.activeAnalysis?.dataFlow ?? []
+  const businessRules = props.activeProcedure?.business_rules ?? props.activeAnalysis?.businessRules ?? []
+  const dependencies = props.activeProcedure?.dependencies ?? props.activeAnalysis?.dependencies ?? []
+  const complexity = props.activeProcedure?.complexity ?? props.activeAnalysis?.complexity
+  const exceptions = props.activeProcedure?.exceptions ?? props.activeAnalysis?.exceptions ?? []
+
+  return (
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle>Procedure-Level Behavior Model</CardTitle>
+          <CardDescription>
+            Per-procedure pass: parameters, local variables, CRUD operations, data flow, business rules, and cleaned
+            dependencies.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 md:grid-cols-2">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+            <p className="text-xs uppercase tracking-wide text-slate-500">Procedure Name</p>
+            <p className="text-sm font-semibold text-slate-800">
+              {props.activeProcedure?.name || props.activeAnalysis?.procedureName || "N/A"}
+            </p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+            <p className="text-xs uppercase tracking-wide text-slate-500">Object Type</p>
+            <p className="text-sm font-semibold text-slate-800">
+              {props.activeProcedure?.object_type || props.activeAnalysis?.objectType || "N/A"}
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Parameters</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            <div>
+              <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">IN</p>
+              {parametersIn.length > 0 ? (
+                parametersIn.map((param) => (
+                  <p key={`in-${param.name}`} className="text-slate-700">
+                    {param.name} ({param.type})
+                  </p>
+                ))
+              ) : (
+                <p className="text-slate-500">No input parameters detected</p>
+              )}
+            </div>
+            <div>
+              <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">OUT</p>
+              {parametersOut.length > 0 ? (
+                parametersOut.map((param) => (
+                  <p key={`out-${param.name}`} className="text-slate-700">
+                    {param.name} ({param.type})
+                  </p>
+                ))
+              ) : (
+                <p className="text-slate-500">No output parameters detected</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Tables Used</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm">
+            {tablesUsed.length > 0 ? (
+              <ul className="space-y-1 text-slate-700">
+                {tablesUsed.map((tableName) => (
+                  <li key={tableName}>{tableName}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-slate-500">No tables detected</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>CRUD Operations By Table</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm">
+            {Object.entries(operationsByTable).length > 0 ? (
+              <div className="space-y-2 text-slate-700">
+                {Object.entries(operationsByTable).map(([tableName, operations]) => (
+                  <div key={tableName} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <p className="font-semibold">{tableName}</p>
+                    <p>{operations.join(", ")}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-slate-500">No CRUD operations detected</p>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Local Variables</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm">
+            {variables.length > 0 ? (
+              <ul className="space-y-1 text-slate-700">
+                {variables.map((variable) => (
+                  <li key={variable.name}>
+                    {variable.name} ({variable.type})
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-slate-500">No variables detected</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Data Flow</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm">
+            {dataFlow.length > 0 ? (
+              <div className="space-y-2 text-slate-700">
+                {dataFlow.map((flow: SqlDataFlow, index: number) => (
+                  <div key={`${flow.variable}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    {flow.variable} {"<-"} {flow.source}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-slate-500">No SELECT INTO data flow detected</p>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Business Rules</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm">
+            {businessRules.length > 0 ? (
+              <div className="space-y-2 text-slate-700">
+                {businessRules.map((rule: SqlBusinessRule, index: number) => (
+                  <div key={`${rule.condition}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <p className="font-semibold">IF {rule.condition}</p>
+                    <p>THEN {rule.true_action || "N/A"}</p>
+                    {rule.false_action ? <p>ELSE {rule.false_action}</p> : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-slate-500">No conditional business logic detected</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Dependencies</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            <div>
+              <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Tables And Sequences</p>
+              {dependencies.length > 0 ? (
+                <ul className="space-y-1 text-slate-700">
+                  {dependencies.map((dependency) => (
+                    <li key={dependency}>{dependency}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-slate-500">No dependencies detected</p>
+              )}
+            </div>
+            <div>
+              <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Sequence Usage</p>
+              {(props.activeAnalysis?.dependencyGraph?.sequencesUsed ?? []).length > 0 ? (
+                <ul className="space-y-1 text-slate-700">
+                  {(props.activeAnalysis?.dependencyGraph?.sequencesUsed ?? []).map((sequenceName: string) => (
+                    <li key={sequenceName}>{sequenceName}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-slate-500">No sequence usage detected</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Complexity And Exceptions</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            <div className="grid gap-2 md:grid-cols-2">
+              <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
+                LOC: {complexity?.linesOfCode ?? 0}
+              </p>
+              <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
+                Queries: {complexity?.numberOfQueries ?? 0}
+              </p>
+              <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
+                Conditions: {complexity?.numberOfConditions ?? 0}
+              </p>
+              <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
+                Loops: {complexity?.numberOfLoops ?? 0}
+              </p>
+            </div>
+            <div>
+              <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Exceptions</p>
+              {exceptions.length > 0 ? (
+                <ul className="space-y-1 text-slate-700">
+                  {exceptions.map((exceptionName: string) => (
+                    <li key={exceptionName}>{exceptionName}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-slate-500">No exceptions detected</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Conversion Preview</CardTitle>
+        </CardHeader>
+        <CardContent className="grid gap-3 text-sm md:grid-cols-2 xl:grid-cols-5">
+          {[
+            { label: "Entities", values: props.activeAnalysis?.conversionPreview?.entities ?? [] },
+            { label: "Repositories", values: props.activeAnalysis?.conversionPreview?.repositories ?? [] },
+            { label: "Services", values: props.activeAnalysis?.conversionPreview?.services ?? [] },
+            { label: "Controllers", values: props.activeAnalysis?.conversionPreview?.controllers ?? [] },
+            { label: "DTOs", values: props.activeAnalysis?.conversionPreview?.dtos ?? [] },
+          ].map((item) => (
+            <div key={item.label} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+              <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">{item.label}</p>
+              {item.values.length > 0 ? (
+                <p className="text-slate-700">{item.values.join(", ")}</p>
+              ) : (
+                <p className="text-slate-500">No {item.label.toLowerCase()} detected</p>
+              )}
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+    </>
+  )
+}
+
 interface DiscoveryPanelProps {
   sourceMethod: SourceMethod
   gitRepoUrl: string
@@ -510,17 +1012,25 @@ function SqlSourceDiscovery(props: {
     ) ?? null
   const activeAnalysis: SqlDiscoveryAnalyzeResponse | SqlDiscoveryObject | null =
     selectedObject ?? analysis
+  const globalSchema: SqlDiscoverySchema | null = analysis?.discovery?.schema ?? null
+  const globalTables: SqlSchemaTable[] = globalSchema?.tables ?? []
+  const activeProcedure: SqlDiscoveryProcedure | null =
+    analysis?.discovery?.procedures?.find(
+      (item) => `${item.object_type}::${item.name}` === selectedObjectKey,
+    ) ??
+    analysis?.discovery?.procedures?.[0] ??
+    null
 
   useEffect(() => {
-    const tables: SqlTableDetail[] = activeAnalysis?.tableDetails?.tables ?? []
+    const tables: SqlSchemaTable[] = globalTables
     if (!tables.length) {
       setSelectedTable(null)
       return
     }
-    if (!selectedTable || !tables.some((table: SqlTableDetail) => table.name === selectedTable)) {
+    if (!selectedTable || !tables.some((table: SqlSchemaTable) => table.name === selectedTable)) {
       setSelectedTable(tables[0].name)
     }
-  }, [activeAnalysis, selectedTable])
+  }, [globalTables, selectedTable])
 
   useEffect(() => {
     if (props.sourceMethod !== "git") {
@@ -762,7 +1272,7 @@ function SqlSourceDiscovery(props: {
         </Card>
       ) : null}
 
-      {activeAnalysis && (props.sourceMethod !== "git" || gitStep === 2) ? (
+      {analysis && (props.sourceMethod !== "git" || gitStep === 2) ? (
         <>
           {(analysis?.objects ?? []).length > 1 ? (
             <Card>
@@ -792,415 +1302,15 @@ function SqlSourceDiscovery(props: {
             </Card>
           ) : null}
 
-          {activeAnalysis.tableDetails?.tables?.length ? (
-            <Card>
-              <CardHeader>
-                <CardTitle>Schema Explorer</CardTitle>
-                <CardDescription>Tables, relationships, and local variables extracted from the SQL source</CardDescription>
-              </CardHeader>
-              <CardContent className="grid gap-4 lg:grid-cols-[220px_1fr_260px]">
-                <div className="rounded-xl border border-slate-200 bg-white p-3">
-                  <p className="text-xs uppercase tracking-wide text-slate-500">
-                    Tables ({activeAnalysis.tableDetails.tables.length})
-                  </p>
-                  <div className="mt-2 space-y-1">
-                    {activeAnalysis.tableDetails.tables.map((table: SqlTableDetail) => (
-                      <button
-                        key={table.name}
-                        onClick={() => setSelectedTable(table.name)}
-                        className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left text-sm transition ${
-                          selectedTable === table.name
-                            ? "bg-cyan-50 text-cyan-900"
-                            : "text-slate-700 hover:bg-slate-50"
-                        }`}
-                      >
-                        <span className="flex-1 truncate">{table.name}</span>
-                        <span className="w-8 shrink-0 text-right text-xs text-slate-400">
-                          {(table.columns ?? []).length}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="space-y-3">
-                  <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-white">
-                  <div className="absolute inset-0 bg-grid-pattern opacity-30" />
-                  <div className="relative h-full min-h-[320px] overflow-auto p-6">
-                    {(() => {
-                      const tables: SqlTableDetail[] = activeAnalysis.tableDetails?.tables ?? []
-                      const relationships: SqlTableRelationship[] = activeAnalysis.tableDetails?.relationships ?? []
-                      const cardWidth = 220
-                      const cardHeight = 140
-                      const gapX = 80
-                      const gapY = 90
-                      const columns = 2
-                      const rows = Math.ceil(tables.length / columns)
-                      const width = columns * cardWidth + (columns - 1) * gapX + 40
-                      const height = rows * cardHeight + (rows - 1) * gapY + 40
-                      const positions = new Map<string, { x: number; y: number }>()
-                      tables.forEach((table: SqlTableDetail, index: number) => {
-                        const col = index % columns
-                        const row = Math.floor(index / columns)
-                        positions.set(table.name, {
-                          x: 20 + col * (cardWidth + gapX),
-                          y: 20 + row * (cardHeight + gapY),
-                        })
-                      })
-
-                      return (
-                        <div className="relative" style={{ width, height }}>
-                          <svg className="absolute inset-0 h-full w-full">
-                            <defs>
-                              <marker
-                                id="arrow"
-                                viewBox="0 0 10 10"
-                                refX="9"
-                                refY="5"
-                                markerWidth="6"
-                                markerHeight="6"
-                                orient="auto-start-reverse"
-                              >
-                                <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8" />
-                              </marker>
-                            </defs>
-                            {relationships.map((rel: SqlTableRelationship, idx: number) => {
-                              const from = positions.get(rel.fromTable)
-                              const to = positions.get(rel.toTable)
-                              if (!from || !to) {
-                                return null
-                              }
-                              const startX = from.x + cardWidth
-                              const startY = from.y + cardHeight / 2
-                              const endX = to.x
-                              const endY = to.y + cardHeight / 2
-                              const midX = (startX + endX) / 2
-                              return (
-                                <path
-                                  key={`${rel.fromTable}-${rel.toTable}-${idx}`}
-                                  d={`M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`}
-                                  stroke="#94a3b8"
-                                  strokeWidth="1.5"
-                                  fill="none"
-                                  markerEnd="url(#arrow)"
-                                />
-                              )
-                            })}
-                          </svg>
-
-                          {tables.map((table: SqlTableDetail) => {
-                            const pos = positions.get(table.name)
-                            if (!pos) {
-                              return null
-                            }
-                            return (
-                              <div
-                                key={table.name}
-                                className="absolute overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
-                                style={{ width: cardWidth, height: cardHeight, left: pos.x, top: pos.y }}
-                              >
-                                <div className="rounded-t-xl border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
-                                  {table.name}
-                                </div>
-                                <div className="flex h-[96px] flex-col overflow-auto px-3 py-2 text-xs text-slate-600">
-                                  {(table.columns ?? []).length > 0 ? (
-                                    <ul className="space-y-1">
-                                      {(table.columns ?? []).slice(0, 6).map((col: string) => (
-                                        <li key={col}>{col}</li>
-                                      ))}
-                                    </ul>
-                                  ) : (
-                                    <p className="text-slate-400">No columns detected</p>
-                                  )}
-                                  {(table.columns ?? []).length > 6 ? (
-                                    <p className="mt-1 text-[11px] text-slate-400">
-                                      +{(table.columns ?? []).length - 6} more
-                                    </p>
-                                  ) : null}
-                                </div>
-                              </div>
-                            )
-                          })}
-                        </div>
-                      )
-                    })()}
-                  </div>
-                </div>
-                  <div className="rounded-xl border border-slate-200 bg-white p-3">
-                    <p className="text-xs uppercase tracking-wide text-slate-500">Local Variables</p>
-                    {(activeAnalysis.localVariables ?? []).length > 0 ? (
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {(activeAnalysis.localVariables ?? []).map((variable: SqlLocalVariable) => (
-                          <span
-                            key={variable.name}
-                            className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
-                          >
-                            {variable.name} ({variable.type})
-                          </span>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-sm text-slate-400">No local variables detected</p>
-                    )}
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-slate-200 bg-white p-3">
-                  <p className="text-xs uppercase tracking-wide text-slate-500">Table Properties</p>
-                  <div className="mt-3 space-y-3">
-                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-800">
-                      {selectedTable ?? "Select a table"}
-                    </div>
-                    <div>
-                      <p className="text-xs uppercase tracking-wide text-slate-500">Columns</p>
-                      <div className="mt-2 space-y-1 text-sm text-slate-700">
-                        {(activeAnalysis.tableDetails.tables.find((t: SqlTableDetail) => t.name === selectedTable)?.columns ?? []).map(
-                          (col: string) => (
-                            <p key={col}>{col}</p>
-                          ),
-                        )}
-                        {selectedTable &&
-                        (activeAnalysis.tableDetails.tables.find((t: SqlTableDetail) => t.name === selectedTable)?.columns?.length ??
-                          0) === 0 ? (
-                          <p className="text-sm text-slate-400">No columns detected</p>
-                        ) : null}
-                      </div>
-                    </div>
-                    <div>
-                      <p className="text-xs uppercase tracking-wide text-slate-500">Local Variables</p>
-                      <div className="mt-2 space-y-1 text-sm text-slate-700">
-                        {(activeAnalysis.localVariables ?? []).length > 0 ? (
-                          (activeAnalysis.localVariables ?? []).map((variable: SqlLocalVariable) => (
-                            <p key={variable.name}>
-                              {variable.name} ({variable.type})
-                            </p>
-                          ))
-                        ) : (
-                          <p className="text-sm text-slate-400">No local variables detected</p>
-                        )}
-                      </div>
-                    </div>
-                    <div>
-                      <p className="text-xs uppercase tracking-wide text-slate-500">Relationships</p>
-                      <div className="mt-2 space-y-1 text-sm text-slate-700">
-                        {(activeAnalysis.tableDetails.relationships ?? []).length > 0 ? (
-                          activeAnalysis.tableDetails.relationships.map((rel: SqlTableRelationship, index: number) => (
-                            <p key={`${rel.fromTable}-${rel.toTable}-${index}`}>
-                              {rel.fromTable}.{rel.fromColumn} {"->"} {rel.toTable}.{rel.toColumn}
-                            </p>
-                          ))
-                        ) : (
-                          <p className="text-sm text-slate-400">No relationships detected</p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
+          {globalSchema ? (
+            <GlobalSchemaPanel
+              schema={globalSchema}
+              selectedTable={selectedTable}
+              onSelectTable={(tableName) => setSelectedTable(tableName)}
+            />
           ) : null}
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Procedure Info</CardTitle>
-            </CardHeader>
-            <CardContent className="grid gap-3 md:grid-cols-2">
-              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Procedure Name</p>
-                <p className="text-sm font-semibold text-slate-800">{activeAnalysis.procedureName || "N/A"}</p>
-              </div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Object Type</p>
-                <p className="text-sm font-semibold text-slate-800">{activeAnalysis.objectType || "N/A"}</p>
-              </div>
-            </CardContent>
-          </Card>
-
-          <div className="grid gap-4 lg:grid-cols-2">
-            <Card>
-              <CardHeader>
-                <CardTitle>Parameters</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3 text-sm">
-                <div>
-                  <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">IN</p>
-                  {(activeAnalysis.parameters?.in ?? []).length > 0 ? (
-                    activeAnalysis.parameters?.in?.map((param: { name: string; type: string }) => (
-                      <p key={`in-${param.name}`} className="text-slate-700">
-                        {param.name} ({param.type})
-                      </p>
-                    ))
-                  ) : (
-                    <p className="text-slate-500">No input parameters detected</p>
-                  )}
-                </div>
-                <div>
-                  <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">OUT</p>
-                  {(activeAnalysis.parameters?.out ?? []).length > 0 ? (
-                    activeAnalysis.parameters?.out?.map((param: { name: string; type: string }) => (
-                      <p key={`out-${param.name}`} className="text-slate-700">
-                        {param.name} ({param.type})
-                      </p>
-                    ))
-                  ) : (
-                    <p className="text-slate-500">No output parameters detected</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Tables</CardTitle>
-              </CardHeader>
-              <CardContent className="text-sm">
-                {(activeAnalysis.tablesUsed ?? []).length > 0 ? (
-                  <ul className="space-y-1 text-slate-700">
-                    {(activeAnalysis.tablesUsed ?? []).map((tableName: string) => (
-                      <li key={tableName}>{tableName}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-slate-500">No tables detected</p>
-                )}
-              </CardContent>
-            </Card>
-          </div>
-
-          <div className="grid gap-4 lg:grid-cols-2">
-            <Card>
-              <CardHeader>
-                <CardTitle>Operations</CardTitle>
-              </CardHeader>
-              <CardContent className="text-sm">
-                {(activeAnalysis.operations ?? []).length > 0 ? (
-                  <ul className="space-y-1 text-slate-700">
-                    {(activeAnalysis.operations ?? []).map((operation: string) => (
-                      <li key={operation}>{operation}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-slate-500">No operations detected</p>
-                )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Local Variables</CardTitle>
-              </CardHeader>
-              <CardContent className="text-sm">
-                {(activeAnalysis.localVariables ?? []).length > 0 ? (
-                  <ul className="space-y-1 text-slate-700">
-                    {(activeAnalysis.localVariables ?? []).map((variable) => (
-                      <li key={variable.name}>
-                        {variable.name} ({variable.type})
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-slate-500">No variables detected</p>
-                )}
-              </CardContent>
-            </Card>
-          </div>
-
-          <div className="grid gap-4 lg:grid-cols-2">
-            <Card>
-              <CardHeader>
-                <CardTitle>Exceptions</CardTitle>
-              </CardHeader>
-              <CardContent className="text-sm">
-                {(activeAnalysis.exceptions ?? []).length > 0 ? (
-                  <ul className="space-y-1 text-slate-700">
-                    {(activeAnalysis.exceptions ?? []).map((exceptionName: string) => (
-                      <li key={exceptionName}>{exceptionName}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-slate-500">No exceptions detected</p>
-                )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Complexity</CardTitle>
-              </CardHeader>
-              <CardContent className="grid gap-2 text-sm md:grid-cols-2">
-                <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                  LOC: {activeAnalysis.complexity?.linesOfCode ?? 0}
-                </p>
-                <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                  Queries: {activeAnalysis.complexity?.numberOfQueries ?? 0}
-                </p>
-                <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                  Conditions: {activeAnalysis.complexity?.numberOfConditions ?? 0}
-                </p>
-                <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                  Loops: {activeAnalysis.complexity?.numberOfLoops ?? 0}
-                </p>
-              </CardContent>
-            </Card>
-          </div>
-
-          <div className="grid gap-4 lg:grid-cols-2">
-            <Card>
-              <CardHeader>
-                <CardTitle>Dependencies</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3 text-sm">
-                <div>
-                  <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Tables Used</p>
-                  {(activeAnalysis.dependencyGraph?.tablesUsed ?? []).length > 0 ? (
-                    <ul className="space-y-1 text-slate-700">
-                      {(activeAnalysis.dependencyGraph?.tablesUsed ?? []).map((tableName: string) => (
-                        <li key={tableName}>{tableName}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-slate-500">No table dependencies detected</p>
-                  )}
-                </div>
-                <div>
-                  <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Procedures Called</p>
-                  {(activeAnalysis.dependencyGraph?.proceduresCalled ?? []).length > 0 ? (
-                    <ul className="space-y-1 text-slate-700">
-                      {(activeAnalysis.dependencyGraph?.proceduresCalled ?? []).map((proc: string) => (
-                        <li key={proc}>{proc}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-slate-500">No procedure dependencies detected</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Conversion Preview</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3 text-sm">
-                {[
-                  { label: "Entities", values: activeAnalysis.conversionPreview?.entities ?? [] },
-                  { label: "Repositories", values: activeAnalysis.conversionPreview?.repositories ?? [] },
-                  { label: "Services", values: activeAnalysis.conversionPreview?.services ?? [] },
-                  { label: "Controllers", values: activeAnalysis.conversionPreview?.controllers ?? [] },
-                  { label: "DTOs", values: activeAnalysis.conversionPreview?.dtos ?? [] },
-                ].map((item) => (
-                  <div key={item.label}>
-                    <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">{item.label}</p>
-                    {item.values.length > 0 ? (
-                      <p className="text-slate-700">{item.values.join(", ")}</p>
-                    ) : (
-                      <p className="text-slate-500">No {item.label.toLowerCase()} detected</p>
-                    )}
-                  </div>
-                ))}
-              </CardContent>
-            </Card>
-          </div>
+          <ProcedureBehaviorPanel activeProcedure={activeProcedure} activeAnalysis={activeAnalysis} />
 
           <Card>
             <CardHeader>

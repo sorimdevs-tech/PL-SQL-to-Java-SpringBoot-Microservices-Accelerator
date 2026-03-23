@@ -8,6 +8,7 @@ export interface SqlDiscoveryUploadResponse {
 export interface SqlParameter {
   name: string
   type: string
+  direction?: string
 }
 
 export interface SqlLocalVariable {
@@ -24,12 +25,23 @@ export interface SqlDiscoveryObject {
   }
   tablesUsed?: string[]
   operations?: string[]
+  operationsByTable?: Record<string, string[]>
   localVariables?: SqlLocalVariable[]
   exceptions?: string[]
+  exceptionSources?: SqlExceptionSource[]
+  businessRules?: SqlBusinessRule[]
+  dataFlow?: SqlDataFlow[]
+  variableSemantics?: SqlVariableSemantic[]
+  dependencies?: string[]
   complexity?: SqlComplexityMetrics
   dependencyGraph?: SqlDependencyGraph
   conversionPreview?: SqlConversionPreview
   tableDetails?: SqlTableDetails
+  unusedVariables?: SqlUnusedVariable[]
+  idGeneration?: SqlIdGeneration
+  transaction?: SqlTransactionSummary
+  issues?: SqlProcedureIssue[]
+  dependencyChain?: string[]
 }
 
 export interface SqlComplexityMetrics {
@@ -42,6 +54,7 @@ export interface SqlComplexityMetrics {
 export interface SqlDependencyGraph {
   tablesUsed: string[]
   proceduresCalled: string[]
+  sequencesUsed?: string[]
 }
 
 export interface SqlConversionPreview {
@@ -67,6 +80,145 @@ export interface SqlTableRelationship {
 export interface SqlTableDetails {
   tables: SqlTableDetail[]
   relationships: SqlTableRelationship[]
+}
+
+export interface SqlBusinessRule {
+  condition: string
+  action?: string
+  true_action: string
+  false_action?: string
+  type?: string
+  pattern?: string
+  severity?: string
+}
+
+export interface SqlDataFlow {
+  variable: string
+  source: string
+  source_table?: string
+  source_column?: string
+  used?: boolean
+  semantic_type?: string
+}
+
+export interface SqlUnusedVariable {
+  name: string
+  type: string
+  reason: string
+  source?: string
+}
+
+export interface SqlExceptionSource {
+  statement: string
+  exceptions: string[]
+  reason: string
+}
+
+export interface SqlVariableSemantic {
+  variable: string
+  type: string
+}
+
+export interface SqlIdGeneration {
+  uses_sequence: boolean
+  input_id_provided: boolean
+  conflict: boolean
+  strategy?: string
+  details: string
+}
+
+export interface SqlTransactionSummary {
+  required: boolean
+  type?: string
+  reason: string
+}
+
+export interface SqlProcedureIssue {
+  type: string
+  details: string
+}
+
+export interface SqlSchemaColumn {
+  name: string
+  type: string
+}
+
+export interface SqlSchemaForeignKey {
+  source_column: string
+  target_table: string
+  target_column: string
+}
+
+export interface SqlSchemaTable {
+  name: string
+  columns: SqlSchemaColumn[]
+  primary_keys: string[]
+  foreign_keys: SqlSchemaForeignKey[]
+}
+
+export interface SqlSchemaRelationship {
+  source_table: string
+  source_column: string
+  target_table: string
+  target_column: string
+}
+
+export interface SqlSequenceDefinition {
+  name: string
+}
+
+export interface SqlSequenceMapping {
+  sequence_name: string
+  mapped_table: string
+}
+
+export interface SqlDiscoverySchema {
+  tables: SqlSchemaTable[]
+  relationships: SqlSchemaRelationship[]
+  sequences: SqlSequenceDefinition[]
+  sequence_mapping: SqlSequenceMapping[]
+}
+
+export interface SqlDiscoveryProcedure {
+  name: string
+  object_type: string
+  parameters: SqlParameter[]
+  input_parameters: SqlParameter[]
+  output_parameters: SqlParameter[]
+  variables: SqlLocalVariable[]
+  tables_used: string[]
+  operations: Record<string, string[]>
+  data_flow: SqlDataFlow[]
+  business_rules: SqlBusinessRule[]
+  dependencies: string[]
+  exceptions?: string[]
+  exception_sources?: SqlExceptionSource[]
+  variable_semantics?: SqlVariableSemantic[]
+  dependency_graph?: {
+    tables_used: string[]
+    procedures_called: string[]
+    sequences_used?: string[]
+  }
+  table_details?: {
+    tables: {
+      name: string
+      columns: string[]
+      primary_keys: string[]
+      foreign_keys: SqlSchemaForeignKey[]
+    }[]
+    relationships: SqlSchemaRelationship[]
+  }
+  complexity?: SqlComplexityMetrics
+  unused_variables?: SqlUnusedVariable[]
+  id_generation?: SqlIdGeneration
+  transaction?: SqlTransactionSummary
+  issues?: SqlProcedureIssue[]
+  dependency_chain?: string[]
+}
+
+export interface SqlDiscoveryModel {
+  schema: SqlDiscoverySchema
+  procedures: SqlDiscoveryProcedure[]
 }
 
 export interface GitTreeEntry {
@@ -105,12 +257,24 @@ export interface SqlDiscoveryAnalyzeResponse {
   }
   tablesUsed?: string[]
   operations?: string[]
+  operationsByTable?: Record<string, string[]>
   localVariables?: SqlLocalVariable[]
   exceptions?: string[]
+  exceptionSources?: SqlExceptionSource[]
+  businessRules?: SqlBusinessRule[]
+  dataFlow?: SqlDataFlow[]
+  variableSemantics?: SqlVariableSemantic[]
+  dependencies?: string[]
   complexity?: SqlComplexityMetrics
   dependencyGraph?: SqlDependencyGraph
   conversionPreview?: SqlConversionPreview
   tableDetails?: SqlTableDetails
+  unusedVariables?: SqlUnusedVariable[]
+  idGeneration?: SqlIdGeneration
+  transaction?: SqlTransactionSummary
+  issues?: SqlProcedureIssue[]
+  dependencyChain?: string[]
+  discovery?: SqlDiscoveryModel
   objects?: SqlDiscoveryObject[]
   count?: number
   source?: string

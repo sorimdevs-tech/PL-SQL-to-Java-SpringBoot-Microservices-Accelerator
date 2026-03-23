@@ -299,19 +299,26 @@ STRICT OUTPUT RULES — violating any of these causes compile errors:
 12. Before emitting an insertXxx()/updateXxx()/deleteXxx() call, inspect the repository
     method name and copy its parameter list in the exact declared order and Java types.
     If the repository method accepts BigDecimal, pass BigDecimal in that exact slot.
-13. For UPDATE: findById(id).orElseThrow(), then setters, then save(entity).
+13. NEVER use undefined placeholder variables such as name, email, amount, status,
+    orderId, customerId unless those variables are actually declared in the method body
+    or are method parameters. Every variable referenced in a repository call must exist.
+14. For UPDATE: findById(id).orElseThrow(), then setters, then save(entity).
     Do NOT call a generic .update() method — it does not exist.
-14. FK fields in entities are mapped as entity OBJECTS, not Long IDs.
+15. When reading entity values, use the REAL generated accessor names from the entity
+    fields. Example: customerId field -> getCustomerId(), NOT getId().
+16. Do NOT call setters/getters for fields that do not exist on the entity.
+    WRONG: payment.setStatus("UPDATED") when PaymentsEntity has no status field.
+15. FK fields in entities are mapped as entity OBJECTS, not Long IDs.
     WRONG: order.setCustomerId(pCustomerId)   // no such setter exists
     RIGHT: CustomersEntity c = customersRepository.findById(pCustomerId).orElseThrow(...);
            order.setCustomersEntity(c);
-15. The service method return type MUST be void. The controller handles the response.
-16. Use BigDecimal for ALL decimal/monetary NUMBER columns. NEVER use Double or Float.
+17. The service method return type MUST be void. The controller handles the response.
+18. Use BigDecimal for ALL decimal/monetary NUMBER columns. NEVER use Double or Float.
     NUMBER(10,2) -> BigDecimal.   Any NUMBER(p,s) where s > 0 -> BigDecimal.
-17. Entity and Repository class names are PascalCase. NEVER use ALLCAPS.
+19. Entity and Repository class names are PascalCase. NEVER use ALLCAPS.
     WRONG: CUSTOMERSEntity, ORDERSEntity, PAYMENTSEntity, CUSTOMERSRepository
     RIGHT: CustomersEntity, OrdersEntity, PaymentsEntity, CustomersRepository
-18. Import only classes that actually exist in the project.
+20. Import only classes that actually exist in the project.
     NEVER import: com.example.demo.entity.Crud, com.example.demo.repository.CrudRepository,
     or any ALLCAPS entity/repository class name.
 
@@ -339,6 +346,9 @@ STRICT OUTPUT RULES:
 - If calling any repository method, the Java argument order MUST match the repository
   method signature exactly. Never reorder arguments by SQL column order.
 - For insertXxx() methods, do NOT pass the PK when the query uses sequence.NEXTVAL.
+- NEVER reference undeclared placeholder variables in repository/service calls.
+- Use only real entity accessors derived from actual fields: getCustomerId() not getId().
+- Never call a setter for a field that is not present on the entity.
 - Output EXACTLY ONE Java file. The LAST character must be the class closing brace }}.
 - Do NOT add any content after the class closing brace.
 
@@ -1386,6 +1396,8 @@ public class {service_name} {{
             'Double': '0.0', 'Float': '0.0f', 'Boolean': 'false',
             'BigDecimal': 'java.math.BigDecimal.ZERO',
             'LocalDateTime': 'java.time.LocalDateTime.now()',
+            'LocalTime': 'java.time.LocalTime.now()',
+            'LocalDate': 'java.time.LocalDate.now()',
             'void': '',
         }
         return defaults.get(java_type, 'null')
@@ -1455,7 +1467,9 @@ public class {service_name} {{
 
     def _build_repair_prompt(self, repair_context: Dict[str, Any]) -> str:
         return (
-            "You are repairing a generated Java Spring Boot project so it compiles successfully.\n"
+            "You are repairing a generated Java Spring Boot project with one objective: 0 compile errors.\n"
+            "Treat compilation success as the only priority for this pass.\n"
+            "Do not optimize architecture, style, or feature completeness unless required to remove a compiler error.\n"
             "Return JSON only. No markdown. No prose outside JSON.\n\n"
             "Required schema:\n"
             "{\n"
@@ -1472,9 +1486,30 @@ public class {service_name} {{
             "2. Every file entry must contain the ENTIRE replacement file content.\n"
             "3. Do not invent files unless required for compilation.\n"
             "4. Keep package names and project structure consistent.\n"
-            "5. Fix the reported build/compiler errors directly.\n"
-            "6. If one fix requires import changes or method signature changes, include them in the full file content.\n"
-            "7. Prefer minimal edits.\n\n"
+            "5. Fix the reported build/compiler errors directly and aggressively.\n"
+            "6. Prefer the smallest safe edit that removes a compile error.\n"
+            "7. If a method, annotation block, or trailing fragment is incomplete or syntactically broken, complete it or remove the broken fragment.\n"
+            "8. If a type is used but not imported, add the exact missing import.\n"
+            "9. If a class/entity/repository name does not exist, replace it with the real existing generated class name instead of inventing a new one.\n"
+            "10. If an argument list, method signature, or generic type does not match existing code, rewrite it to match the declared existing signature exactly.\n"
+            "11. If the code references undefined local variables, replace them with existing in-scope variables or compile-safe literals/constants.\n"
+            "12. If a field accessor/mutator does not exist, switch to a real existing accessor/mutator or remove that line.\n"
+            "13. Never leave a file half-written. Every edited Java file must end with balanced braces and valid syntax.\n"
+            "14. In service classes, replace TODOs, placeholders, disconnected branches, and no-op CRUD logic with actual repository calls whenever the repository method already exists.\n"
+            "15. In service classes, prefer calling existing custom repository methods first; if none exist, use findById/save/deleteById as the compile-safe fallback.\n"
+            "16. If a service is not calling its repository at all, wire it to the matching repository instead of leaving the logic disconnected.\n"
+            "17. Do not make speculative runtime/business-logic improvements in this pass.\n"
+            "18. Focus first on the files named in the compiler output. Do not touch unrelated files unless one of those files cannot compile without it.\n"
+            "19. Assume the build will be rerun immediately. Your response should maximize the chance that the next compile has fewer errors, ideally zero.\n\n"
+            "Common compile-only fixes allowed in this pass:\n"
+            "- add missing imports such as LocalTime, Timestamp, BigDecimal, Arrays, ArrayList, Pattern, AtomicReference\n"
+            "- fix truncated repository/service/interface/class files\n"
+            "- replace wrong lowercase entity names in JpaRepository generics/imports\n"
+            "- remove duplicate annotations on a single repository method\n"
+            "- rewrite wrong repository call arguments to match the actual signature\n"
+            "- replace undefined placeholders with compile-safe literals\n"
+            "- replace getId()/setStatus() style calls with real existing entity accessors when necessary\n"
+            "- replace disconnected service stubs with actual repository invocations when matching repository methods already exist\n\n"
             f"Repair context JSON:\n{json.dumps(repair_context, ensure_ascii=True, indent=2)}"
         )
 
