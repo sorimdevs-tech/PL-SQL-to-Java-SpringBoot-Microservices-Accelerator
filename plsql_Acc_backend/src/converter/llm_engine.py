@@ -1106,6 +1106,7 @@ class LLMConversionEngine:
                 return {
                     'operations': set(),
                     'lookup_keys': [],
+                    'lookup_key_variants': [],
                     'requires_upsert': False,
                     'requires_skip_locked': False,
                     'aggregation_columns': [],
@@ -1116,10 +1117,21 @@ class LLMConversionEngine:
                 normalized_table = str(table_name).upper()
                 spec = table_specs.setdefault(normalized_table, _default_spec())
                 spec['operations'].update(str(op).upper() for op in (operations or []))
+                unit_lookup_keys: List[str] = []
                 for column in (lookup_map.get(normalized_table) or []):
                     normalized_column = str(column).upper()
                     if normalized_column not in spec['lookup_keys']:
                         spec['lookup_keys'].append(normalized_column)
+                    if normalized_column not in unit_lookup_keys:
+                        unit_lookup_keys.append(normalized_column)
+                if unit_lookup_keys:
+                    variant_key = tuple(unit_lookup_keys)
+                    known_variants = {
+                        tuple(str(value).upper() for value in (variant or []) if value)
+                        for variant in (spec.get('lookup_key_variants') or [])
+                    }
+                    if variant_key not in known_variants:
+                        spec['lookup_key_variants'].append(unit_lookup_keys)
                 spec['requires_upsert'] = spec['requires_upsert'] or ('MERGE' in spec['operations'])
                 spec['requires_skip_locked'] = spec['requires_skip_locked'] or (normalized_table in skip_locked_tables)
             for upsert in semantic_upserts:
@@ -1141,10 +1153,21 @@ class LLMConversionEngine:
                 spec['operations'].add('SELECT')
                 if column_name not in spec['aggregation_columns']:
                     spec['aggregation_columns'].append(column_name)
+                aggregation_lookup_keys: List[str] = []
                 for column in (lookup_map.get(table_name) or []):
                     normalized_column = str(column).upper()
                     if normalized_column not in spec['lookup_keys']:
                         spec['lookup_keys'].append(normalized_column)
+                    if normalized_column not in aggregation_lookup_keys:
+                        aggregation_lookup_keys.append(normalized_column)
+                if aggregation_lookup_keys:
+                    variant_key = tuple(aggregation_lookup_keys)
+                    known_variants = {
+                        tuple(str(value).upper() for value in (variant or []) if value)
+                        for variant in (spec.get('lookup_key_variants') or [])
+                    }
+                    if variant_key not in known_variants:
+                        spec['lookup_key_variants'].append(aggregation_lookup_keys)
             for skip_table in skip_locked_tables:
                 spec = table_specs.setdefault(skip_table, _default_spec())
                 spec['operations'].add('SELECT')
@@ -1308,7 +1331,20 @@ class LLMConversionEngine:
     ) -> str:
         package_name = self.config.get('output', {}).get('package_name', 'com.company.project')
         lookup_keys = list(spec.get('lookup_keys', []))
-        lookup_method_name = self._expected_lookup_method_name(lookup_keys) if lookup_keys else ""
+        lookup_variants_raw = spec.get('lookup_key_variants') or []
+        lookup_variants: List[List[str]] = []
+        seen_lookup_variants: Set[Tuple[str, ...]] = set()
+        for variant in lookup_variants_raw:
+            normalized_variant = [str(key).upper() for key in (variant or []) if key]
+            if not normalized_variant:
+                continue
+            signature = tuple(normalized_variant)
+            if signature in seen_lookup_variants:
+                continue
+            seen_lookup_variants.add(signature)
+            lookup_variants.append(normalized_variant)
+        if not lookup_variants and lookup_keys:
+            lookup_variants = [lookup_keys]
         custom_methods: List[str] = []
         imports = {
             "import org.springframework.data.jpa.repository.JpaRepository;",
@@ -1316,14 +1352,20 @@ class LLMConversionEngine:
             f"import {package_name}.entity.{entity_name};",
         }
 
-        if lookup_method_name and lookup_keys:
+        if lookup_variants:
             imports.add("import java.util.Optional;")
-            params = []
-            for key in lookup_keys:
-                param_name = normalize_column_name(key)
-                param_type = self._resolve_lookup_key_type(key, entity_field_types)
-                params.append(f"{param_type} {param_name}")
-            custom_methods.append(f"    Optional<{entity_name}> {lookup_method_name}({', '.join(params)});")
+            emitted_lookup_methods: Set[str] = set()
+            for lookup_variant in lookup_variants:
+                lookup_method_name = self._expected_lookup_method_name(lookup_variant)
+                if not lookup_method_name or lookup_method_name in emitted_lookup_methods:
+                    continue
+                params = []
+                for key in lookup_variant:
+                    param_name = normalize_column_name(key)
+                    param_type = self._resolve_lookup_key_type(key, entity_field_types)
+                    params.append(f"{param_type} {param_name}")
+                custom_methods.append(f"    Optional<{entity_name}> {lookup_method_name}({', '.join(params)});")
+                emitted_lookup_methods.add(lookup_method_name)
 
         if spec.get('requires_skip_locked'):
             cursor_filters = list(spec.get('cursor_filters') or [])

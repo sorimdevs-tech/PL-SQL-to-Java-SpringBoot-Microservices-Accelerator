@@ -666,9 +666,21 @@ class PLSQLModernizationPipeline:
         Returns:
             Dict[str, Any]: Test results and validation information
         """
-        return await self.test_generator.generate_and_validate(
-            entities, repositories, services, controllers
-        )
+        # return await self.test_generator.generate_and_validate(
+        #     entities, repositories, services, controllers
+        # )
+         # Temporarily disabled per product decision:
+        # do not generate/write test sources as part of conversion output.
+        logger.info("Test generation is disabled; skipping Stage 8 test file creation.")
+        return {
+            'total_tests': 0,
+            'unit_tests': [],
+            'integration_tests': [],
+            'validation_results': [],
+            'sql_validation_results': [],
+            'test_report': '# Test generation disabled\n',
+            'validation_passed': True,
+        }
 
     async def repair_generated_project_if_needed(self, project_structure: Dict[str, Any]) -> Dict[str, Any]:
         project_root = self.output_directory

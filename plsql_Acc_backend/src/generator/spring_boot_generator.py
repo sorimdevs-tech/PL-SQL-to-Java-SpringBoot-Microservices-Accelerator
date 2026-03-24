@@ -1,4 +1,4 @@
-"""
+﻿"""
 Spring Boot Project Generator for PL/SQL Modernization Platform
 Generates complete Spring Boot projects from converted Java code
 
@@ -1602,7 +1602,11 @@ public class {entity_base}Controller {{
                 f.write(content)
 
         # SBG-6: generate at least a context-load test per service
-        self._generate_test_files()
+        # self._generate_test_files()
+         # Test source generation intentionally disabled for now.
+        # Keep converter output focused on compile-ready main sources.
+        logger.info("Skipping generated test sources by design.")
+
 
     # ── SBG-6: test file generation ──────────────────────────────────────────
     def _generate_test_files(self):

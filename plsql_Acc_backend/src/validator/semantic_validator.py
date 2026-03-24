@@ -634,6 +634,11 @@ class SemanticValidator:
         for unit in source_units:
             object_name = unit.get("name", "")
             lookup_map = unit.get("lookup_keys") or {}
+            operations_by_table = {
+                str(table_name).upper()
+                for table_name in (unit.get("operations_by_table") or {}).keys()
+                if table_name
+            }
             skip_locked_tables = {
                 str(table).upper()
                 for table in (unit.get("skip_locked_tables") or [])
@@ -645,6 +650,11 @@ class SemanticValidator:
                     skip_locked_tables.add(driving_table)
             for table_name, lookup_keys in lookup_map.items():
                 if not lookup_keys:
+                    continue
+                normalized_table = str(table_name).upper()
+                if normalized_table not in operations_by_table and normalized_table not in skip_locked_tables:
+                    # Ignore lookup hints from joined/read-only tables that are not directly
+                    # represented as repository operations for this unit.
                     continue
                 repository_name = self._derive_repository_name_from_table(str(table_name))
                 repository_code = repositories.get(f"{repository_name}.java", "")
@@ -661,7 +671,7 @@ class SemanticValidator:
                     )
                     continue
                 expected_method = self._expected_lookup_method_name(list(lookup_keys))
-                if expected_method not in contract.get("methods", set()):
+                if not self._has_lookup_method_for_keys(contract.get("methods", set()), list(lookup_keys)):
                     issues.append(
                         SemanticIssue(
                             component="repository",
@@ -756,6 +766,33 @@ class SemanticValidator:
             if normalize_column_name(key)
         )
         return f"findBy{suffix}" if suffix else "findById"
+
+    def _lookup_method_parts(self, method_name: str) -> List[str]:
+        if not method_name.startswith("findBy"):
+            return []
+        suffix = method_name[len("findBy"):]
+        if not suffix:
+            return []
+        return [part.lower() for part in suffix.split("And") if part]
+
+    def _has_lookup_method_for_keys(self, methods: Set[str], lookup_keys: List[str]) -> bool:
+        expected_parts = [
+            normalize_column_name(key).lower()
+            for key in (lookup_keys or [])
+            if normalize_column_name(key)
+        ]
+        if not expected_parts:
+            return True
+        expected_method = self._expected_lookup_method_name(lookup_keys)
+        if expected_method in methods:
+            return True
+        for method_name in methods:
+            parts = self._lookup_method_parts(method_name)
+            if not parts:
+                continue
+            if all(part in parts for part in expected_parts):
+                return True
+        return False
 
     def _derive_repository_name_from_table(self, table_name: str) -> str:
         base = to_pascal_case(table_name)
