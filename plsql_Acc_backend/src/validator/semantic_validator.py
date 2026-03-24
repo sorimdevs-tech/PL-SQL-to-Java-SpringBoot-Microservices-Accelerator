@@ -191,6 +191,26 @@ class SemanticValidator:
                         file_name=filename,
                     )
                 )
+            if "Collection<" in code and "import java.util.Collection;" not in code:
+                issues.append(
+                    SemanticIssue(
+                        component="repository",
+                        object_name=interface_name,
+                        code="missing_collection_import",
+                        message=f"{interface_name} uses Collection without importing it",
+                        file_name=filename,
+                    )
+                )
+            if "LocalDateTime" in code and "import java.time.LocalDateTime;" not in code:
+                issues.append(
+                    SemanticIssue(
+                        component="repository",
+                        object_name=interface_name,
+                        code="missing_localdatetime_import",
+                        message=f"{interface_name} uses LocalDateTime without importing it",
+                        file_name=filename,
+                    )
+                )
         return issues
 
     def _validate_service_files(self, services: Dict[str, str]) -> List[SemanticIssue]:

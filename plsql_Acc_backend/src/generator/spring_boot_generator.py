@@ -3236,6 +3236,8 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import org.springframework.data.domain.PageRequest;')
         if 'List<' in code:
             import_lines.append('import java.util.List;')
+        if 'Collection<' in code:
+            import_lines.append('import java.util.Collection;')
         if 'Optional<' in code:
             import_lines.append('import java.util.Optional;')
         if 'LocalDateTime' in code:
@@ -3303,6 +3305,22 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         for imp in extra_imports:
             if imp not in import_lines:
                 import_lines.append(imp)
+
+        # Re-scan finalized body so imports cover symbols introduced by audit/repair steps.
+        if 'Collection<' in body and 'import java.util.Collection;' not in import_lines:
+            import_lines.append('import java.util.Collection;')
+        if 'List<' in body and 'import java.util.List;' not in import_lines:
+            import_lines.append('import java.util.List;')
+        if 'Optional<' in body and 'import java.util.Optional;' not in import_lines:
+            import_lines.append('import java.util.Optional;')
+        if 'LocalDateTime' in body and 'import java.time.LocalDateTime;' not in import_lines:
+            import_lines.append('import java.time.LocalDateTime;')
+        if 'LocalDate' in body and 'import java.time.LocalDate;' not in import_lines:
+            import_lines.append('import java.time.LocalDate;')
+        if 'LocalTime' in body and 'import java.time.LocalTime;' not in import_lines:
+            import_lines.append('import java.time.LocalTime;')
+        if 'BigDecimal' in body and 'import java.math.BigDecimal;' not in import_lines:
+            import_lines.append('import java.math.BigDecimal;')
         imports = '\n'.join(dict.fromkeys(import_lines))
 
         return f"""package {self.package_name}.repository;
@@ -3560,6 +3578,12 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             ]
             if needs_big_decimal():
                 extra_imports.append('import java.math.BigDecimal;')
+            if any(t == 'LocalDateTime' for _, t in param_parts):
+                extra_imports.append('import java.time.LocalDateTime;')
+            if any(t == 'LocalDate' for _, t in param_parts):
+                extra_imports.append('import java.time.LocalDate;')
+            if any(t == 'LocalTime' for _, t in param_parts):
+                extra_imports.append('import java.time.LocalTime;')
 
         # ── Issue 5: detect missing DELETE ────────────────────────────────────
         has_delete = bool(re.search(r'(?i)\bDELETE\s+FROM\b', body))
@@ -3663,6 +3687,12 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                 ]
                 if needs_big_decimal():
                     extra_imports.append('import java.math.BigDecimal;')
+                if any(ptype == 'LocalDateTime' for _, ptype in all_params):
+                    extra_imports.append('import java.time.LocalDateTime;')
+                if any(ptype == 'LocalDate' for _, ptype in all_params):
+                    extra_imports.append('import java.time.LocalDate;')
+                if any(ptype == 'LocalTime' for _, ptype in all_params):
+                    extra_imports.append('import java.time.LocalTime;')
 
         return body, list(dict.fromkeys(extra_imports))
 
