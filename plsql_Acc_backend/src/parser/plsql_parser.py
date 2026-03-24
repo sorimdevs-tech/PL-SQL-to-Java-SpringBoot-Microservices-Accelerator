@@ -71,6 +71,10 @@ def preprocess_plsql_for_parser(content: str) -> str:
             continue
         if stripped.startswith("@@") or stripped.startswith("@"):
             continue
+        if stripped in {"```", "~~~"}:
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            continue
 
         processed_lines.append(line)
 

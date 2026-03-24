@@ -1403,8 +1403,6 @@ class LLMConversionEngine:
         if aggregation_columns:
             sum_column = aggregation_columns[0]
             sum_field = self._resolve_entity_field_name(sum_column, entity_field_types)
-            lookup_for_sum = list(lookup_keys)
-            sum_method_name = self._aggregation_method_name(lookup_for_sum)
             imports.update(
                 {
                     "import java.math.BigDecimal;",
@@ -1413,47 +1411,70 @@ class LLMConversionEngine:
                     "import org.springframework.transaction.annotation.Transactional;",
                 }
             )
-            if lookup_for_sum:
-                where_fragments = []
-                method_params = []
-                for key in lookup_for_sum:
-                    field_name = self._resolve_entity_field_name(key, entity_field_types)
-                    param_name = normalize_column_name(key)
-                    param_type = self._resolve_lookup_key_type(key, entity_field_types)
-                    where_fragments.append(f"e.{field_name} = :{param_name}")
-                    method_params.append(f"@Param(\"{param_name}\") {param_type} {param_name}")
-                where_clause = " WHERE " + " AND ".join(where_fragments)
-                query = f"SELECT COALESCE(SUM(e.{sum_field}), 0) FROM {entity_name} e{where_clause}"
-                custom_methods.append(
-                    f"    @Transactional(readOnly = true)\n"
-                    f"    @Query(\"{query}\")\n"
-                    f"    BigDecimal {sum_method_name}({', '.join(method_params)});"
-                )
-                if len(lookup_for_sum) == 1:
-                    key = lookup_for_sum[0]
-                    key_field = self._resolve_entity_field_name(key, entity_field_types)
-                    key_type = self._resolve_lookup_key_type(key, entity_field_types)
-                    in_param_name = f"{normalize_column_name(key)}Values"
-                    in_method_name = self._aggregation_batch_method_name(lookup_for_sum)
-                    imports.update({"import java.util.Collection;", "import java.util.List;"})
-                    in_query = (
-                        f"SELECT e.{key_field}, COALESCE(SUM(e.{sum_field}), 0) "
-                        f"FROM {entity_name} e "
-                        f"WHERE e.{key_field} IN :{in_param_name} "
-                        f"GROUP BY e.{key_field}"
-                    )
+            sum_lookup_variants: List[List[str]] = []
+            seen_sum_variants: Set[Tuple[str, ...]] = set()
+            raw_sum_variants = lookup_variants if lookup_variants else ([lookup_keys] if lookup_keys else [[]])
+            for variant in raw_sum_variants:
+                normalized_variant = [str(key).upper() for key in (variant or []) if key]
+                signature = tuple(normalized_variant)
+                if signature in seen_sum_variants:
+                    continue
+                seen_sum_variants.add(signature)
+                sum_lookup_variants.append(normalized_variant)
+            if not sum_lookup_variants:
+                sum_lookup_variants = [[]]
+
+            emitted_sum_methods: Set[str] = set()
+            emitted_batch_methods: Set[str] = set()
+            for lookup_for_sum in sum_lookup_variants:
+                sum_method_name = self._aggregation_method_name(lookup_for_sum)
+                if sum_method_name in emitted_sum_methods:
+                    continue
+                emitted_sum_methods.add(sum_method_name)
+
+                if lookup_for_sum:
+                    where_fragments = []
+                    method_params = []
+                    for key in lookup_for_sum:
+                        field_name = self._resolve_entity_field_name(key, entity_field_types)
+                        param_name = normalize_column_name(key)
+                        param_type = self._resolve_lookup_key_type(key, entity_field_types)
+                        where_fragments.append(f"e.{field_name} = :{param_name}")
+                        method_params.append(f"@Param(\"{param_name}\") {param_type} {param_name}")
+                    where_clause = " WHERE " + " AND ".join(where_fragments)
+                    query = f"SELECT COALESCE(SUM(e.{sum_field}), 0) FROM {entity_name} e{where_clause}"
                     custom_methods.append(
                         f"    @Transactional(readOnly = true)\n"
-                        f"    @Query(\"{in_query}\")\n"
-                        f"    List<Object[]> {in_method_name}(@Param(\"{in_param_name}\") Collection<{key_type}> {in_param_name});"
+                        f"    @Query(\"{query}\")\n"
+                        f"    BigDecimal {sum_method_name}({', '.join(method_params)});"
                     )
-            else:
-                query = f"SELECT COALESCE(SUM(e.{sum_field}), 0) FROM {entity_name} e"
-                custom_methods.append(
-                    f"    @Transactional(readOnly = true)\n"
-                    f"    @Query(\"{query}\")\n"
-                    f"    BigDecimal {sum_method_name}();"
-                )
+                    if len(lookup_for_sum) == 1:
+                        key = lookup_for_sum[0]
+                        key_field = self._resolve_entity_field_name(key, entity_field_types)
+                        key_type = self._resolve_lookup_key_type(key, entity_field_types)
+                        in_param_name = f"{normalize_column_name(key)}Values"
+                        in_method_name = self._aggregation_batch_method_name(lookup_for_sum)
+                        if in_method_name not in emitted_batch_methods:
+                            emitted_batch_methods.add(in_method_name)
+                            imports.update({"import java.util.Collection;", "import java.util.List;"})
+                            in_query = (
+                                f"SELECT e.{key_field}, COALESCE(SUM(e.{sum_field}), 0) "
+                                f"FROM {entity_name} e "
+                                f"WHERE e.{key_field} IN :{in_param_name} "
+                                f"GROUP BY e.{key_field}"
+                            )
+                            custom_methods.append(
+                                f"    @Transactional(readOnly = true)\n"
+                                f"    @Query(\"{in_query}\")\n"
+                                f"    List<Object[]> {in_method_name}(@Param(\"{in_param_name}\") Collection<{key_type}> {in_param_name});"
+                            )
+                else:
+                    query = f"SELECT COALESCE(SUM(e.{sum_field}), 0) FROM {entity_name} e"
+                    custom_methods.append(
+                        f"    @Transactional(readOnly = true)\n"
+                        f"    @Query(\"{query}\")\n"
+                        f"    BigDecimal {sum_method_name}();"
+                    )
 
         methods_block = "\n\n".join(custom_methods)
         if methods_block:
@@ -1662,6 +1683,17 @@ class LLMConversionEngine:
         )
         has_cursor = bool(unit.get('cursor')) or bool(re.search(r"\bCURSOR\b", raw_plsql, flags=re.IGNORECASE))
         requires_pagination = has_bulk_collect or has_cursor
+        transaction = unit.get('transaction') or {}
+        requires_transactional_method = bool(
+            transaction.get('required')
+            or transaction.get('has_savepoint')
+            or transaction.get('has_partial_rollback')
+            or transaction.get('has_commit')
+            or transaction.get('has_rollback')
+            or re.search(r"\b(commit|rollback|savepoint)\b", raw_plsql, flags=re.IGNORECASE)
+        )
+        if requires_transactional_method:
+            imports.add('import org.springframework.transaction.annotation.Transactional;')
 
         skip_locked_tables = {
             str(table).upper()
@@ -2129,6 +2161,7 @@ class LLMConversionEngine:
                 )
             )
         helper_block = "\n\n".join(helper_methods)
+        method_annotation = "    @Transactional\n" if requires_transactional_method else ""
         return (
             f"package {package_name}.service;\n\n"
             f"{chr(10).join(sorted(imports))}\n\n"
@@ -2138,7 +2171,7 @@ class LLMConversionEngine:
             f"    public {service_name}({constructor_args}) {{\n"
             f"{init_block}\n"
             "    }\n\n"
-            f"    public void {method_name}({method_params}) {{\n"
+            f"{method_annotation}    public void {method_name}({method_params}) {{\n"
             f"{method_body}\n"
             "    }\n\n"
             f"{helper_block}\n"

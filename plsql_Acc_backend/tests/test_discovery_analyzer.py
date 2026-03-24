@@ -148,6 +148,26 @@ def test_build_conversion_units_extracts_lookup_keys_from_predicates():
     assert "UPDATED_AT" not in lookup_keys["CUSTOMER_BALANCE"]
 
 
+def test_build_conversion_units_ignores_markdown_fences():
+    sql = """
+    CREATE OR REPLACE PROCEDURE fenced_demo IS
+    ```
+    BEGIN
+        UPDATE accounts
+        SET status = 'REVIEW'
+        WHERE account_id = 1;
+    END;
+    ```
+    """
+
+    units = build_conversion_units(sql)
+    assert len(units) == 1
+    unit = units[0]
+    assert "```" not in unit["raw_plsql"]
+    assert "ACCOUNTS" in unit["operations_by_table"]
+    assert "UPDATE" in unit["operations_by_table"]["ACCOUNTS"]
+
+
 def test_analyze_sql_source_adds_semantic_analysis_for_reconciliation_flow():
     sql = """
     CREATE OR REPLACE PROCEDURE reconcile_customer_balances (

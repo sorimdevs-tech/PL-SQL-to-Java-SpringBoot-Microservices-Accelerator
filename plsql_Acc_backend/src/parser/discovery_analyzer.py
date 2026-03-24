@@ -140,6 +140,10 @@ def _remove_sqlplus_commands(sql_text: str) -> str:
         stripped = line.strip()
         if stripped == "/":
             continue
+        if stripped in {"```", "~~~"}:
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            continue
         lowered = stripped.lower()
         if lowered.startswith("set "):
             if re.match(r'^set\s+["`A-Za-z_][\w$#"`]*\s*=', stripped, flags=re.IGNORECASE):

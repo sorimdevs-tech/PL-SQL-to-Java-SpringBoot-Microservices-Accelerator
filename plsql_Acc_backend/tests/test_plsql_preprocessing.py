@@ -34,6 +34,21 @@ def test_preprocess_normalizes_oracle_specific_tokens():
     assert "old_employee_id" in cleaned
 
 
+def test_preprocess_removes_markdown_fences():
+    content = """
+    CREATE OR REPLACE PROCEDURE p_demo IS
+    ```
+    BEGIN
+      NULL;
+    END;
+    ```
+    """
+    cleaned = preprocess_plsql_for_parser(content)
+    assert "```" not in cleaned
+    assert "CREATE OR REPLACE PROCEDURE p_demo" in cleaned
+    assert "BEGIN" in cleaned
+
+
 def test_fallback_parse_extracts_objects_and_sql():
     parser = PLSQLParser()
     content = """
