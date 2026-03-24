@@ -158,6 +158,7 @@ import logging
 
 from ..utils.logger import get_logger
 from ..utils.config import get_config_value
+from ..utils.naming import normalize_column_name, to_pascal_case
 
 logger = get_logger(__name__)
 
@@ -938,7 +939,7 @@ class SpringBootGenerator:
                 parts.extend(gradle_line(dep))
         return "\n".join(parts)
 
-    async def generate_project(self, java_code: Dict[str, str]) -> Dict[str, Any]:
+    async def generate_project(self, java_code: Dict[str, str], auto_generate_controllers: bool = True) -> Dict[str, Any]:
         logger.info("Starting Spring Boot project generation...")
         self._latest_java_code = dict(java_code or {})
 
@@ -946,7 +947,7 @@ class SpringBootGenerator:
         self._generate_build_config()
         self._generate_application_config()
 
-        java_files = self._generate_java_files(java_code)
+        java_files = self._generate_java_files(java_code, auto_generate_controllers=auto_generate_controllers)
 
         repo_dir = self.package_path / 'repository'
         for reserved in ('JpaRepository.java', 'CrudRepository.java'):
@@ -1293,7 +1294,7 @@ app.build-time={self._get_current_time()}
         lowered = str(value or "").strip().lower()
         return "yaml" if lowered in {"yaml", "yml"} else "properties"
 
-    def _generate_java_files(self, java_code: Dict[str, str]) -> Dict[str, str]:
+    def _generate_java_files(self, java_code: Dict[str, str], auto_generate_controllers: bool = True) -> Dict[str, str]:
         java_files = {}
 
         # SBG-16 FIX: Build _ddl_table_map from entity class names BEFORE
@@ -1357,7 +1358,8 @@ app.build-time={self._get_current_time()}
         # because generate_controllers() is a separate public method that was
         # never called from within the main pipeline. Fix: after all service
         # files are written, derive and write a controller for each service.
-        self._generate_controllers_from_services(java_files)
+        if auto_generate_controllers:
+            self._generate_controllers_from_services(java_files)
 
         logger.info(f"Generated {len(java_files)} Java source files")
         return java_files
@@ -1973,7 +1975,7 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
         return summary
 
     def _to_camel_case(self, text: str) -> str:
-        return ''.join(word.capitalize() for word in text.replace('-', '_').split('_'))
+        return to_pascal_case(text)
 
     def _normalize_entity_type_name(self, raw_name: str) -> str:
         if not raw_name:
@@ -2032,10 +2034,7 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
         return value[0].upper() + value[1:]
 
     def _to_lower_camel_case(self, value: str) -> str:
-        if not value:
-            return value
-        pascal = self._to_camel_case(value)
-        return self._lower_first(pascal)
+        return normalize_column_name(value)
 
     def _is_numeric_type(self, sql_type: str) -> bool:
         normalized = (sql_type or "").upper()
@@ -2249,7 +2248,7 @@ public class {normalized_entity_name} {{
 }}
 """
 
-    def generate_repositories(self, entities: Dict[str, str]) -> Dict[str, str]:
+    def generate_repositories(self, entities: Dict[str, str], write_files: bool = True) -> Dict[str, str]:
         # SBG-18 FIX: when called standalone (Stage 7 in the pipeline, after
         # generate_project/generate_entities), _latest_java_code and
         # _ddl_table_map may be empty because they are only set inside
@@ -2378,10 +2377,11 @@ public class {normalized_entity_name} {{
                 resolved_entity, repo_name=repo_name
             )
 
-        for filename, code in repositories.items():
-            file_path = repo_dir / filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
+        if write_files:
+            for filename, code in repositories.items():
+                file_path = repo_dir / filename
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(code)
 
         logger.info(f"Generated {len(repositories)} repository interfaces")
         return repositories
@@ -2404,7 +2404,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 }}
 """
 
-    def generate_services(self, java_code: Dict[str, str]) -> Dict[str, str]:
+    def generate_services(self, java_code: Dict[str, str], write_files: bool = True) -> Dict[str, str]:
         # SBG-16 FIX: ensure _ddl_table_map is populated from entity sources
         # before normalising any service, so that _derive_entity_name can map
         # procedure-named services to the correct entity class.
@@ -2462,9 +2462,10 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                 target_filename = f"{class_name}.java" if class_name else filename
                 normalised = self._normalize_service_code(target_filename, code)
                 services[target_filename] = normalised
-                file_path = service_dir / target_filename
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(normalised)
+                if write_files:
+                    file_path = service_dir / target_filename
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(normalised)
 
         logger.info(f"Generated {len(services)} service classes")
         return services
@@ -3929,7 +3930,7 @@ public class {entity_name}Controller {{
 }}
 """
 
-    def generate_controllers(self, services: Dict[str, str]) -> Dict[str, str]:
+    def generate_controllers(self, services: Dict[str, str], write_files: bool = True) -> Dict[str, str]:
         # SBG-18 FIX: the pipeline calls this method (Stage 9) with a dict of
         # filename -> Java source code produced by generate_services().
         # The old implementation only delegated to _generate_controller() which
@@ -3963,14 +3964,21 @@ public class {entity_name}Controller {{
             normalized = self._normalize_controller_code(controller_filename, controller_code)
             controllers[controller_filename] = normalized
 
-            file_path = controller_dir / controller_filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(normalized)
+            if write_files:
+                file_path = controller_dir / controller_filename
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(normalized)
 
         logger.info(f"Generated {len(controllers)} controller classes")
         return controllers
 
-    def generate_entities(self, java_code: Dict[str, str], ddl_columns: Optional[Dict[str, List[Dict[str, str]]]] = None, fk_map: Optional[Dict[str, List[Dict[str, str]]]] = None) -> Dict[str, str]:
+    def generate_entities(
+        self,
+        java_code: Dict[str, str],
+        ddl_columns: Optional[Dict[str, List[Dict[str, str]]]] = None,
+        fk_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
+        write_files: bool = True,
+    ) -> Dict[str, str]:
         entities = {}
         ddl_columns = ddl_columns or {}
         ddl_map = {table.replace("_", "").lower(): table for table in ddl_columns.keys()}
@@ -4009,11 +4017,12 @@ public class {entity_name}Controller {{
                     if fallback_name not in entities:
                         entities[fallback_name] = self._generate_fallback_entity(entity_name, [])
 
-        entity_dir = self.package_path / 'entity'
-        for filename, code in entities.items():
-            file_path = entity_dir / filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
+        if write_files:
+            entity_dir = self.package_path / 'entity'
+            for filename, code in entities.items():
+                file_path = entity_dir / filename
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(code)
 
         logger.info(f"Generated {len(entities)} entity classes")
         return entities

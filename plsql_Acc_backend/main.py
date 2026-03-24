@@ -23,13 +23,24 @@ from src.analyzer.dependency_graph import DependencyAnalyzer
 from src.converter.llm_engine import LLMConversionEngine
 from src.generator.spring_boot_generator import SpringBootGenerator
 from src.validator.test_generator import TestGenerator
+from src.validator.semantic_validator import SemanticValidator, SemanticValidationReport
 from src.utils.file_utils import FileExtractor
 from src.parser.sql_table_discovery import extract_create_table_columns
+from src.parser.discovery_analyzer import build_conversion_units, build_discovery_model
 from src.advanced.optimization_engine import create_optimization_engine
 from src.advanced.advanced_features import create_advanced_features
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+class ConversionError(RuntimeError):
+    """Raised when deterministic semantic validation cannot be satisfied."""
+
+    def __init__(self, errors: List[str]):
+        self.errors = list(errors or [])
+        detail = "; ".join(self.errors[:12]) if self.errors else "unknown conversion error"
+        super().__init__(f"Conversion failed: {detail}")
 
 
 class PLSQLModernizationPipeline:
@@ -71,6 +82,9 @@ class PLSQLModernizationPipeline:
         self.llm_engine = LLMConversionEngine(llm_config)
         self.generator = SpringBootGenerator(self.config.get('output', {}))
         self.test_generator = TestGenerator()
+        self.semantic_validator = SemanticValidator(
+            self.config.get('output', {}).get('package_name', 'com.company.project')
+        )
         self.file_extractor = FileExtractor()
         self.repair_config = self.config.get('backup_llm', {}) or {}
         self._last_repair_result: Dict[str, Any] = {}
@@ -111,69 +125,86 @@ class PLSQLModernizationPipeline:
             logger.info("Stage 1: Extracting PL/SQL code...")
             plsql_files = await self.extract_plsql_code(source_path, source_type)
             
-            # Stage 2: Parse PL/SQL and generate AST
-            logger.info("Stage 2: Parsing PL/SQL code...")
+            # Stage 2: Extract raw PL/SQL semantics and full object bodies
+            logger.info("Stage 2: Extracting SQL semantics from raw PL/SQL...")
+            semantic_model = await self.extract_conversion_semantics(plsql_files)
+
+            # Diagnostic parse only. AST is no longer the LLM source of truth.
+            logger.info("Stage 2a: Parsing PL/SQL for diagnostics...")
             ast_results = await self.parse_plsql_code(plsql_files)
-            
-            # Stage 3: Analyze dependencies
-            logger.info("Stage 3: Analyzing dependencies...")
-            dependency_graph = await self.analyze_dependencies(ast_results)
-            
-            # Stage 4: Convert to Java using LLM
-            logger.info("Stage 4: Converting to Java using LLM...")
+            dependency_graph = self.build_dependency_summary(semantic_model)
 
-            # LCE-FIX: Extract DDL table names NOW (before Stage 4) so convert_to_java
-            # can inject them into the LLM context. The dependency graph may not have
-            # found any tables if the SQL statement parser couldn't resolve table
-            # references in procedure bodies.
-            try:
-                from src.parser.sql_table_discovery import extract_create_table_columns
-                self._last_ddl_tables = []
-                for _content in (plsql_files or {}).values():
-                    for _tbl in extract_create_table_columns(_content).keys():
-                        if _tbl.upper() not in [t.upper() for t in self._last_ddl_tables]:
-                            self._last_ddl_tables.append(_tbl.upper())
-                if self._last_ddl_tables:
-                    logger.info(f"LCE-FIX: found {len(self._last_ddl_tables)} DDL tables for LLM context: {self._last_ddl_tables}")
-            except Exception as _e:
-                logger.warning(f"LCE-FIX: DDL table extraction failed: {_e}")
-                self._last_ddl_tables = []
+            # Stage 3: Generate entities from extracted columns
+            logger.info("Stage 3: Generating JPA entities...")
+            entities = await self.generate_entities({}, plsql_files, semantic_model)
 
-            java_code = await self.convert_to_java(ast_results, dependency_graph)
-            if not java_code:
-                raise RuntimeError(
-                    "Stage 4 produced zero Java files after retries. "
-                    "Check LLM provider connectivity/model access or configure llm.fallback."
+            # Stage 4-6: Deterministic generation with strict 3-pass validation loop.
+            repositories: Dict[str, str] = {}
+            services: Dict[str, str] = {}
+            semantic_validation = SemanticValidationReport(passed=False, issues=[])
+            repository_feedback: Dict[str, List[str]] = {}
+            service_feedback: Dict[str, List[str]] = {}
+            for attempt in range(3):
+                logger.info("Stage 4: Generating deterministic repositories (attempt %s/3)...", attempt + 1)
+                repositories = await self.generate_repositories(
+                    semantic_model,
+                    entities,
+                    repository_feedback,
                 )
+
+                logger.info("Stage 5: Generating constrained services (attempt %s/3)...", attempt + 1)
+                services = await self.generate_services(
+                    semantic_model,
+                    entities,
+                    repositories,
+                    service_feedback,
+                )
+
+                logger.info("Stage 6: Running semantic validation (attempt %s/3)...", attempt + 1)
+                semantic_validation = await self.validate_semantics(
+                    semantic_model,
+                    entities,
+                    repositories,
+                    services,
+                )
+                if semantic_validation.passed:
+                    break
+                repository_feedback = semantic_validation.feedback_by_component("repository")
+                service_feedback = semantic_validation.feedback_by_component("service")
+                logger.warning(
+                    "Semantic validation failed on attempt %s/3: %s",
+                    attempt + 1,
+                    "; ".join(issue.message for issue in semantic_validation.issues[:5]),
+                )
+            if not semantic_validation.passed:
+                raise ConversionError([issue.message for issue in semantic_validation.issues])
+
+            controllers = await self.generate_controllers(services, write_files=False)
+            final_java_code = {}
+            final_java_code.update(entities)
+            final_java_code.update(repositories)
+            final_java_code.update(services)
+            final_java_code.update(controllers)
+
+            # Stage 7: Write validated files to the Spring Boot project
+            logger.info("Stage 7: Writing validated Spring Boot project...")
+            project_structure = await self.generate_spring_boot_project(
+                final_java_code,
+                auto_generate_controllers=False,
+            )
             
-            # Stage 5: Generate Spring Boot project
-            logger.info("Stage 5: Generating Spring Boot project...")
-            project_structure = await self.generate_spring_boot_project(java_code)
-            
-            # Stage 6: Generate entities
-            logger.info("Stage 6: Generating JPA entities...")
-            entities = await self.generate_entities(java_code, plsql_files)
-            
-            # Stage 7: Generate repositories
-            logger.info("Stage 7: Generating JPA repositories...")
-            repositories = await self.generate_repositories(entities)
-            
-            # Stage 8: Generate services
-            logger.info("Stage 8: Generating service layer...")
-            services = await self.generate_services(java_code)
-            
-            # Stage 9: Generate controllers
-            logger.info("Stage 9: Generating REST controllers...")
-            controllers = await self.generate_controllers(services)
-            
-            # Stage 10: Generate tests and validate
-            logger.info("Stage 10: Generating tests and validation...")
+            # Stage 8: Generate tests and validate
+            logger.info("Stage 8: Generating tests and validation...")
             test_results = await self.generate_tests_and_validate(
                 entities, repositories, services, controllers
             )
+            test_results["semantic_validation"] = semantic_validation.to_dict()
+            test_results["validation_passed"] = bool(
+                test_results.get("validation_passed", False) and semantic_validation.passed
+            )
 
-            # Stage 11: Build validation and backup-LLM repair
-            logger.info("Stage 11: Validating generated project build...")
+            # Stage 9: Build validation and backup-LLM repair
+            logger.info("Stage 9: Validating generated project build...")
             repair_results = await self.repair_generated_project_if_needed(project_structure)
             
             # Generate migration report
@@ -245,6 +276,139 @@ class PLSQLModernizationPipeline:
                 continue
         
         return ast_results
+
+    async def extract_conversion_semantics(self, plsql_files: Dict[str, str]) -> Dict[str, Any]:
+        """Build raw-object conversion units and merged schema semantics."""
+        units: List[Dict[str, Any]] = []
+        merged_schema = {
+            "tables": [],
+            "relationships": [],
+            "sequences": [],
+            "sequence_mapping": [],
+        }
+        table_index: Dict[str, Dict[str, Any]] = {}
+        relationship_keys: set[tuple[str, str, str, str]] = set()
+        sequence_names: set[str] = set()
+        sequence_mapping_keys: set[tuple[str, str]] = set()
+
+        for filename, content in (plsql_files or {}).items():
+            model = build_discovery_model(content)
+            file_units = build_conversion_units(content)
+            for unit in file_units:
+                unit["source_file"] = filename
+            units.extend(file_units)
+
+            for table in model.get("schema", {}).get("tables", []):
+                table_name = str(table.get("name", "")).upper()
+                if not table_name:
+                    continue
+                existing = table_index.get(table_name)
+                if not existing:
+                    table_index[table_name] = {
+                        "name": table_name,
+                        "columns": list(table.get("columns", [])),
+                        "primary_keys": list(table.get("primary_keys", [])),
+                        "foreign_keys": list(table.get("foreign_keys", [])),
+                        "source": table.get("source", "ddl"),
+                    }
+                    continue
+
+                existing_columns = {
+                    str(column.get("name", "")).upper(): column
+                    for column in existing.get("columns", [])
+                    if column.get("name")
+                }
+                for column in table.get("columns", []):
+                    column_name = str(column.get("name", "")).upper()
+                    if column_name and column_name not in existing_columns:
+                        existing["columns"].append(column)
+                existing["primary_keys"] = sorted(
+                    {*(existing.get("primary_keys", []) or []), *(table.get("primary_keys", []) or [])}
+                )
+                existing["foreign_keys"] = list({
+                    (
+                        fk.get("source_column", ""),
+                        fk.get("target_table", ""),
+                        fk.get("target_column", ""),
+                    ): fk
+                    for fk in [*(existing.get("foreign_keys", []) or []), *(table.get("foreign_keys", []) or [])]
+                }.values())
+
+            for relationship in model.get("schema", {}).get("relationships", []):
+                key = (
+                    str(relationship.get("source_table", "")).upper(),
+                    str(relationship.get("source_column", "")).upper(),
+                    str(relationship.get("target_table", "")).upper(),
+                    str(relationship.get("target_column", "")).upper(),
+                )
+                if key in relationship_keys:
+                    continue
+                relationship_keys.add(key)
+                merged_schema["relationships"].append(relationship)
+
+            for sequence in model.get("schema", {}).get("sequences", []):
+                sequence_name = str(sequence.get("name", "")).upper()
+                if not sequence_name or sequence_name in sequence_names:
+                    continue
+                sequence_names.add(sequence_name)
+                merged_schema["sequences"].append(sequence)
+
+            for mapping in model.get("schema", {}).get("sequence_mapping", []):
+                key = (
+                    str(mapping.get("sequence_name", "")).upper(),
+                    str(mapping.get("mapped_table", "")).upper(),
+                )
+                if key in sequence_mapping_keys:
+                    continue
+                sequence_mapping_keys.add(key)
+                merged_schema["sequence_mapping"].append(mapping)
+
+        merged_schema["tables"] = sorted(table_index.values(), key=lambda item: item.get("name", ""))
+        return {
+            "source_units": units,
+            "schema": merged_schema,
+        }
+
+    def build_dependency_summary(self, semantic_model: Dict[str, Any]) -> Dict[str, Any]:
+        tables = sorted(
+            {
+                str(table.get("name", "")).upper()
+                for table in semantic_model.get("schema", {}).get("tables", [])
+                if table.get("name")
+            }
+        )
+        operations_by_table: Dict[str, List[str]] = {}
+        lookup_keys_by_table: Dict[str, List[str]] = {}
+        for unit in semantic_model.get("source_units", []):
+            for table_name, operations in (unit.get("operations_by_table") or {}).items():
+                operations_by_table.setdefault(table_name, [])
+                operations_by_table[table_name] = sorted(
+                    {*(operations_by_table[table_name]), *(operations or [])}
+                )
+            for table_name, columns in (unit.get("lookup_keys") or {}).items():
+                lookup_keys_by_table.setdefault(table_name, [])
+                lookup_keys_by_table[table_name] = sorted(
+                    {*(lookup_keys_by_table[table_name]), *(columns or [])}
+                )
+        return {
+            "tables": tables,
+            "operations_by_table": operations_by_table,
+            "lookup_keys_by_table": lookup_keys_by_table,
+        }
+
+    async def validate_semantics(
+        self,
+        semantic_model: Dict[str, Any],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+        services: Dict[str, str],
+    ) -> SemanticValidationReport:
+        return self.semantic_validator.validate(
+            semantic_model.get("source_units", []),
+            entities,
+            repositories,
+            services,
+        )
     
     async def analyze_dependencies(self, ast_results: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -314,7 +478,11 @@ class PLSQLModernizationPipeline:
         
         return merged
     
-    async def generate_spring_boot_project(self, java_code: Dict[str, str]) -> Dict[str, Any]:
+    async def generate_spring_boot_project(
+        self,
+        java_code: Dict[str, str],
+        auto_generate_controllers: bool = True,
+    ) -> Dict[str, Any]:
         """
         Generate complete Spring Boot project structure
         
@@ -324,9 +492,17 @@ class PLSQLModernizationPipeline:
         Returns:
             Dict[str, Any]: Project structure information
         """
-        return await self.generator.generate_project(java_code)
+        return await self.generator.generate_project(
+            java_code,
+            auto_generate_controllers=auto_generate_controllers,
+        )
     
-    async def generate_entities(self, java_code: Dict[str, str], plsql_files: Dict[str, str]) -> Dict[str, str]:
+    async def generate_entities(
+        self,
+        java_code: Dict[str, str],
+        plsql_files: Dict[str, str],
+        semantic_model: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, str]:
         """
         Generate JPA entity classes
         
@@ -338,24 +514,47 @@ class PLSQLModernizationPipeline:
             Dict[str, str]: Generated entity files
         """
         ddl_columns: Dict[str, List[Dict[str, str]]] = {}
-        for content in (plsql_files or {}).values():
-            try:
-                ddl_columns.update(extract_create_table_columns(content))
-            except Exception:
-                continue
-
-        # SBG-20 FIX (Issue 6): parse ALTER TABLE ... FOREIGN KEY constraints
-        # so that _generate_entity_from_ddl can emit @ManyToOne/@JoinColumn
         fk_map: Dict[str, List[Dict[str, str]]] = {}
-        for content in (plsql_files or {}).values():
-            try:
-                fk_map.update(SpringBootGenerator.parse_fk_constraints(content))
-            except Exception:
-                continue
 
-        return self.generator.generate_entities(java_code, ddl_columns, fk_map)
+        if semantic_model:
+            for table in semantic_model.get("schema", {}).get("tables", []):
+                table_name = table.get("name")
+                if not table_name:
+                    continue
+                ddl_columns[str(table_name).upper()] = list(table.get("columns", []))
+                for fk in table.get("foreign_keys", []) or []:
+                    fk_map.setdefault(str(table_name).upper(), []).append(
+                        {
+                            "column": fk.get("source_column", ""),
+                            "ref_table": fk.get("target_table", ""),
+                            "ref_column": fk.get("target_column", ""),
+                        }
+                    )
+        else:
+            for content in (plsql_files or {}).values():
+                try:
+                    ddl_columns.update(extract_create_table_columns(content))
+                except Exception:
+                    continue
+            for content in (plsql_files or {}).values():
+                try:
+                    fk_map.update(SpringBootGenerator.parse_fk_constraints(content))
+                except Exception:
+                    continue
+
+        return self.generator.generate_entities(
+            java_code,
+            ddl_columns,
+            fk_map,
+            write_files=False,
+        )
     
-    async def generate_repositories(self, entities: Dict[str, str]) -> Dict[str, str]:
+    async def generate_repositories(
+        self,
+        semantic_model: Dict[str, Any],
+        entities: Dict[str, str],
+        validation_feedback: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, str]:
         """
         Generate JPA repository interfaces
         
@@ -365,9 +564,19 @@ class PLSQLModernizationPipeline:
         Returns:
             Dict[str, str]: Generated repository files
         """
-        return self.generator.generate_repositories(entities)
+        return await self.llm_engine.generate_repositories_from_semantics(
+            semantic_model.get("source_units", []),
+            entities,
+            validation_feedback=validation_feedback,
+        )
     
-    async def generate_services(self, java_code: Dict[str, str]) -> Dict[str, str]:
+    async def generate_services(
+        self,
+        semantic_model: Dict[str, Any],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+        validation_feedback: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, str]:
         """
         Generate service layer classes
         
@@ -377,9 +586,14 @@ class PLSQLModernizationPipeline:
         Returns:
             Dict[str, str]: Generated service files
         """
-        return self.generator.generate_services(java_code)
+        return await self.llm_engine.generate_services_from_semantics(
+            semantic_model.get("source_units", []),
+            entities,
+            repositories,
+            validation_feedback=validation_feedback,
+        )
     
-    async def generate_controllers(self, services: Dict[str, str]) -> Dict[str, str]:
+    async def generate_controllers(self, services: Dict[str, str], write_files: bool = True) -> Dict[str, str]:
         """
         Generate REST controller classes
         
@@ -389,7 +603,7 @@ class PLSQLModernizationPipeline:
         Returns:
             Dict[str, str]: Generated controller files
         """
-        return self.generator.generate_controllers(services)
+        return self.generator.generate_controllers(services, write_files=write_files)
     
     async def generate_tests_and_validate(self, entities: Dict[str, str], 
                                         repositories: Dict[str, str],
@@ -670,6 +884,7 @@ class PLSQLModernizationPipeline:
             "integration_tests_generated": len(integration_tests),
             "total_tests_generated": test_results.get('total_tests', 0),
             "validation_passed": test_results.get('validation_passed', False),
+            "semantic_validation_passed": bool((test_results.get("semantic_validation") or {}).get("passed")),
             "backup_llm_repair_enabled": bool((repair_results or {}).get('enabled')),
             "backup_llm_repair_attempted": bool((repair_results or {}).get('attempted')),
             "build_validation_passed": bool((repair_results or {}).get('final_build', {}).get('success')),
@@ -735,6 +950,7 @@ class PLSQLModernizationPipeline:
                 'integration_tests_generated': len(integration_tests),
                 'validation_results': len(validation_results),
                 'validation_passed': test_results.get('validation_passed', False),
+                'semantic_validation_passed': bool((test_results.get("semantic_validation") or {}).get("passed")),
                 'build_validation_passed': bool((repair_results or {}).get('final_build', {}).get('success')),
                 'repair_iterations': len((repair_results or {}).get('iterations', [])),
             },

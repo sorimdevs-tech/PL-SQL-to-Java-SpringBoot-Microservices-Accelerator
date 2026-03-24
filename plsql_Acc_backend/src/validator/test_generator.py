@@ -604,7 +604,7 @@ class {entity_name}IntegrationTest {{
                 issues.append(f"Entity {entity_name} missing primary key annotation")
             
             # Check for proper imports
-            if 'import javax.persistence' not in entity_code:
+            if 'import javax.persistence' not in entity_code and 'import jakarta.persistence' not in entity_code:
                 issues.append(f"Entity {entity_name} missing JPA imports")
             
             # Check for toString method

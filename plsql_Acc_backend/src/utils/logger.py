@@ -344,3 +344,49 @@ def log_class_methods(cls):
         if callable(attr) and not attr_name.startswith('_'):
             setattr(cls, attr_name, log_function_call(attr))
     return cls
+
+
+def safe_close_handlers(logger_obj: logging.Logger) -> None:
+    """
+    Safely close and remove all handlers from a logger
+    Flushes all handlers before closing to prevent I/O errors
+    
+    Args:
+        logger_obj (logging.Logger): Logger instance to clean up
+    """
+    handlers_to_remove = list(logger_obj.handlers)
+    for handler in handlers_to_remove:
+        try:
+            # Flush any buffered records
+            handler.flush()
+        except Exception:
+            pass  # Ignore flush errors
+        
+        try:
+            logger_obj.removeHandler(handler)
+        except Exception:
+            pass  # Ignore removal errors
+        
+        try:
+            handler.close()
+        except Exception:
+            pass  # Ignore close errors
+
+
+class ResilientStreamHandler(logging.StreamHandler):
+    """
+    StreamHandler that gracefully handles closed file operations
+    """
+    def emit(self, record: logging.LogRecord) -> None:
+        """
+        Emit a log record, ignoring I/O errors on closed files
+        """
+        try:
+            super().emit(record)
+        except ValueError as e:
+            # Ignore "I/O operation on closed file" errors
+            if "closed file" not in str(e):
+                raise
+        except Exception:
+            # Suppress other exceptions to prevent logging from crashing the app
+            pass

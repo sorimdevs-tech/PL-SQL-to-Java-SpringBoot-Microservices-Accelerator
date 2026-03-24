@@ -33,6 +33,29 @@ KEYWORD_BLOCKLIST = {
     "nvl",
 }
 
+TABLE_NAME_BLOCKLIST = {
+    "SET",
+    "SKIP",
+    "LOCKED",
+    "MATCHED",
+    "NOT",
+    "DUAL",
+    "INTO",
+    "FROM",
+    "JOIN",
+    "ON",
+    "USING",
+    "WHEN",
+    "THEN",
+    "VALUES",
+    "TABLE",
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+}
+
 TYPE_BLOCKLIST = {
     "VARCHAR2",
     "NVARCHAR2",
@@ -49,6 +72,8 @@ TYPE_BLOCKLIST = {
     "FLOAT",
     "DECIMAL",
 }
+
+AGGREGATION_FUNCTIONS = ("SUM", "COUNT", "AVG", "MIN", "MAX")
 
 OBJECT_PATTERN = re.compile(
     r"\bcreate\s+(?:or\s+replace\s+)?(?:editionable\s+|noneditionable\s+)?(procedure|function|package(?:\s+body)?)\s+([`\"\w$#\.]+)",
@@ -76,6 +101,13 @@ def _normalize_identifier(raw_name: str) -> str:
     return clean
 
 
+def _normalize_table_candidate(raw_name: str) -> str:
+    normalized = _normalize_identifier(raw_name).upper()
+    if not normalized or normalized in TABLE_NAME_BLOCKLIST:
+        return ""
+    return normalized
+
+
 def _to_pascal_case(name: str) -> str:
     parts = re.split(r"[_\W]+", name)
     return "".join(part[:1].upper() + part[1:].lower() for part in parts if part)
@@ -89,7 +121,6 @@ def _prepare_sql_text(sql_text: str) -> str:
 def _remove_sqlplus_commands(sql_text: str) -> str:
     filtered_lines: List[str] = []
     command_prefixes = (
-        "set ",
         "spool ",
         "prompt ",
         "rem ",
@@ -110,6 +141,11 @@ def _remove_sqlplus_commands(sql_text: str) -> str:
         if stripped == "/":
             continue
         lowered = stripped.lower()
+        if lowered.startswith("set "):
+            if re.match(r'^set\s+["`A-Za-z_][\w$#"`]*\s*=', stripped, flags=re.IGNORECASE):
+                filtered_lines.append(line)
+                continue
+            continue
         if any(lowered.startswith(prefix) for prefix in command_prefixes):
             continue
         filtered_lines.append(line)
@@ -505,8 +541,8 @@ def _extract_operations_and_tables(block_text: str) -> Dict[str, Any]:
     def _add_table(raw_name: str) -> None:
         if not raw_name:
             return
-        normalized = _normalize_identifier(raw_name).upper()
-        if normalized in {"TABLE", "DUAL"}:
+        normalized = _normalize_table_candidate(raw_name)
+        if not normalized:
             return
         tables.add(normalized)
 
@@ -518,6 +554,8 @@ def _extract_operations_and_tables(block_text: str) -> Dict[str, Any]:
         operations.add("UPDATE")
     if re.search(r"\bdelete\s+from\b", block_text, flags=re.IGNORECASE):
         operations.add("DELETE")
+    if re.search(r"\bmerge\s+into\b", block_text, flags=re.IGNORECASE):
+        operations.add("MERGE")
 
     for match in re.finditer(r"\bfrom\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         _add_table(match.group(1))
@@ -529,6 +567,8 @@ def _extract_operations_and_tables(block_text: str) -> Dict[str, Any]:
         _add_table(match.group(1))
     for match in re.finditer(r"\bdelete\s+from\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         _add_table(match.group(1))
+    for match in re.finditer(r"\bmerge\s+into\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
+        _add_table(match.group(1))
 
     return {"operations": sorted(operations), "tables": sorted(tables)}
 
@@ -537,8 +577,8 @@ def _extract_operations_by_table(block_text: str) -> Dict[str, List[str]]:
     per_table: Dict[str, Set[str]] = {}
 
     def add(table: str, op: str) -> None:
-        normalized = _normalize_identifier(table).upper()
-        if normalized in {"TABLE", "DUAL"}:
+        normalized = _normalize_table_candidate(table)
+        if not normalized:
             return
         per_table.setdefault(normalized, set()).add(op)
 
@@ -550,8 +590,47 @@ def _extract_operations_by_table(block_text: str) -> Dict[str, List[str]]:
         add(match.group(1), "UPDATE")
     for match in re.finditer(r"\bdelete\s+from\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
         add(match.group(1), "DELETE")
+    for match in re.finditer(r"\bmerge\s+into\s+([`\"\w$#\.]+)", block_text, flags=re.IGNORECASE):
+        add(match.group(1), "MERGE")
 
     return {table: sorted(ops) for table, ops in per_table.items()}
+
+
+def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
+    """Return raw object blocks plus extracted semantics for code generation."""
+    cleaned = _prepare_sql_text(sql_text)
+    model = build_discovery_model(cleaned)
+    semantics_by_object = {
+        (proc.get("name", "").upper(), proc.get("object_type", "").upper()): proc
+        for proc in model.get("procedures", [])
+    }
+
+    units: List[Dict[str, Any]] = []
+    for item in _extract_objects(cleaned):
+        object_key = (item.object_name.upper(), item.object_type.upper())
+        semantics = semantics_by_object.get(object_key, {})
+        units.append(
+            {
+                "name": item.object_name,
+                "object_type": item.object_type,
+                "raw_plsql": item.block_text.strip(),
+                "tables_used": semantics.get("tables_used", []),
+                "operations_by_table": semantics.get("operations", {}),
+                "input_parameters": semantics.get("input_parameters", []),
+                "output_parameters": semantics.get("output_parameters", []),
+                "variables": semantics.get("variables", []),
+                "lookup_keys": semantics.get("lookup_keys", {}),
+                "bulk_operations": semantics.get("bulk_operations", []),
+                "cursor": semantics.get("cursor", {}),
+                "transaction": semantics.get("transaction", {}),
+                "exceptions": semantics.get("exceptions", []),
+                "business_rules": semantics.get("business_rules", []),
+                "issues": semantics.get("issues", []),
+                "semantic_analysis": semantics.get("semantic_analysis", {}),
+            }
+        )
+
+    return units
 
 
 def _extract_table_aliases(block_text: str) -> Dict[str, str]:
@@ -580,6 +659,135 @@ def _extract_table_columns(block_text: str, tables: Sequence[str]) -> Dict[str, 
         if table in normalized_tables:
             columns.setdefault(table, set()).add(column)
     return {table: sorted(values) for table, values in columns.items()}
+
+
+def _extract_lookup_keys(
+    block_text: str,
+    ddl_columns: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, List[str]]:
+    lookup_keys: Dict[str, Set[str]] = {}
+
+    def add_key(table_name: str, column_name: str) -> None:
+        normalized_table = _normalize_table_candidate(table_name)
+        normalized_column = _normalize_identifier(column_name).upper()
+        if not normalized_table or not normalized_column:
+            return
+        lookup_keys.setdefault(normalized_table, set()).add(normalized_column)
+
+    def extract_clause_columns(
+        clause_text: str,
+        alias_map: Dict[str, str],
+        default_table: str = "",
+    ) -> None:
+        if not clause_text.strip():
+            return
+
+        for match in re.finditer(r"\b([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#]*)\b", clause_text):
+            resolved_table = alias_map.get(match.group(1).upper(), "")
+            if resolved_table:
+                add_key(resolved_table, match.group(2))
+
+        if not default_table:
+            return
+
+        known_columns = {
+            _normalize_identifier(column).upper()
+            for column in (ddl_columns or {}).get(default_table.upper(), [])
+            if column
+        }
+        unqualified_pattern = re.compile(
+            r"(?:^|[\s(,])([A-Za-z_][\w$#]*)\s*"
+            r"(=|<>|!=|>=|<=|>|<|\blike\b|\bin\s*\(|\bbetween\b|\bis\s+(?:not\s+)?null\b)",
+            flags=re.IGNORECASE,
+        )
+        for raw_name, _ in unqualified_pattern.findall(clause_text):
+            normalized_name = _normalize_identifier(raw_name).upper()
+            if not normalized_name:
+                continue
+            if (
+                normalized_name in TABLE_NAME_BLOCKLIST
+                or normalized_name in TYPE_BLOCKLIST
+                or normalized_name.lower() in KEYWORD_BLOCKLIST
+            ):
+                continue
+            if known_columns and normalized_name not in known_columns:
+                continue
+            add_key(default_table, normalized_name)
+
+    def extract_predicate_clauses(statement_text: str) -> List[str]:
+        clauses: List[str] = []
+        seen_clauses: Set[str] = set()
+        clause_patterns = (
+            re.compile(
+                r"\bon\s*\((.*?)\)\s*(?=\bwhen\b|\bjoin\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|;)",
+                flags=re.IGNORECASE | re.DOTALL,
+            ),
+            re.compile(
+                r"\bon\s+(.*?)(?=\bjoin\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\bwhen\b|;)",
+                flags=re.IGNORECASE | re.DOTALL,
+            ),
+            re.compile(
+                r"\bwhere\b(.*?)(?=\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\bconnect\s+by\b|\bstart\s+with\b|\bfor\s+update\b|\breturning\b|\bwhen\b|;)",
+                flags=re.IGNORECASE | re.DOTALL,
+            ),
+        )
+        for pattern in clause_patterns:
+            for match in pattern.finditer(statement_text):
+                clause = _normalize_statement_text(match.group(1))
+                if not clause or clause in seen_clauses:
+                    continue
+                seen_clauses.add(clause)
+                clauses.append(clause)
+        return clauses
+
+    def register_statement(statement_text: str, default_table: str = "", target_alias: str = "") -> None:
+        alias_map = _extract_table_aliases(statement_text)
+        if default_table:
+            normalized_default = _normalize_table_candidate(default_table)
+            if normalized_default:
+                alias_map[normalized_default] = normalized_default
+                if target_alias:
+                    alias_map[target_alias.upper()] = normalized_default
+                default_table = normalized_default
+            else:
+                default_table = ""
+        else:
+            statement_tables = {
+                table_name.upper()
+                for table_name in alias_map.values()
+                if table_name.upper() not in {"DUAL", "TABLE"}
+            }
+            default_table = next(iter(statement_tables)) if len(statement_tables) == 1 else ""
+
+        for clause_text in extract_predicate_clauses(statement_text):
+            extract_clause_columns(clause_text, alias_map, default_table)
+
+    for match in re.finditer(r"\bselect\b[\s\S]*?;", block_text, flags=re.IGNORECASE):
+        register_statement(match.group(0))
+
+    statement_patterns = (
+        re.compile(
+            r"\bupdate\s+([`\"\w$#\.]+)(?:\s+(?:as\s+)?([A-Za-z_][\w$#]*))?\s+set\b[\s\S]*?;",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bdelete\s+from\s+([`\"\w$#\.]+)(?:\s+(?:as\s+)?([A-Za-z_][\w$#]*))?[\s\S]*?;",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bmerge\s+into\s+([`\"\w$#\.]+)(?:\s+(?:as\s+)?([A-Za-z_][\w$#]*))?[\s\S]*?;",
+            flags=re.IGNORECASE,
+        ),
+    )
+    for pattern in statement_patterns:
+        for match in pattern.finditer(block_text):
+            register_statement(
+                match.group(0),
+                default_table=match.group(1),
+                target_alias=match.group(2) or "",
+            )
+
+    return {table: sorted(columns) for table, columns in lookup_keys.items()}
 
 
 def _extract_table_relationships(block_text: str) -> List[Dict[str, str]]:
@@ -732,6 +940,56 @@ def _normalize_statement_text(statement: str) -> str:
     return " ".join(statement.strip().rstrip(";").split())
 
 
+def _format_source_reference(table_name: str, column_name: str) -> str:
+    if table_name and column_name:
+        return f"{table_name.lower()}.{column_name.lower()}"
+    if column_name:
+        return column_name.lower()
+    return table_name.lower() if table_name else ""
+
+
+def _extract_aggregate_expression_metadata(
+    expression: str,
+    alias_map: Dict[str, str],
+    default_table: str,
+) -> Dict[str, str]:
+    match = re.search(
+        r"\b(SUM|COUNT|AVG|MIN|MAX)\s*\(\s*(?:DISTINCT\s+)?(.*?)\s*\)",
+        expression,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return {}
+
+    function_name = match.group(1).upper()
+    raw_argument = _normalize_statement_text(match.group(2))
+    argument = raw_argument.strip()
+    source_table = default_table.upper() if default_table else ""
+    source_column = ""
+
+    if argument == "*":
+        source_column = "*"
+    else:
+        qualifier_match = re.search(
+            r"([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#*]*)",
+            argument,
+            flags=re.IGNORECASE,
+        )
+        if qualifier_match:
+            alias = qualifier_match.group(1).upper()
+            source_table = alias_map.get(alias, alias).upper()
+            source_column = _normalize_identifier(qualifier_match.group(2)).upper()
+        else:
+            source_column = _normalize_identifier(argument).upper()
+
+    return {
+        "function": function_name,
+        "source_table": source_table,
+        "source_column": source_column,
+        "source": _format_source_reference(source_table, source_column),
+    }
+
+
 def _build_variable_type_index(symbols: Sequence[Dict[str, str]]) -> Dict[str, str]:
     return {
         symbol.get("name", "").upper(): symbol.get("type", "")
@@ -791,16 +1049,21 @@ def _semantic_priority(semantic_type: str) -> int:
 
 def _extract_select_into_assignments(block_text: str) -> List[Dict[str, Any]]:
     assignments: List[Dict[str, Any]] = []
-    aliases = _extract_table_aliases(block_text)
+    statement_pattern = re.compile(r"\bselect\b[\s\S]*?;", flags=re.IGNORECASE)
     select_into_pattern = re.compile(
-        r"\bselect\s+(?P<select>.*?)\s+into\s+(?P<into>.*?)\s+from\s+(?P<table>[`\"\w$#\.]+)(?P<rest>.*?);",
+        r"\bselect\s+(?P<select>.*?)\s+into\s+(?P<into>.*?)\s+from\s+(?P<table>[`\"\w$#\.]+)",
         flags=re.IGNORECASE | re.DOTALL,
     )
-    for match in select_into_pattern.finditer(block_text):
-        statement = _normalize_statement_text(match.group(0))
-        columns = [token.strip() for token in _split_top_level_csv(match.group("select"))]
-        variables = [token.strip() for token in _split_top_level_csv(match.group("into"))]
-        table = _normalize_identifier(match.group("table")).upper()
+    for stmt_match in statement_pattern.finditer(block_text):
+        statement_text = stmt_match.group(0)
+        parsed = select_into_pattern.search(statement_text)
+        if not parsed:
+            continue
+        statement = _normalize_statement_text(statement_text)
+        aliases = _extract_table_aliases(statement_text)
+        columns = [token.strip() for token in _split_top_level_csv(parsed.group("select"))]
+        variables = [token.strip() for token in _split_top_level_csv(parsed.group("into"))]
+        table = _normalize_identifier(parsed.group("table")).upper()
         row_risk = _select_into_has_row_risk(columns, statement)
         for column, variable in zip(columns, variables):
             column_expr = column.strip()
@@ -811,6 +1074,11 @@ def _extract_select_into_assignments(block_text: str) -> List[Dict[str, Any]]:
             source_column = column_expr.split(".")[-1].strip('"`').upper()
             variable_name = _normalize_identifier(variable)
             semantic_type = _classify_select_semantic_type(column_expr)
+            aggregate = _extract_aggregate_expression_metadata(column_expr, aliases, table)
+            if aggregate.get("source_table"):
+                source_table = aggregate.get("source_table", source_table)
+            if aggregate.get("source_column"):
+                source_column = aggregate.get("source_column", source_column)
             assignments.append(
                 {
                     "variable": variable_name,
@@ -818,11 +1086,14 @@ def _extract_select_into_assignments(block_text: str) -> List[Dict[str, Any]]:
                     "statement": statement,
                     "source_table": source_table,
                     "source_column": source_column,
+                    "column_expression": _normalize_statement_text(column_expr),
+                    "aggregation_function": aggregate.get("function", ""),
+                    "aggregation_source": aggregate.get("source", ""),
                     "semantic_type": semantic_type,
-                    "used": _find_variable_usage_after(block_text, variable_name, match.end()),
+                    "used": _find_variable_usage_after(block_text, variable_name, stmt_match.end()),
                     "row_risk": row_risk,
-                    "start": match.start(),
-                    "end": match.end(),
+                    "start": stmt_match.start(),
+                    "end": stmt_match.end(),
                 }
             )
     return assignments
@@ -1119,7 +1390,10 @@ def _synchronize_tables_used(
 def _extract_exceptions(block_text: str) -> List[str]:
     found: Set[str] = set()
     for match in re.finditer(r"\bwhen\s+([A-Za-z_][\w$#]*)\s+then\b", block_text, flags=re.IGNORECASE):
-        found.add(match.group(1).upper())
+        candidate = match.group(1).upper()
+        if candidate in TABLE_NAME_BLOCKLIST:
+            continue
+        found.add(candidate)
     for match in re.finditer(r"\b([A-Za-z_][\w$#]*)\s+exception\s*;", block_text, flags=re.IGNORECASE):
         found.add(match.group(1).upper())
     return sorted(found)
@@ -1164,6 +1438,8 @@ def _extract_procedure_calls(
 def _complexity_metrics(block_text: str) -> Dict[str, int]:
     non_empty_lines = [line for line in block_text.splitlines() if line.strip()]
     matched_spans: List[Tuple[int, int]] = []
+    executable_match = re.search(r"\bbegin\b([\s\S]*)$", block_text, flags=re.IGNORECASE)
+    executable_section = executable_match.group(1) if executable_match else block_text
 
     def count_pattern(pattern: str) -> int:
         count = 0
@@ -1186,13 +1462,38 @@ def _complexity_metrics(block_text: str) -> Dict[str, int]:
             continue
         number_of_loops += 1
 
+    number_of_conditions = 0
+    for match in re.finditer(r"\b(?:if|elsif)\s+(.*?)\s+then\b", executable_section, flags=re.IGNORECASE | re.DOTALL):
+        condition = _normalize_statement_text(match.group(1))
+        if not condition:
+            continue
+        boolean_branches = len(re.findall(r"\b(?:and|or)\b", condition, flags=re.IGNORECASE))
+        number_of_conditions += 1 + boolean_branches
+    number_of_conditions += len(re.findall(r"\bcase\b", executable_section, flags=re.IGNORECASE))
+
+    nesting_depth = 0
+    max_nesting_depth = 0
+    token_pattern = re.compile(
+        r"\b(begin|if|loop|case|end\s+if|end\s+loop|end\s+case|end)\b",
+        flags=re.IGNORECASE,
+    )
+    for token_match in token_pattern.finditer(block_text):
+        token = _normalize_statement_text(token_match.group(1)).upper()
+        if token in {"BEGIN", "IF", "LOOP", "CASE"}:
+            nesting_depth += 1
+            max_nesting_depth = max(max_nesting_depth, nesting_depth)
+        elif token in {"END IF", "END LOOP", "END CASE", "END"}:
+            nesting_depth = max(0, nesting_depth - 1)
+
     return {
         "linesOfCode": len(non_empty_lines),
         "numberOfQueries": len(
-            re.findall(r"\b(?:select|insert|update|delete)\b", block_text, flags=re.IGNORECASE)
+            re.findall(r"\b(?:select|insert|update|delete|merge)\b", block_text, flags=re.IGNORECASE)
         ),
-        "numberOfConditions": len(re.findall(r"\b(?:if|elsif|else)\b", block_text, flags=re.IGNORECASE)),
+        "numberOfConditions": number_of_conditions,
         "numberOfLoops": number_of_loops,
+        "nestedBlocks": max(max_nesting_depth - 1, 0),
+        "maxNestingDepth": max_nesting_depth,
     }
 
 
@@ -1558,6 +1859,18 @@ def classify_complexity(ast: Dict[str, Any]) -> Dict[str, Any]:
         or ast.get("bulk_operations")
         or ast.get("transaction", {}).get("features")
     )
+    has_batch_shape = (
+        bool(ast.get("bulk_operations"))
+        and metrics.get("numberOfLoops", 0) > 0
+        and metrics.get("numberOfQueries", 0) >= 4
+        and metrics.get("numberOfConditions", 0) >= 3
+    )
+    if has_batch_shape:
+        metrics["classification"] = "high_complexity_batch_processing"
+    elif has_advanced_patterns:
+        metrics["classification"] = "moderate_complexity_transactional_processing"
+    else:
+        metrics["classification"] = "standard_procedural_logic"
     metrics["level"] = "high" if has_advanced_patterns else ("medium" if metrics["numberOfQueries"] > 2 else "low")
     metrics["type"] = "enterprise_batch_processing" if has_advanced_patterns else "standard_procedural_logic"
     return metrics
@@ -1833,6 +2146,328 @@ def detect_logic_gaps(ast: Dict[str, Any]) -> List[Dict[str, str]]:
     return issues
 
 
+def detect_upsert_semantics(block_text: str) -> List[Dict[str, Any]]:
+    upserts: List[Dict[str, Any]] = []
+    merge_pattern = re.compile(r"\bmerge\s+into\s+([`\"\w$#\.]+)([\s\S]*?);", flags=re.IGNORECASE)
+    for match in merge_pattern.finditer(block_text):
+        table_name = _normalize_identifier(match.group(1)).upper()
+        statement_body = match.group(2)
+        details: List[str] = []
+        if re.search(r"\bwhen\s+not\s+matched\b", statement_body, flags=re.IGNORECASE):
+            details.append("INSERT")
+        if re.search(r"\bwhen\s+matched\b", statement_body, flags=re.IGNORECASE):
+            details.append("UPDATE")
+        upserts.append(
+            {
+                "table": table_name,
+                "operation": "UPSERT",
+                "type": "upsert_operation",
+                "details": details or ["UPDATE", "INSERT"],
+            }
+        )
+    return upserts
+
+
+def detect_aggregation_semantics(ast: Dict[str, Any]) -> Dict[str, Any]:
+    functions: Set[str] = set()
+    columns: Set[str] = set()
+    for assignment in ast.get("select_assignments", []):
+        function_name = str(assignment.get("aggregation_function", "")).upper()
+        if not function_name:
+            continue
+        functions.add(function_name)
+        source = str(assignment.get("aggregation_source", "")).strip()
+        if source:
+            columns.add(source)
+    if not functions:
+        return {}
+    return {
+        "type": "aggregation",
+        "columns": sorted(columns),
+        "functions": sorted(functions),
+    }
+
+
+def _extract_expression_identifiers(expression: str) -> List[str]:
+    excluded = {
+        *(keyword.upper() for keyword in KEYWORD_BLOCKLIST),
+        *(dtype.upper() for dtype in TYPE_BLOCKLIST),
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "SYSDATE",
+        "SQLERRM",
+    }
+    names: List[str] = []
+    for token in re.findall(r"\b([A-Za-z_][\w$#]*)\b", expression):
+        normalized = _normalize_identifier(token)
+        upper_name = normalized.upper()
+        if upper_name in excluded:
+            continue
+        names.append(normalized)
+    # Preserve declaration order while removing duplicates.
+    return list(dict.fromkeys(names))
+
+
+def detect_derived_value_semantics(ast: Dict[str, Any]) -> List[Dict[str, Any]]:
+    derived_values: List[Dict[str, Any]] = []
+    for assignment in ast.get("assignments", []):
+        if assignment.get("source") != ":=":
+            continue
+        formula = _normalize_statement_text(assignment.get("expression", ""))
+        if not formula or not re.search(r"[+\-*/]", formula):
+            continue
+        variable_name = assignment.get("variable", "")
+        identifiers = _extract_expression_identifiers(formula)
+        semantic_signal = f"{variable_name} {formula}".upper()
+        financial_markers = ("BALANCE", "AMOUNT", "PAYMENT", "PAYMENTS", "ORDER", "ORDERS", "TOTAL", "PRICE", "CREDIT", "DEBIT")
+        semantic_type = (
+            "financial_calculation"
+            if any(marker in semantic_signal for marker in financial_markers)
+            else "derived_calculation"
+        )
+        derived_values.append(
+            {
+                "variable": variable_name,
+                "type": "derived_value",
+                "formula": formula,
+                "semantic_type": semantic_type,
+                "source_variables": identifiers,
+            }
+        )
+    return derived_values
+
+
+def build_structured_data_flow_semantics(
+    ast: Dict[str, Any],
+    derived_values: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    flows: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+
+    for assignment in ast.get("select_assignments", []):
+        operation = assignment.get("aggregation_function", "")
+        source = assignment.get("aggregation_source", "")
+        if not operation or not source:
+            continue
+        target = assignment.get("variable", "")
+        key = (target, str(source), operation)
+        if key in seen:
+            continue
+        seen.add(key)
+        flows.append(
+            {
+                "target": target,
+                "source": source,
+                "operation": operation,
+            }
+        )
+
+    for derived in derived_values:
+        formula = derived.get("formula", "")
+        operation = "computed"
+        if "+" in formula and "-" not in formula:
+            operation = "addition"
+        elif "-" in formula and "+" not in formula:
+            operation = "subtraction"
+        elif "*" in formula and "/" not in formula:
+            operation = "multiplication"
+        elif "/" in formula and "*" not in formula:
+            operation = "division"
+        source_vars = derived.get("source_variables", [])
+        source: Any = source_vars if len(source_vars) != 1 else source_vars[0]
+        key = (derived.get("variable", ""), str(source), operation)
+        if key in seen:
+            continue
+        seen.add(key)
+        flows.append(
+            {
+                "target": derived.get("variable", ""),
+                "source": source,
+                "operation": operation,
+            }
+        )
+    return flows
+
+
+def _summarize_first_action(action_block: str) -> str:
+    for candidate in action_block.split(";"):
+        statement = _normalize_statement_text(candidate)
+        if statement:
+            return statement
+    return ""
+
+
+def detect_validation_rule_semantics(block_text: str) -> List[Dict[str, Any]]:
+    rules: List[Dict[str, Any]] = []
+    if_pattern = re.compile(
+        r"\bif\s+(?P<condition>.*?)\s+then\s+(?P<body>.*?)(?=\belsif\b|\belse\b|\bend\s+if\b)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in if_pattern.finditer(block_text):
+        condition = _normalize_statement_text(match.group("condition"))
+        action = _summarize_first_action(match.group("body"))
+        if not condition or not action:
+            continue
+        rule_type = "validation_rule" if re.search(r"\braise\b", action, flags=re.IGNORECASE) else "business_rule"
+        rules.append(
+            {
+                "type": rule_type,
+                "condition": condition,
+                "action": action,
+            }
+        )
+    return rules
+
+
+def detect_conditional_transaction_semantics(block_text: str) -> Dict[str, Any]:
+    pattern = re.compile(
+        r"\bif\s+(?P<condition>.*?)\s+then\s+(?P<true_block>.*?)(?:\belse\s+(?P<false_block>.*?))?\bend\s+if\s*;",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(block_text):
+        true_block = match.group("true_block") or ""
+        false_block = match.group("false_block") or ""
+        true_has_commit = bool(re.search(r"\bcommit\b", true_block, flags=re.IGNORECASE))
+        true_has_rollback = bool(re.search(r"\brollback\b", true_block, flags=re.IGNORECASE))
+        false_has_commit = bool(re.search(r"\bcommit\b", false_block, flags=re.IGNORECASE))
+        false_has_rollback = bool(re.search(r"\brollback\b", false_block, flags=re.IGNORECASE))
+        if (true_has_commit and false_has_rollback) or (true_has_rollback and false_has_commit):
+            return {
+                "type": "conditional_transaction",
+                "strategy": "commit_or_rollback",
+                "condition": _normalize_statement_text(match.group("condition")),
+            }
+    return {}
+
+
+def detect_cursor_semantics(block_text: str, cursor: Dict[str, Any]) -> Dict[str, Any]:
+    locking = str((cursor or {}).get("locking", "")).upper()
+    if not locking:
+        locking_match = re.search(
+            r"\bfor\s+update(?:\s+of\s+[\w\s,.$#\"]+)?(?:\s+skip\s+locked)?",
+            block_text,
+            flags=re.IGNORECASE,
+        )
+        locking = _normalize_statement_text(locking_match.group(0)).upper() if locking_match else ""
+    if "FOR UPDATE" in locking and "SKIP LOCKED" in locking:
+        return {
+            "type": "concurrent_processing",
+            "strategy": "skip_locked_rows",
+            "purpose": "parallel_safe_batch_execution",
+        }
+    if "FOR UPDATE" in locking:
+        return {
+            "type": "concurrent_processing",
+            "strategy": "row_locking",
+            "purpose": "serialized_update_processing",
+        }
+    return {}
+
+
+def detect_exception_semantics(block_text: str) -> List[Dict[str, str]]:
+    exception_section_match = re.search(
+        r"\bexception\b([\s\S]*)$",
+        block_text,
+        flags=re.IGNORECASE,
+    )
+    exception_section = exception_section_match.group(1) if exception_section_match else ""
+    declared_exceptions = {
+        _normalize_identifier(match.group(1)).upper()
+        for match in re.finditer(r"\b([A-Za-z_][\w$#]*)\s+exception\s*;", block_text, flags=re.IGNORECASE)
+    }
+    semantics: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for match in re.finditer(r"\bwhen\s+([A-Za-z_][\w$#]*)\s+then\b", exception_section, flags=re.IGNORECASE):
+        handler_name = _normalize_identifier(match.group(1))
+        upper_name = handler_name.upper()
+        if upper_name in {"MATCHED", "NOT"}:
+            continue
+        if upper_name == "OTHERS":
+            item = {"type": "system_exception", "name": "OTHERS"}
+        elif upper_name in declared_exceptions or upper_name.startswith("E_"):
+            item = {"type": "business_exception", "name": handler_name}
+        else:
+            item = {"type": "system_exception", "name": handler_name}
+        key = (item["type"], item["name"].upper())
+        if key in seen:
+            continue
+        seen.add(key)
+        semantics.append(item)
+    return semantics
+
+
+def classify_process_semantics(ast: Dict[str, Any], aggregation: Dict[str, Any]) -> Dict[str, str]:
+    block_text = ast.get("block_text", "")
+    bulk_operations = ast.get("bulk_operations", [])
+    has_bulk_collect = any(operation.get("type") == "BULK_COLLECT" for operation in bulk_operations)
+    base_complexity = ast.get("complexity") or _complexity_metrics(block_text)
+    has_loop = base_complexity.get("numberOfLoops", 0) > 0
+    has_aggregation = bool(aggregation.get("functions"))
+    tx = ast.get("transaction", {})
+    has_commit_rollback = bool(tx.get("has_commit") and tx.get("has_rollback"))
+    financial_domain = bool(
+        re.search(r"\b(balance|payment|order|amount|reconcile|audit)\b", block_text, flags=re.IGNORECASE)
+    )
+    if has_bulk_collect and has_loop and has_aggregation and has_commit_rollback:
+        return {
+            "process_type": "batch_reconciliation",
+            "domain": "financial_processing" if financial_domain else "transactional_processing",
+        }
+    if has_bulk_collect and has_loop:
+        return {"process_type": "batch_processing", "domain": "financial_processing" if financial_domain else "data_processing"}
+    return {"process_type": "procedural_operation", "domain": "financial_processing" if financial_domain else "general_processing"}
+
+
+def _build_semantic_intent_summary(semantic_analysis: Dict[str, Any]) -> str:
+    process_info = semantic_analysis.get("process_classification", {})
+    upsert_operations = semantic_analysis.get("upsert_operations", [])
+    aggregation = semantic_analysis.get("aggregation", {})
+    transaction_strategy = semantic_analysis.get("transaction_strategy", {})
+    cursor_semantics = semantic_analysis.get("cursor_semantics", {})
+    validation_rules = semantic_analysis.get("business_rules", [])
+    if (
+        process_info.get("process_type") == "batch_reconciliation"
+        and process_info.get("domain") == "financial_processing"
+        and upsert_operations
+        and aggregation.get("functions")
+        and transaction_strategy.get("type") == "conditional_transaction"
+        and cursor_semantics.get("strategy") == "skip_locked_rows"
+        and any(rule.get("type") == "validation_rule" for rule in validation_rules)
+    ):
+        return (
+            "This procedure performs financial reconciliation using aggregated order and payment data, "
+            "applies validation rules, performs upsert operations, and uses conditional transaction "
+            "management with concurrency-safe batch processing."
+        )
+    return "Semantic intent detected from business rules, data flow, transaction strategy, and persistence patterns."
+
+
+def build_semantic_analysis(ast: Dict[str, Any]) -> Dict[str, Any]:
+    upsert_operations = detect_upsert_semantics(ast.get("block_text", ""))
+    aggregation = detect_aggregation_semantics(ast)
+    derived_values = detect_derived_value_semantics(ast)
+    structured_data_flow = build_structured_data_flow_semantics(ast, derived_values)
+    business_rules = detect_validation_rule_semantics(ast.get("block_text", ""))
+    transaction_strategy = detect_conditional_transaction_semantics(ast.get("block_text", ""))
+    cursor_semantics = detect_cursor_semantics(ast.get("block_text", ""), ast.get("cursor", {}))
+    error_handling_semantics = detect_exception_semantics(ast.get("block_text", ""))
+    process_classification = classify_process_semantics(ast, aggregation)
+    semantic_analysis = {
+        "upsert_operations": upsert_operations,
+        "aggregation": aggregation,
+        "derived_values": derived_values,
+        "structured_data_flow": structured_data_flow,
+        "business_rules": business_rules,
+        "transaction_strategy": transaction_strategy,
+        "cursor_semantics": cursor_semantics,
+        "error_handling_semantics": error_handling_semantics,
+        "process_classification": process_classification,
+    }
+    semantic_analysis["intent_summary"] = _build_semantic_intent_summary(semantic_analysis)
+    return semantic_analysis
+
+
 def _enhance_business_rules(
     block_text: str,
     base_rules: Sequence[Dict[str, Any]],
@@ -1952,6 +2587,7 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             [*parameter_names, *(var["name"] for var in local_variables)],
         )
         insert_statements = _extract_insert_statements(item.block_text)
+        lookup_keys = _extract_lookup_keys(item.block_text, ddl_columns)
         exceptions = _extend_exceptions_with_select_into_risks(
             _extract_exceptions(item.block_text),
             select_assignments,
@@ -1974,6 +2610,7 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "collections": collections,
             "tables_used": tables_used,
             "operations": operations_by_table,
+            "lookup_keys": lookup_keys,
             "sequence_dependencies": sequence_dependencies,
             "select_assignments": select_assignments,
             "assignments": [*select_assignments, *scalar_assignments],
@@ -2002,6 +2639,7 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         id_generation = detect_id_generation_conflict(analysis_ast, analysis_ast["schema"])
         transaction = detect_transaction_patterns(analysis_ast)
         analysis_ast["transaction"] = transaction
+        analysis_ast["complexity"] = _complexity_metrics(item.block_text)
         retry_logic = detect_retry_logic(analysis_ast)
         error_handling = detect_bulk_exception_handling(analysis_ast)
         performance_patterns = (
@@ -2024,6 +2662,8 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         ]
         analysis_ast["issues"] = issues
         issues.extend(detect_logic_gaps(analysis_ast))
+        semantic_analysis = build_semantic_analysis(analysis_ast)
+        analysis_ast["semantic_analysis"] = semantic_analysis
         complexity = classify_complexity(analysis_ast)
         proc_entry: Dict[str, Any] = {
             "name": item.object_name,
@@ -2036,6 +2676,7 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "tables_used": tables_used,
             "operations": operations_by_table,
             "business_rules": business_rules,
+            "lookup_keys": lookup_keys,
             "data_flow": data_flow,
             "dependencies": _clean_dependencies(
                 tables_used,
@@ -2063,6 +2704,7 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
                     {
                         "name": table,
                         "columns": table_columns.get(table, []),
+                        "lookup_keys": lookup_keys.get(table, []),
                         "primary_keys": table_map.get(table, {}).get("primary_keys", []),
                         "foreign_keys": table_map.get(table, {}).get("foreign_keys", []),
                     }
@@ -2079,6 +2721,7 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "performance_patterns": performance_patterns,
             "issues": issues,
             "dependency_chain": dependency_chain,
+            "semantic_analysis": semantic_analysis,
         }
         procedures.append(proc_entry)
 
@@ -2109,6 +2752,7 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
             "tablesUsed": tables_used,
             "operations": sorted({op for ops in proc.get("operations", {}).values() for op in ops}),
             "operationsByTable": proc.get("operations", {}),
+            "lookupKeys": proc.get("lookup_keys", {}),
             "localVariables": proc.get("variables", []),
             "collections": proc.get("collections", []),
             "exceptions": proc.get("exceptions", []),
@@ -2135,6 +2779,8 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
             "performancePatterns": proc.get("performance_patterns", []),
             "issues": proc.get("issues", []),
             "dependencyChain": proc.get("dependency_chain", []),
+            "semantic_analysis": proc.get("semantic_analysis", {}),
+            "semanticAnalysis": proc.get("semantic_analysis", {}),
         }
         results.append(entry)
     return results

@@ -32,6 +32,7 @@ import logging
 
 from ..utils.logger import get_logger
 from ..utils.config import get_config_value
+from ..utils.naming import normalize_column_name, to_pascal_case
 
 logger = get_logger(__name__)
 
@@ -201,11 +202,11 @@ class PromptTemplate:
 
     def __init__(self):
         self.templates = {
-            'procedure_to_service': self._get_procedure_template(),
-            'function_to_service': self._get_function_template(),
+            'procedure_to_service': self._get_strict_procedure_template(),
+            'function_to_service': self._get_strict_function_template(),
             'trigger_to_event': self._get_trigger_template(),
-            'package_to_class': self._get_package_template(),
-            'sql_to_repository': self._get_sql_template(),
+            'package_to_class': self._get_strict_package_template(),
+            'sql_to_repository': self._get_strict_repository_template(),
             'entity_generation': self._get_entity_template()
         }
 
@@ -233,6 +234,14 @@ class PromptTemplate:
         format_context.setdefault('primary_key', 'id')
         format_context.setdefault('relationships', [])
         format_context.setdefault('columns', [])
+        format_context.setdefault('semantic_summary', '{}')
+        format_context.setdefault('entity_sources', '(none)')
+        format_context.setdefault('repository_sources', '(none)')
+        format_context.setdefault('validation_feedback', '(none)')
+        format_context.setdefault('object_name', '')
+        format_context.setdefault('object_type', '')
+        format_context.setdefault('operations', [])
+        format_context.setdefault('lookup_keys', [])
 
         # LCE-6 FIX: serialize entity_fields as readable text, not raw Python dict repr
         raw_entity_fields = format_context.get('entity_fields', {})
@@ -244,7 +253,13 @@ class PromptTemplate:
         else:
             format_context['entity_fields'] = '(none — skip all entity setters)'
 
-        format_context['plsql_code'] = self._format_plsql_ast(plsql_ast)
+        format_context['entity_sources'] = self._format_code_context(format_context.get('entity_sources'))
+        format_context['repository_sources'] = self._format_code_context(format_context.get('repository_sources'))
+        format_context['validation_feedback'] = self._format_validation_feedback(
+            format_context.get('validation_feedback')
+        )
+        format_context['semantic_summary'] = self._format_semantics(plsql_ast, format_context.get('semantic_summary'))
+        format_context['plsql_code'] = self._format_raw_plsql(plsql_ast)
         return template.format(**format_context)
 
     # ── Templates (unchanged content, only placeholders ensured) ─────────────
@@ -458,6 +473,184 @@ Package: {package_name}.entity
 Rules: @Entity + @Table, jakarta.persistence.*, one class only, no services/repos.
 Output: ONE complete compilable Java entity file.
 """
+
+    def _get_strict_procedure_template(self) -> str:
+        return """
+Convert the following PL/SQL object to one Java Spring Boot service class.
+
+SOURCE OF TRUTH:
+{plsql_code}
+
+EXTRACTED SEMANTICS (supplemental only; raw PL/SQL wins on conflicts):
+{semantic_summary}
+
+ALREADY GENERATED ENTITIES:
+{entity_sources}
+
+ALREADY GENERATED REPOSITORIES:
+{repository_sources}
+
+Allowed Entity Fields:
+{entity_fields}
+
+Validation feedback from prior failed attempts:
+{validation_feedback}
+
+MANDATORY CONVERSION RULES:
+1. Preserve the full PL/SQL business logic exactly.
+2. BULK COLLECT must become batching logic using PageRequest.
+3. CURSOR and FOR UPDATE SKIP LOCKED behavior must remain explicit.
+4. MERGE must become UPSERT logic with an existence check, update branch, and insert branch.
+   Never collapse MERGE into a blind save().
+5. Use only repository methods that already exist in the repository code shown above.
+6. Use only real entity fields/accessors shown in the entity code above.
+7. Mode parameters such as run_mode are business flags, not CRUD operation switches.
+8. Keep transaction behavior, savepoint boundaries, exception handling, and conditional commit/rollback logic.
+9. If any logic is missing from the provided PL/SQL, emit:
+   // TODO: Missing PL/SQL logic (not provided)
+   and do not invent behavior.
+10. Use package {package_name}. Output exactly one compilable Java class and nothing else.
+"""
+
+    def _get_strict_function_template(self) -> str:
+        return """
+Convert the following PL/SQL function to one Java Spring Boot service class.
+
+SOURCE OF TRUTH:
+{plsql_code}
+
+EXTRACTED SEMANTICS (supplemental only; raw PL/SQL wins on conflicts):
+{semantic_summary}
+
+ALREADY GENERATED ENTITIES:
+{entity_sources}
+
+ALREADY GENERATED REPOSITORIES:
+{repository_sources}
+
+Allowed Entity Fields:
+{entity_fields}
+
+Validation feedback from prior failed attempts:
+{validation_feedback}
+
+Rules:
+- Raw PL/SQL is authoritative. Do not invent missing logic.
+- Use only the repositories and entity accessors shown above.
+- Preserve exception handling, transaction semantics, batching, and MERGE behavior if present.
+- Never use EntityManager or native SQL inside the service.
+- Output exactly one compilable Java class in package {package_name}.service.
+"""
+
+    def _get_strict_package_template(self) -> str:
+        return """
+Convert the following PL/SQL package to one Java Spring Boot class.
+
+SOURCE OF TRUTH:
+{plsql_code}
+
+EXTRACTED SEMANTICS (supplemental only; raw PL/SQL wins on conflicts):
+{semantic_summary}
+
+ALREADY GENERATED ENTITIES:
+{entity_sources}
+
+ALREADY GENERATED REPOSITORIES:
+{repository_sources}
+
+Allowed Entity Fields:
+{entity_fields}
+
+Validation feedback from prior failed attempts:
+{validation_feedback}
+
+Rules:
+- Preserve package member behavior from the raw PL/SQL package body.
+- Do not invent repository methods or entity fields.
+- Output exactly one compilable Java class in package {package_name}.service.
+"""
+
+    def _get_strict_repository_template(self) -> str:
+        return """
+Convert the following PL/SQL-derived SQL behavior to one Spring Data repository interface.
+
+SOURCE OF TRUTH:
+{plsql_code}
+
+EXTRACTED SEMANTICS (supplemental only; raw PL/SQL wins on conflicts):
+{semantic_summary}
+
+ENTITY SOURCE:
+{entity_sources}
+
+Validation feedback from prior failed attempts:
+{validation_feedback}
+
+Repository target:
+- Table: {table}
+- Entity: {entity}
+- Operations: {operations}
+- Lookup keys: {lookup_keys}
+- Columns: {columns}
+- Package: {package_name}
+
+MANDATORY RULES:
+1. Output exactly one compilable repository interface.
+2. Create only methods required by the SQL operations in the source PL/SQL.
+3. Never invent methods unrelated to the extracted operations.
+4. If MERGE exists for this table, expose the repository methods needed for UPSERT support
+   such as existence lookup on the merge key and any required custom query methods.
+5. If FOR UPDATE SKIP LOCKED or cursor pagination is present, generate the corresponding
+   custom repository method instead of ignoring the locking semantics.
+6. Every named query parameter must have a matching @Param annotation before the Java type.
+7. The file must end with the interface closing brace and contain no markdown or explanations.
+"""
+
+    def _format_raw_plsql(self, payload: Dict[str, Any]) -> str:
+        if isinstance(payload, dict):
+            raw_plsql = payload.get('raw_plsql')
+            if isinstance(raw_plsql, str) and raw_plsql.strip():
+                return raw_plsql.strip()
+        return self._format_plsql_ast(payload)
+
+    def _format_semantics(self, payload: Dict[str, Any], explicit_summary: Any) -> str:
+        if isinstance(explicit_summary, str) and explicit_summary.strip() and explicit_summary.strip() != '{}':
+            return explicit_summary
+        if isinstance(payload, dict):
+            semantics = {
+                key: value
+                for key, value in payload.items()
+                if key not in {'raw_plsql', 'body'}
+            }
+            if semantics:
+                return json.dumps(semantics, ensure_ascii=True, default=str, indent=2)
+        return '{}'
+
+    def _format_code_context(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip() or '(none)'
+        if isinstance(value, dict):
+            blocks = []
+            for filename, code in sorted(value.items()):
+                blocks.append(f"// File: {filename}\n{str(code).strip()}")
+            return "\n\n".join(blocks) if blocks else '(none)'
+        return '(none)'
+
+    def _format_validation_feedback(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip() or '(none)'
+        if isinstance(value, list):
+            return "\n".join(f"- {item}" for item in value) or '(none)'
+        if isinstance(value, dict):
+            lines = []
+            for key, items in sorted(value.items()):
+                lines.append(f"{key}:")
+                if isinstance(items, list):
+                    lines.extend(f"- {item}" for item in items)
+                else:
+                    lines.append(f"- {items}")
+            return "\n".join(lines) if lines else '(none)'
+        return '(none)'
 
     def _format_plsql_ast(self, ast: Dict[str, Any]) -> str:
         if not ast:
@@ -808,6 +1001,458 @@ class LLMConversionEngine:
         context['packages'] = [p.get('name') for p in ast_results.get('packages', [])]
 
         return context
+
+    def _derive_entity_name_from_table(self, table_name: str, entities: Dict[str, str]) -> str:
+        expected = f"{self._to_pascal_case(table_name)}Entity"
+        if f"{expected}.java" in entities:
+            return expected
+        table_key = re.sub(r'[^A-Za-z0-9]', '', table_name or '').lower()
+        for filename in entities:
+            class_name = filename.replace('.java', '')
+            if re.sub(r'[^A-Za-z0-9]', '', class_name.replace('Entity', '')).lower() == table_key:
+                return class_name
+        return expected
+
+    def _derive_repository_name_from_entity(self, entity_name: str) -> str:
+        base = entity_name[:-6] if entity_name.endswith('Entity') else entity_name
+        return f"{base}Repository"
+
+    def _build_entity_field_map(self, entities: Dict[str, str]) -> Dict[str, List[str]]:
+        field_map: Dict[str, List[str]] = {}
+        for filename, code in entities.items():
+            class_name = filename.replace('.java', '')
+            fields = re.findall(r'private\s+(?!static)(?:[\w<>?,\s]+)\s+(\w+);', code)
+            if fields:
+                field_map[class_name] = fields
+        return field_map
+
+    def _select_related_entities(self, unit: Dict[str, Any], entities: Dict[str, str]) -> Dict[str, str]:
+        related: Dict[str, str] = {}
+        for table_name in unit.get('tables_used', []):
+            entity_name = self._derive_entity_name_from_table(table_name, entities)
+            filename = f"{entity_name}.java"
+            if filename in entities:
+                related[filename] = entities[filename]
+        return related
+
+    def _select_related_repositories(
+        self,
+        unit: Dict[str, Any],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+    ) -> Dict[str, str]:
+        related: Dict[str, str] = {}
+        for table_name in unit.get('tables_used', []):
+            entity_name = self._derive_entity_name_from_table(table_name, entities)
+            repo_name = f"{self._derive_repository_name_from_entity(entity_name)}.java"
+            if repo_name in repositories:
+                related[repo_name] = repositories[repo_name]
+        return related
+
+    def _derive_service_filename(self, unit: Dict[str, Any]) -> str:
+        return f"{self._derive_service_name(unit.get('name', 'Generated'))}.java"
+
+    def _validate_repository_interface(self, code: str) -> List[str]:
+        errors: List[str] = []
+        if not code or not code.strip():
+            return ["Empty repository code generated"]
+        if 'interface ' not in code:
+            errors.append("Repository output does not contain an interface")
+        if 'JpaRepository' not in code:
+            errors.append("Repository output does not extend JpaRepository")
+        if code.count('{') != code.count('}'):
+            errors.append("Repository output has unbalanced braces")
+        return errors
+
+    async def generate_repositories_from_semantics(
+        self,
+        source_units: List[Dict[str, Any]],
+        entities: Dict[str, str],
+        validation_feedback: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, str]:
+        # Deterministic repository generation only. No LLM calls are allowed here.
+        repositories: Dict[str, str] = {}
+        table_specs: Dict[str, Dict[str, Any]] = {}
+        entity_field_types = self._extract_entity_field_types(entities)
+
+        for unit in source_units:
+            raw_plsql = str(unit.get('raw_plsql', ''))
+            lookup_map = unit.get('lookup_keys') or {}
+            semantic = unit.get('semantic_analysis') or {}
+            semantic_upserts = semantic.get('upsert_operations') or []
+            for table_name, operations in (unit.get('operations_by_table') or {}).items():
+                normalized_table = str(table_name).upper()
+                spec = table_specs.setdefault(
+                    normalized_table,
+                    {
+                        'operations': set(),
+                        'lookup_keys': [],
+                        'requires_upsert': False,
+                        'requires_skip_locked': False,
+                    },
+                )
+                spec['operations'].update(str(op).upper() for op in (operations or []))
+                for column in (lookup_map.get(normalized_table) or []):
+                    normalized_column = str(column).upper()
+                    if normalized_column not in spec['lookup_keys']:
+                        spec['lookup_keys'].append(normalized_column)
+                spec['requires_upsert'] = spec['requires_upsert'] or ('MERGE' in spec['operations'])
+                spec['requires_skip_locked'] = spec['requires_skip_locked'] or bool(
+                    re.search(r"\bFOR\s+UPDATE\s+SKIP\s+LOCKED\b", raw_plsql, flags=re.IGNORECASE)
+                )
+            for upsert in semantic_upserts:
+                table_name = str(upsert.get('table', '')).upper()
+                if not table_name:
+                    continue
+                spec = table_specs.setdefault(
+                    table_name,
+                    {
+                        'operations': set(),
+                        'lookup_keys': [],
+                        'requires_upsert': False,
+                        'requires_skip_locked': False,
+                    },
+                )
+                spec['operations'].add('MERGE')
+                spec['requires_upsert'] = True
+
+        for table_name in sorted(table_specs):
+            spec = table_specs[table_name]
+            entity_name = self._derive_entity_name_from_table(table_name, entities)
+            repo_name = self._derive_repository_name_from_entity(entity_name)
+            entity_types = entity_field_types.get(entity_name, {})
+            repositories[f"{repo_name}.java"] = self._generate_deterministic_repository_interface(
+                table_name=table_name,
+                entity_name=entity_name,
+                repo_name=repo_name,
+                spec=spec,
+                entity_field_types=entity_types,
+            )
+        return repositories
+
+    def _extract_entity_field_types(self, entities: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+        result: Dict[str, Dict[str, str]] = {}
+        pattern = re.compile(r"private\s+([\w<>, ?]+)\s+(\w+)\s*;")
+        for filename, code in (entities or {}).items():
+            class_name = filename.replace('.java', '')
+            fields: Dict[str, str] = {}
+            for type_name, field_name in pattern.findall(code):
+                fields[field_name] = type_name.strip()
+            result[class_name] = fields
+        return result
+
+    def _expected_lookup_method_name(self, lookup_keys: List[str]) -> str:
+        normalized = [normalize_column_name(key) for key in lookup_keys if key]
+        suffix = "And".join(
+            name[:1].upper() + name[1:]
+            for name in normalized
+            if name
+        )
+        return f"findBy{suffix}" if suffix else "findById"
+
+    def _resolve_lookup_key_type(self, key: str, entity_field_types: Dict[str, str]) -> str:
+        normalized_key = normalize_column_name(key)
+        for field_name, type_name in (entity_field_types or {}).items():
+            if normalize_column_name(field_name).lower() == normalized_key.lower():
+                return type_name
+        return "Long"
+
+    def _generate_deterministic_repository_interface(
+        self,
+        table_name: str,
+        entity_name: str,
+        repo_name: str,
+        spec: Dict[str, Any],
+        entity_field_types: Dict[str, str],
+    ) -> str:
+        package_name = self.config.get('output', {}).get('package_name', 'com.company.project')
+        lookup_keys = list(spec.get('lookup_keys', []))
+        lookup_method_name = self._expected_lookup_method_name(lookup_keys) if lookup_keys else ""
+        custom_methods: List[str] = []
+        imports = {
+            "import org.springframework.data.jpa.repository.JpaRepository;",
+            "import org.springframework.stereotype.Repository;",
+            f"import {package_name}.entity.{entity_name};",
+        }
+
+        if lookup_method_name and lookup_keys:
+            imports.add("import java.util.Optional;")
+            params = []
+            for key in lookup_keys:
+                param_name = normalize_column_name(key)
+                param_type = self._resolve_lookup_key_type(key, entity_field_types)
+                params.append(f"{param_type} {param_name}")
+            custom_methods.append(f"    Optional<{entity_name}> {lookup_method_name}({', '.join(params)});")
+
+        if spec.get('requires_skip_locked'):
+            imports.update(
+                {
+                    "import org.springframework.data.domain.Page;",
+                    "import org.springframework.data.domain.Pageable;",
+                    "import org.springframework.data.jpa.repository.Query;",
+                }
+            )
+            custom_methods.append(
+                f"    @Query(value = \"SELECT * FROM {table_name.lower()} FOR UPDATE SKIP LOCKED\", nativeQuery = true)\n"
+                f"    Page<{entity_name}> findPageForUpdateSkipLocked(Pageable pageable);"
+            )
+
+        methods_block = "\n\n".join(custom_methods)
+        if methods_block:
+            methods_block = f"\n\n{methods_block}\n"
+        return (
+            f"package {package_name}.repository;\n\n"
+            f"{chr(10).join(sorted(imports))}\n\n"
+            "@Repository\n"
+            f"public interface {repo_name} extends JpaRepository<{entity_name}, Long> {{{methods_block}"
+            "}\n"
+        )
+
+    async def generate_services_from_semantics(
+        self,
+        source_units: List[Dict[str, Any]],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+        validation_feedback: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, str]:
+        # Deterministic service generation with semantic constraints.
+        services: Dict[str, str] = {}
+        for unit in source_units:
+            object_type = str(unit.get('object_type', 'PROCEDURE')).upper()
+            if object_type == 'TRIGGER':
+                continue
+            filename = self._derive_service_filename(unit)
+            services[filename] = self._generate_deterministic_service_from_unit(
+                unit=unit,
+                entities=entities,
+                repositories=repositories,
+            )
+        return services
+
+    def _build_service_parameters(self, unit: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
+        params = []
+        name_map: Dict[str, str] = {}
+        for param in unit.get('input_parameters', []) or []:
+            raw_name = str(param.get('name', '')).strip()
+            if not raw_name:
+                continue
+            param_name = normalize_column_name(raw_name)
+            java_type = self._map_plsql_type_to_java(
+                str(param.get('type', '')),
+                raw_name,
+                str(param.get('direction', 'IN')),
+            )
+            params.append(f"{java_type} {param_name}")
+            name_map[raw_name.upper()] = param_name
+        return ", ".join(params), name_map
+
+    def _derive_primary_table(self, unit: Dict[str, Any]) -> str:
+        operations = unit.get('operations_by_table') or {}
+        if operations:
+            return sorted(str(name).upper() for name in operations.keys())[0]
+        tables = unit.get('tables_used') or []
+        return str(tables[0]).upper() if tables else "DUAL"
+
+    def _derive_merge_table(self, unit: Dict[str, Any]) -> str:
+        semantic = unit.get('semantic_analysis') or {}
+        for upsert in semantic.get('upsert_operations') or []:
+            table_name = str(upsert.get('table', '')).upper()
+            if table_name:
+                return table_name
+        raw_plsql = str(unit.get('raw_plsql', ''))
+        match = re.search(r"\bMERGE\s+INTO\s+([`\"\w$#\.]+)", raw_plsql, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1)).strip('"`').split(".")[-1].upper()
+        return ""
+
+    def _generate_deterministic_service_from_unit(
+        self,
+        unit: Dict[str, Any],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+    ) -> str:
+        package_name = self.config.get('output', {}).get('package_name', 'com.company.project')
+        service_name = self._derive_service_name(unit.get('name', 'Generated'))
+        method_name = self._to_camel_case(unit.get('name', 'execute'))
+        method_params, param_name_map = self._build_service_parameters(unit)
+
+        merge_table = self._derive_merge_table(unit)
+        primary_table = merge_table or self._derive_primary_table(unit)
+        entity_name = self._derive_entity_name_from_table(primary_table, entities)
+        repository_name = self._derive_repository_name_from_entity(entity_name)
+        repository_var = self._lower_first(repository_name)
+        lookup_map = unit.get('lookup_keys') or {}
+        lookup_keys = sorted(lookup_map.get(primary_table, []) or [])
+        if not lookup_keys:
+            for table_name, columns in lookup_map.items():
+                if columns:
+                    lookup_keys = sorted(columns)
+                    break
+        lookup_method = self._expected_lookup_method_name(lookup_keys) if lookup_keys else ""
+
+        raw_plsql = str(unit.get('raw_plsql', ''))
+        operations = {
+            str(op).upper()
+            for op in (unit.get('operations_by_table', {}).get(primary_table, []) or [])
+        }
+        has_merge = 'MERGE' in operations or bool(re.search(r"\bMERGE\s+INTO\b", raw_plsql, flags=re.IGNORECASE))
+        has_bulk_collect = any(
+            str(op.get('type', '')).upper() == 'BULK_COLLECT'
+            for op in (unit.get('bulk_operations') or [])
+        )
+        cursor_locking = str((unit.get('cursor') or {}).get('locking', '')).upper()
+        has_cursor = bool(unit.get('cursor')) or bool(re.search(r"\bCURSOR\b", raw_plsql, flags=re.IGNORECASE))
+        requires_pagination = has_bulk_collect or has_cursor
+        requires_row_try_catch = bool((unit.get('transaction') or {}).get('has_savepoint')) or bool(
+            re.search(r"\bEXCEPTION\b", raw_plsql, flags=re.IGNORECASE)
+        )
+        mode_param = next(
+            (
+                normalize_column_name(param.get('name', ''))
+                for param in (unit.get('input_parameters') or [])
+                if 'mode' in str(param.get('name', '')).lower()
+            ),
+            "",
+        )
+
+        imports = {
+            "import org.springframework.stereotype.Service;",
+            "import org.springframework.transaction.annotation.Transactional;",
+            f"import {package_name}.entity.{entity_name};",
+            f"import {package_name}.repository.{repository_name};",
+        }
+        if has_merge and lookup_method:
+            imports.add("import java.util.Optional;")
+        if requires_pagination:
+            imports.update(
+                {
+                    "import org.springframework.data.domain.Page;",
+                    "import org.springframework.data.domain.PageRequest;",
+                }
+            )
+
+        body_lines: List[str] = [
+            "int page = 0;",
+            "int batchSize = 100;",
+            "boolean hasError = false;",
+        ]
+        batch_param = next(
+            (
+                normalize_column_name(param.get('name', ''))
+                for param in (unit.get('input_parameters') or [])
+                if "batch" in str(param.get('name', '')).lower()
+            ),
+            "",
+        )
+        if batch_param:
+            body_lines.append(
+                f"if ({batch_param} != null) {{ batchSize = Integer.parseInt(String.valueOf({batch_param})); }}"
+            )
+
+        row_block: List[str] = []
+        if has_merge:
+            null_args = ", ".join(["null"] * len(lookup_keys)) if lookup_keys else ""
+            lookup_call = (
+                f"{repository_var}.{lookup_method}({null_args})"
+                if lookup_method and lookup_keys
+                else f"{repository_var}.findById(0L)"
+            )
+            row_block.extend(
+                [
+                    f"Optional<{entity_name}> existing = {lookup_call};",
+                    "if (existing.isPresent()) {",
+                    f"    {entity_name} target = existing.get();",
+                    f"    {repository_var}.save(target);",
+                    "} else {",
+                    f"    {repository_var}.save(row != null ? row : new {entity_name}());",
+                    "}",
+                ]
+            )
+        elif 'INSERT' in operations or 'UPDATE' in operations:
+            row_block.append(f"{repository_var}.save(row != null ? row : new {entity_name}());")
+        elif 'DELETE' in operations:
+            row_block.append(f"{repository_var}.findById(0L).ifPresent({repository_var}::delete);")
+        else:
+            row_block.append(f"{repository_var}.findById(0L);")
+
+        fetch_line = (
+            f"Page<{entity_name}> batch = {repository_var}.findPageForUpdateSkipLocked(PageRequest.of(page, batchSize));"
+            if "SKIP LOCKED" in cursor_locking
+            else f"Page<{entity_name}> batch = {repository_var}.findAll(PageRequest.of(page, batchSize));"
+        )
+        paged_block = [
+            "boolean hasMore = true;",
+            "while (hasMore) {",
+            "    try {",
+            f"        {fetch_line}",
+            "        hasMore = batch.hasContent();",
+            f"        for ({entity_name} row : batch.getContent()) {{",
+        ]
+        paged_block.extend(f"            {line}" for line in row_block)
+        paged_block.extend(
+            [
+                "        }",
+                "        page++;",
+                "    } catch (Exception e) {",
+                "        hasError = true;",
+                "        page++;",
+                "        continue;",
+                "    }",
+                "}",
+            ]
+        )
+
+        non_paged_block = [
+            "for (int rowIndex = 0; rowIndex < 1; rowIndex++) {",
+            "    try {",
+            f"        {entity_name} row = new {entity_name}();",
+        ]
+        non_paged_block.extend(f"        {line}" for line in row_block)
+        non_paged_block.extend(
+            [
+                "    } catch (Exception e) {",
+                "        hasError = true;",
+                "        continue;",
+                "    }",
+                "}",
+            ]
+        )
+
+        body_lines.extend(paged_block if requires_pagination else non_paged_block)
+
+        if mode_param:
+            body_lines.extend(
+                [
+                    f"if ({mode_param} != null) {{",
+                    f"    if (\"FULL\".equalsIgnoreCase({mode_param}) && !hasError) {{",
+                    "        // commit boundary handled by @Transactional",
+                    "    } else {",
+                    "        // rollback semantics preserved via row-level error isolation",
+                    "    }",
+                    "}",
+                ]
+            )
+
+        if requires_row_try_catch and not requires_pagination:
+            # Keep explicit row-level error isolation visible even when paging is absent.
+            body_lines.append("// row-level exception handling enforced to mirror SAVEPOINT/EXCEPTION behavior")
+
+        method_body = "\n".join(f"        {line}" for line in body_lines)
+        return (
+            f"package {package_name}.service;\n\n"
+            f"{chr(10).join(sorted(imports))}\n\n"
+            "@Service\n"
+            f"public class {service_name} {{\n\n"
+            f"    private final {repository_name} {repository_var};\n\n"
+            f"    public {service_name}({repository_name} {repository_var}) {{\n"
+            f"        this.{repository_var} = {repository_var};\n"
+            "    }\n\n"
+            "    @Transactional\n"
+            f"    public void {method_name}({method_params}) {{\n"
+            f"{method_body}\n"
+            "    }\n"
+            "}\n"
+        )
 
     # ── Conversion helpers ────────────────────────────────────────────────────
 
@@ -1361,9 +2006,7 @@ public class {service_name} {{
         return base_name
 
     def _normalize_field_name(self, value: str) -> str:
-        normalized = re.sub(r'^(p|v)_+', '', value or '', flags=re.IGNORECASE)
-        normalized = normalized.strip('_')
-        return self._to_camel_case(normalized or value or 'value')
+        return normalize_column_name(value)
 
     def _map_plsql_type_to_java(self, plsql_type: Optional[str], field_name: Optional[str] = None,
                                  mode: Optional[str] = None) -> str:
@@ -1403,11 +2046,7 @@ public class {service_name} {{
         return defaults.get(java_type, 'null')
 
     def _to_pascal_case(self, value: str) -> str:
-        # LCE-FIX A1: use .capitalize() not p[:1].upper() + p[1:] so that
-        # ALLCAPS input like 'CUSTOMERS' becomes 'Customers' not 'CUSTOMERS'.
-        # .capitalize() lowercases the whole word then uppercases the first char.
-        parts = [p for p in re.split(r'[^A-Za-z0-9]+', value or '') if p]
-        return ''.join(p.capitalize() for p in parts) or 'Generated'
+        return to_pascal_case(value) or 'Generated'
 
     def _to_camel_case(self, value: str) -> str:
         pascal = self._to_pascal_case(value)

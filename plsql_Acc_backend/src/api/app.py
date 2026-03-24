@@ -804,6 +804,8 @@ class JobManager:
         config_overrides: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Execute the modernization pipeline for a job."""
+        from src.utils.logger import ResilientStreamHandler, safe_close_handlers
+        
         job = self.get_job(job_id)
         output_dir = self.get_output_dir(job_id)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -812,7 +814,7 @@ class JobManager:
         log_path = job_dir / "job.log"
         log_file = log_path.open("a", encoding="utf-8")
         root_logger = logging.getLogger()
-        log_handler = logging.StreamHandler(log_file)
+        log_handler = ResilientStreamHandler(log_file)
         log_handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
@@ -839,9 +841,26 @@ class JobManager:
             job.completed_at = _utc_now()
 
         finally:
-            root_logger.removeHandler(log_handler)
-            log_handler.close()
-            log_file.close()
+            try:
+                # Flush and close handlers safely
+                log_handler.flush()
+            except Exception:
+                pass
+            
+            try:
+                root_logger.removeHandler(log_handler)
+            except Exception:
+                pass
+            
+            try:
+                log_handler.close()
+            except Exception:
+                pass
+            
+            try:
+                log_file.close()
+            except Exception:
+                pass
 
     def start_job(self, job: JobRecord, source_path: str) -> None:
         """Start a job in the current event loop."""
