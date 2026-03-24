@@ -123,12 +123,13 @@ class SemanticValidator:
         contracts: Dict[str, Dict[str, Any]] = {}
         for filename, code in repositories.items():
             interface_name = filename.replace(".java", "")
+            method_pattern = re.compile(
+                r"^\s*(?:public\s+)?(?:default\s+)?[\w<>\[\], ?.]+\s+([A-Za-z_]\w*)\s*\([^;{]*\)\s*;",
+                flags=re.MULTILINE,
+            )
             custom_methods = set(
                 match.group(1)
-                for match in re.finditer(
-                    r"(?:public\s+)?(?:default\s+)?[\w<>\[\], ?@\"]+\s+(\w+)\s*\([^;{]*\)\s*;",
-                    code,
-                )
+                for match in method_pattern.finditer(code)
             )
             contracts[interface_name] = {
                 "methods": custom_methods | STANDARD_REPOSITORY_METHODS,
@@ -170,6 +171,26 @@ class SemanticValidator:
                         file_name=filename,
                     )
                 )
+            if "Page<" in code and "import org.springframework.data.domain.Page;" not in code:
+                issues.append(
+                    SemanticIssue(
+                        component="repository",
+                        object_name=interface_name,
+                        code="missing_page_import",
+                        message=f"{interface_name} uses Page without importing it",
+                        file_name=filename,
+                    )
+                )
+            if "Pageable" in code and "import org.springframework.data.domain.Pageable;" not in code:
+                issues.append(
+                    SemanticIssue(
+                        component="repository",
+                        object_name=interface_name,
+                        code="missing_pageable_import",
+                        message=f"{interface_name} uses Pageable without importing it",
+                        file_name=filename,
+                    )
+                )
         return issues
 
     def _validate_service_files(self, services: Dict[str, str]) -> List[SemanticIssue]:
@@ -206,6 +227,26 @@ class SemanticValidator:
                         file_name=filename,
                     )
                 )
+            if "Page<" in code and "import org.springframework.data.domain.Page;" not in code:
+                issues.append(
+                    SemanticIssue(
+                        component="service",
+                        object_name=class_name,
+                        code="missing_page_import",
+                        message=f"{class_name} uses Page without importing it",
+                        file_name=filename,
+                    )
+                )
+            if "Pageable" in code and "import org.springframework.data.domain.Pageable;" not in code:
+                issues.append(
+                    SemanticIssue(
+                        component="service",
+                        object_name=class_name,
+                        code="missing_pageable_import",
+                        message=f"{class_name} uses Pageable without importing it",
+                        file_name=filename,
+                    )
+                )
             if "BigDecimal" in code and "import java.math.BigDecimal;" not in code:
                 issues.append(
                     SemanticIssue(
@@ -213,6 +254,16 @@ class SemanticValidator:
                         object_name=class_name,
                         code="missing_bigdecimal_import",
                         message=f"{class_name} uses BigDecimal without importing it",
+                        file_name=filename,
+                    )
+                )
+            if "LocalDateTime" in code and "import java.time.LocalDateTime;" not in code:
+                issues.append(
+                    SemanticIssue(
+                        component="service",
+                        object_name=class_name,
+                        code="missing_localdatetime_import",
+                        message=f"{class_name} uses LocalDateTime without importing it",
                         file_name=filename,
                     )
                 )
@@ -304,7 +355,6 @@ class SemanticValidator:
         repositories: Dict[str, str],
     ) -> List[SemanticIssue]:
         issues: List[SemanticIssue] = []
-        repository_blob = "\n".join(repositories.values())
         for unit in source_units:
             service_filename = self._derive_service_filename(unit)
             service_code = services.get(service_filename, "")
@@ -313,6 +363,94 @@ class SemanticValidator:
             object_name = unit.get("name", "")
             raw_plsql = unit.get("raw_plsql", "")
             has_exception_block = bool(re.search(r"\bexception\b", raw_plsql, flags=re.IGNORECASE))
+            semantic = unit.get("semantic_analysis") or {}
+            driving_table = str(unit.get("driving_table", "")).upper()
+            target_tables = {str(table).upper() for table in (unit.get("target_tables") or []) if table}
+            for ref in semantic.get("aggregation", {}).get("columns", []) or []:
+                parts = str(ref).split(".", 1)
+                if len(parts) == 2 and parts[0].strip():
+                    target_tables.add(parts[0].strip().upper())
+            if driving_table:
+                target_tables.add(driving_table)
+
+            for table_name in sorted(target_tables):
+                repository_name = self._derive_repository_name_from_table(table_name)
+                repository_filename = f"{repository_name}.java"
+                if repository_filename not in repositories:
+                    continue
+                if repository_name not in service_code:
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="missing_repository_injection",
+                            message=f"{service_filename} is missing repository injection for {repository_name}",
+                            file_name=service_filename,
+                        )
+                    )
+
+            aggregation_tables = {
+                str(ref).split(".", 1)[0].strip().upper()
+                for ref in (semantic.get("aggregation", {}).get("columns", []) or [])
+                if "." in str(ref)
+            }
+            for table_name in sorted(aggregation_tables):
+                repository_name = self._derive_repository_name_from_table(table_name)
+                repository_filename = f"{repository_name}.java"
+                repository_code = repositories.get(repository_filename, "")
+                if not repository_code:
+                    continue
+                repository_var = self._lower_first(repository_name)
+                if "sumBy" not in repository_code:
+                    issues.append(
+                        SemanticIssue(
+                            component="repository",
+                            object_name=object_name,
+                            code="missing_aggregation_repository_method",
+                            message=f"{repository_filename} must expose SUM aggregation methods (sumBy...)",
+                            file_name=repository_filename,
+                        )
+                    )
+                if not re.search(rf"\b{re.escape(repository_var)}\.sumBy\w*\s*\(", service_code):
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="aggregation_not_preserved",
+                            message=f"{service_filename} must use repository sumBy... methods for table {table_name}",
+                            file_name=service_filename,
+                        )
+                    )
+                if re.search(rf"\b{re.escape(repository_var)}\.findBy\w+\s*\(", service_code):
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="aggregation_entity_fetch_misuse",
+                            message=f"{service_filename} should not use findBy... for aggregation table {table_name}",
+                            file_name=service_filename,
+                        )
+                    )
+
+            if driving_table and (
+                bool(unit.get("cursor"))
+                or any(str(op.get("type", "")).upper() == "BULK_COLLECT" for op in (unit.get("bulk_operations") or []))
+            ):
+                driving_repo_name = self._derive_repository_name_from_table(driving_table)
+                driving_repo_var = self._lower_first(driving_repo_name)
+                if not re.search(
+                    rf"\b{re.escape(driving_repo_var)}\.(findPageForUpdateSkipLocked\w*|findAll)\s*\(",
+                    service_code,
+                ):
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="wrong_driving_table_used",
+                            message=f"{service_filename} does not page over driving table {driving_table}",
+                            file_name=service_filename,
+                        )
+                    )
 
             if re.search(r"\bmerge\s+into\b", raw_plsql, flags=re.IGNORECASE):
                 has_find_by = bool(re.search(r"\.findBy\w+\s*\(", service_code))
@@ -371,7 +509,7 @@ class SemanticValidator:
                 uses_stream_or_paging = (
                     "PageRequest" in service_code
                     or bool(re.search(r"\bStream<", service_code))
-                    or bool(re.search(r"\.findPageForUpdateSkipLocked\s*\(", service_code))
+                    or bool(re.search(r"\.findPageForUpdateSkipLocked\w*\s*\(", service_code))
                 )
                 if not uses_stream_or_paging:
                     issues.append(
@@ -393,18 +531,32 @@ class SemanticValidator:
                             file_name=service_filename,
                         )
                     )
-            if "SKIP LOCKED" in locking and "SKIP LOCKED" not in repository_blob.upper():
-                issues.append(
-                    SemanticIssue(
-                        component="repository",
-                        object_name=object_name,
-                        code="skip_locked_not_preserved",
-                        message=f"{object_name} requires SKIP LOCKED support but no generated repository query preserves it",
+            if "SKIP LOCKED" in locking:
+                expected_table = driving_table or str(next(iter((unit.get("operations_by_table") or {}).keys()), "")).upper()
+                expected_repo = self._derive_repository_name_from_table(expected_table) if expected_table else ""
+                repo_code = repositories.get(f"{expected_repo}.java", "") if expected_repo else ""
+                if "findPageForUpdateSkipLocked" not in repo_code:
+                    issues.append(
+                        SemanticIssue(
+                            component="repository",
+                            object_name=object_name,
+                            code="skip_locked_not_preserved",
+                            message=f"{object_name} requires SKIP LOCKED on driving table {expected_table}",
+                            file_name=f"{expected_repo}.java" if expected_repo else None,
+                        )
                     )
-                )
 
             transaction = unit.get("transaction", {}) or {}
-            if transaction.get("has_savepoint") and "@Transactional" not in service_code:
+            has_transaction_boundary = (
+                "@Transactional" in service_code
+                or "TransactionTemplate" in service_code
+                or "setRollbackOnly" in service_code
+                or (
+                    "commit boundary handled per batch" in service_code
+                    and "rollback boundary handled per batch" in service_code
+                )
+            )
+            if transaction.get("has_savepoint") and not has_transaction_boundary:
                 issues.append(
                     SemanticIssue(
                         component="service",
@@ -462,6 +614,15 @@ class SemanticValidator:
         for unit in source_units:
             object_name = unit.get("name", "")
             lookup_map = unit.get("lookup_keys") or {}
+            skip_locked_tables = {
+                str(table).upper()
+                for table in (unit.get("skip_locked_tables") or [])
+                if table
+            }
+            driving_table = str(unit.get("driving_table", "")).upper()
+            if not skip_locked_tables and re.search(r"\bSKIP\s+LOCKED\b", str(unit.get("raw_plsql", "")), flags=re.IGNORECASE):
+                if driving_table:
+                    skip_locked_tables.add(driving_table)
             for table_name, lookup_keys in lookup_map.items():
                 if not lookup_keys:
                     continue
@@ -490,7 +651,7 @@ class SemanticValidator:
                             file_name=f"{repository_name}.java",
                         )
                     )
-                if re.search(r"\bSKIP\s+LOCKED\b", str(unit.get("raw_plsql", "")), flags=re.IGNORECASE):
+                if str(table_name).upper() in skip_locked_tables:
                     if "findPageForUpdateSkipLocked" not in repository_code:
                         issues.append(
                             SemanticIssue(
@@ -588,6 +749,11 @@ class SemanticValidator:
 
     def _to_camel_case(self, value: str) -> str:
         return normalize_column_name(value)
+
+    def _lower_first(self, value: str) -> str:
+        if not value:
+            return value
+        return value[:1].lower() + value[1:]
 
     def _derive_service_filename(self, unit: Dict[str, Any]) -> str:
         words = [token.capitalize() for token in re.split(r"[^A-Za-z0-9]+", unit.get("name", "")) if token]

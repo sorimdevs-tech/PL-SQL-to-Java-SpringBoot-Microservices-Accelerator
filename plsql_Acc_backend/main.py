@@ -12,6 +12,7 @@ import asyncio
 import json
 import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -364,9 +365,52 @@ class PLSQLModernizationPipeline:
                 merged_schema["sequence_mapping"].append(mapping)
 
         merged_schema["tables"] = sorted(table_index.values(), key=lambda item: item.get("name", ""))
+        sequence_map: Dict[str, str] = {}
+        for mapping in merged_schema.get("sequence_mapping", []):
+            sequence_name = str(mapping.get("sequence_name", "")).upper()
+            mapped_table = str(mapping.get("mapped_table", "")).upper()
+            if sequence_name and mapped_table and mapped_table not in sequence_map:
+                sequence_map[mapped_table] = sequence_name
+
+        known_tables = {
+            str(table.get("name", "")).upper()
+            for table in merged_schema.get("tables", [])
+            if table.get("name")
+        }
+        target_tables = {
+            str(table_name).upper()
+            for unit in units
+            for table_name in (unit.get("target_tables") or [])
+            if table_name
+        }
+        mapped_sequences = set(sequence_map.values())
+        for sequence in merged_schema.get("sequences", []):
+            sequence_name = str(sequence.get("name", "")).upper()
+            if not sequence_name or sequence_name in mapped_sequences:
+                continue
+            base = re.sub(r"_SEQ$", "", sequence_name, flags=re.IGNORECASE)
+            if not base:
+                continue
+            candidates = [
+                table_name
+                for table_name in known_tables
+                if table_name == base
+                or table_name.endswith(f"_{base}")
+                or base in table_name
+            ]
+            if len(candidates) > 1:
+                preferred = [table for table in candidates if table in target_tables]
+                if len(preferred) == 1:
+                    candidates = preferred
+            if len(candidates) == 1:
+                table_name = candidates[0]
+                if table_name not in sequence_map:
+                    sequence_map[table_name] = sequence_name
+
         return {
             "source_units": units,
             "schema": merged_schema,
+            "sequences": sequence_map,
         }
 
     def build_dependency_summary(self, semantic_model: Dict[str, Any]) -> Dict[str, Any]:
@@ -546,6 +590,7 @@ class PLSQLModernizationPipeline:
             java_code,
             ddl_columns,
             fk_map,
+            sequence_map=(semantic_model or {}).get("sequences", {}),
             write_files=False,
         )
     
@@ -700,19 +745,30 @@ class PLSQLModernizationPipeline:
                 'error_files': [],
             }
 
-        process = await asyncio.create_subprocess_exec(
-            *command,
+        pre_stdout = ""
+        pre_stderr = ""
+        if command[0] == "./gradlew":
+            chmod_result = subprocess.run(
+                ["chmod", "+x", "gradlew"],
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+            )
+            pre_stdout = chmod_result.stdout or ""
+            pre_stderr = chmod_result.stderr or ""
+
+        result = subprocess.run(
+            command,
             cwd=str(project_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            capture_output=True,
+            text=True,
         )
-        stdout_bytes, stderr_bytes = await process.communicate()
-        stdout = stdout_bytes.decode('utf-8', errors='replace')
-        stderr = stderr_bytes.decode('utf-8', errors='replace')
+        stdout = f"{pre_stdout}{result.stdout or ''}"
+        stderr = f"{pre_stderr}{result.stderr or ''}"
         combined_output = (stdout + "\n" + stderr).strip()
         return {
-            'success': process.returncode == 0,
-            'returncode': process.returncode,
+            'success': result.returncode == 0,
+            'returncode': result.returncode,
             'command': " ".join(command),
             'stdout': stdout,
             'stderr': stderr,
@@ -721,17 +777,20 @@ class PLSQLModernizationPipeline:
         }
 
     def _resolve_build_command(self, project_root: Path) -> List[str]:
+        gradlew_unix = project_root / 'gradlew'
         gradlew = project_root / 'gradlew.bat'
         gradle = project_root / 'build.gradle'
         mvnw = project_root / 'mvnw.cmd'
         pom = project_root / 'pom.xml'
 
+        if gradlew_unix.exists():
+            return ['./gradlew', 'compileJava']
         if gradlew.exists():
-            return [str(gradlew), 'build', '-x', 'test']
+            return [str(gradlew), 'compileJava']
         if gradle.exists():
             gradle_cmd = shutil.which('gradle')
             if gradle_cmd:
-                return [gradle_cmd, 'build', '-x', 'test']
+                return [gradle_cmd, 'compileJava']
         if mvnw.exists():
             return [str(mvnw), '-DskipTests', 'compile']
         if pom.exists():

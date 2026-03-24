@@ -467,6 +467,7 @@ class SpringBootGenerator:
         self._entity_name_index: Dict[str, str] = {}
         self._ddl_columns: Dict[str, List[Dict[str, str]]] = {}   # SBG-20: table -> columns
         self._fk_map: Dict[str, List[Dict[str, str]]] = {}        # SBG-20: table -> FK list
+        self._sequence_map: Dict[str, str] = {}                   # table -> sequence name
 
         self.base_path = self.target_directory / 'src' / 'main' / 'java'
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -2059,34 +2060,24 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
             return "BigDecimal"
         return "String"
 
-    def _generate_entity_from_ddl(self, entity_name: str, table_name: str, columns: List[Dict[str, str]], fk_list: Optional[List[Dict[str, str]]] = None) -> str:
-        """
-        SBG-20 FIX (Issue 6): accepts fk_list (list of dicts with keys
-        'column', 'ref_table', 'ref_column') and emits @ManyToOne + @JoinColumn
-        for every FK column instead of a plain Long field.
-        """
+    def _generate_entity_from_ddl(
+        self,
+        entity_name: str,
+        table_name: str,
+        columns: List[Dict[str, str]],
+        fk_list: Optional[List[Dict[str, str]]] = None,
+        sequence_name: str = "",
+    ) -> str:
         import_lines = ['import jakarta.persistence.*;']
         field_lines = []
         accessor_lines = []
         fk_list = fk_list or []
-
-        # Build a quick lookup: fk_column_name (upper) -> ref_table_name
-        fk_lookup: Dict[str, str] = {
-            fk['column'].upper(): fk['ref_table']
-            for fk in fk_list
-            if 'column' in fk and 'ref_table' in fk
-        }
 
         id_column = None
         for col in columns:
             if col["name"].upper() == "ID":
                 id_column = col["name"]
                 break
-        if not id_column:
-            for col in columns:
-                if col["name"].upper().endswith("_ID") and col["name"].upper() not in fk_lookup:
-                    id_column = col["name"]
-                    break
         if not id_column:
             for col in columns:
                 if col["name"].upper().endswith("_ID"):
@@ -2103,61 +2094,25 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
             if java_type == "LocalDate":
                 import_lines.append("import java.time.LocalDate;")
             if java_type == "LocalTime":
-                import_lines.append("import java.time.LocalTime;")  
+                import_lines.append("import java.time.LocalTime;")
             if java_type == "BigDecimal":
                 import_lines.append("import java.math.BigDecimal;")
 
             field_name = self._to_lower_camel_case(col_name)
             annotations = []
-
-            # ── PK column ───────────────────────────────────────────────────
             if col_name == id_column.upper():
                 annotations.append("@Id")
                 if self._is_numeric_type(col.get("type", "")):
-                    seq_name = f"{table_name.lower()}_seq"
+                    seq_name = sequence_name or f"{table_name.lower()}_seq"
                     annotations.append(
                         f'@SequenceGenerator(name = "seq_{field_name}", sequenceName = "{seq_name}", allocationSize = 1)'
                     )
                     annotations.append(
                         f'@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "seq_{field_name}")'
                     )
-                annotations.append(f'@Column(name = "{col_name}")')
-                field_lines.append("\n".join(f"    {a}" for a in annotations))
-                field_lines.append(f"    private {java_type} {field_name};\n")
-
-            # ── FK column → @ManyToOne / @JoinColumn ────────────────────────
-            elif col_name in fk_lookup:
-                ref_table = fk_lookup[col_name]
-                ref_entity = f"{self._to_camel_case(ref_table.lower())}Entity"
-                ref_entity = self._normalize_entity_name(ref_entity)
-                # SBG-21 FIX: use lower_first() not _to_lower_camel_case() here.
-                # _to_lower_camel_case() calls _to_camel_case() which lowercases
-                # every character except the first of each underscore-split word,
-                # so 'CustomersEntity' (no underscores) becomes 'customersentity'.
-                # lower_first() preserves the interior PascalCase: 'customersEntity'.
-                ref_field = self._lower_first(ref_entity)
-                annotations.append("@ManyToOne(fetch = FetchType.LAZY)")
-                annotations.append(f'@JoinColumn(name = "{col_name}")')
-                field_lines.append("\n".join(f"    {a}" for a in annotations))
-                field_lines.append(f"    private {ref_entity} {ref_field};\n")
-                # Getter/setter use the entity type, not Long
-                accessor_lines.append(
-                    f"""    public {ref_entity} get{self._capitalize_first(ref_field)}() {{
-        return {ref_field};
-    }}
-
-    public void set{self._capitalize_first(ref_field)}({ref_entity} {ref_field}) {{
-        this.{ref_field} = {ref_field};
-    }}
-"""
-                )
-                continue  # accessor already appended
-
-            # ── Regular column ───────────────────────────────────────────────
-            else:
-                annotations.append(f'@Column(name = "{col_name}")')
-                field_lines.append("\n".join(f"    {a}" for a in annotations))
-                field_lines.append(f"    private {java_type} {field_name};\n")
+            annotations.append(f'@Column(name = "{col_name}")')
+            field_lines.append("\n".join(f"    {a}" for a in annotations))
+            field_lines.append(f"    private {java_type} {field_name};\n")
 
             accessor_lines.append(
                 f"""    public {java_type} get{self._capitalize_first(field_name)}() {{
@@ -2508,6 +2463,12 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.List;')
         if 'Optional<' in code:
             import_lines.append('import java.util.Optional;')
+        if 'Page<' in code:
+            import_lines.append('import org.springframework.data.domain.Page;')
+        if 'Pageable' in code:
+            import_lines.append('import org.springframework.data.domain.Pageable;')
+        if 'PageRequest' in code:
+            import_lines.append('import org.springframework.data.domain.PageRequest;')
         if 'Collections.' in code:
             import_lines.append('import java.util.Collections;')
         if 'Collectors.' in code:
@@ -2688,6 +2649,12 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.List;')
         if 'Optional<' in body:
             import_lines.append('import java.util.Optional;')
+        if 'Page<' in body:
+            import_lines.append('import org.springframework.data.domain.Page;')
+        if 'Pageable' in body:
+            import_lines.append('import org.springframework.data.domain.Pageable;')
+        if 'PageRequest' in body:
+            import_lines.append('import org.springframework.data.domain.PageRequest;')
         if 'BigDecimal' in body:
             import_lines.append('import java.math.BigDecimal;')
         if 'AtomicReference' in body:
@@ -3261,6 +3228,12 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import org.springframework.data.jpa.repository.Modifying;')
         if '@Transactional' in code:
             import_lines.append('import org.springframework.transaction.annotation.Transactional;')
+        if 'Page<' in code:
+            import_lines.append('import org.springframework.data.domain.Page;')
+        if 'Pageable' in code:
+            import_lines.append('import org.springframework.data.domain.Pageable;')
+        if 'PageRequest' in code:
+            import_lines.append('import org.springframework.data.domain.PageRequest;')
         if 'List<' in code:
             import_lines.append('import java.util.List;')
         if 'Optional<' in code:
@@ -3977,6 +3950,7 @@ public class {entity_name}Controller {{
         java_code: Dict[str, str],
         ddl_columns: Optional[Dict[str, List[Dict[str, str]]]] = None,
         fk_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
+        sequence_map: Optional[Dict[str, str]] = None,
         write_files: bool = True,
     ) -> Dict[str, str]:
         entities = {}
@@ -3986,6 +3960,7 @@ public class {entity_name}Controller {{
         # SBG-20: persist for use by _audit_and_complete_repository and FK injection
         self._ddl_columns = ddl_columns
         self._fk_map = fk_map or {}
+        self._sequence_map = {str(k).upper(): str(v) for k, v in (sequence_map or {}).items() if k and v}
 
         for filename, code in java_code.items():
             if '@Entity' in code or 'extends BaseEntity' in code:
@@ -4004,8 +3979,9 @@ public class {entity_name}Controller {{
                 continue
             # SBG-20: pass FK relationships for this table
             table_fks = self._fk_map.get(table_name.upper(), [])
+            table_sequence = self._sequence_map.get(table_name.upper(), "")
             entities[target_filename] = self._generate_entity_from_ddl(
-                normalized_entity_name, table_name, columns, table_fks
+                normalized_entity_name, table_name, columns, table_fks, table_sequence
             )
 
         if not entities:

@@ -462,6 +462,24 @@ def _extract_sequence_catalog(sql_text: str) -> Dict[str, Any]:
         seen_pairs.add(pair)
         mappings.append({"sequence_name": sequence_name, "mapped_table": table_name})
 
+    merge_stmt_pattern = re.compile(
+        r"\bmerge\s+into\s+([`\"\w$#\.]+)\b[\s\S]*?;",
+        flags=re.IGNORECASE,
+    )
+    seq_in_values_pattern = re.compile(r"\b([A-Za-z_][\w$#]*)\s*\.\s*nextval\b", flags=re.IGNORECASE)
+    for merge_match in merge_stmt_pattern.finditer(sql_text):
+        table_name = _normalize_identifier(merge_match.group(1)).upper()
+        statement = merge_match.group(0)
+        for seq_match in seq_in_values_pattern.finditer(statement):
+            sequence_name = _normalize_identifier(seq_match.group(1)).upper()
+            if sequence_name not in known_sequences:
+                continue
+            pair = (sequence_name, table_name)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            mappings.append({"sequence_name": sequence_name, "mapped_table": table_name})
+
     return {
         "sequences": [{"name": seq} for seq in sequence_names],
         "sequence_mapping": mappings,
@@ -596,6 +614,83 @@ def _extract_operations_by_table(block_text: str) -> Dict[str, List[str]]:
     return {table: sorted(ops) for table, ops in per_table.items()}
 
 
+def _extract_target_tables(operations_by_table: Dict[str, List[str]]) -> List[str]:
+    target_ops = {"INSERT", "UPDATE", "DELETE", "MERGE"}
+    targets: Set[str] = set()
+    for table_name, operations in (operations_by_table or {}).items():
+        normalized_table = _normalize_table_candidate(table_name)
+        if not normalized_table:
+            continue
+        if any(str(op).upper() in target_ops for op in (operations or [])):
+            targets.add(normalized_table)
+    return sorted(targets)
+
+
+def _extract_driving_table(
+    block_text: str,
+    cursor_definitions: Sequence[Dict[str, Any]],
+    operations_by_table: Dict[str, List[str]],
+) -> str:
+    for cursor in cursor_definitions or []:
+        tables = [str(table).upper() for table in (cursor.get("tables") or []) if table]
+        if tables:
+            return tables[0]
+
+    implicit_cursor_match = re.search(
+        r"\bfor\s+[A-Za-z_][\w$#]*\s+in\s*\(\s*select\b.*?\bfrom\s+([`\"\w$#\.]+)",
+        block_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if implicit_cursor_match:
+        candidate = _normalize_table_candidate(implicit_cursor_match.group(1))
+        if candidate:
+            return candidate
+
+    select_only_tables: List[str] = []
+    for table_name, operations in (operations_by_table or {}).items():
+        normalized_table = _normalize_table_candidate(table_name)
+        if not normalized_table:
+            continue
+        upper_ops = {str(op).upper() for op in (operations or [])}
+        if "SELECT" in upper_ops and not upper_ops.intersection({"INSERT", "UPDATE", "DELETE", "MERGE"}):
+            select_only_tables.append(normalized_table)
+    if select_only_tables:
+        return sorted(set(select_only_tables))[0]
+
+    if operations_by_table:
+        return sorted(str(table).upper() for table in operations_by_table.keys() if table)[0]
+    return ""
+
+
+def _extract_skip_locked_tables(
+    block_text: str,
+    cursor_definitions: Sequence[Dict[str, Any]],
+    driving_table: str,
+) -> List[str]:
+    tables: Set[str] = set()
+    for cursor in cursor_definitions or []:
+        locking = str(cursor.get("locking", "")).upper()
+        if "SKIP LOCKED" not in locking:
+            continue
+        for table in cursor.get("tables") or []:
+            normalized = _normalize_table_candidate(str(table))
+            if normalized:
+                tables.add(normalized)
+
+    select_lock_pattern = re.compile(
+        r"\bselect\b.*?\bfrom\s+([`\"\w$#\.]+).*?\bfor\s+update\s+skip\s+locked\b",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in select_lock_pattern.finditer(block_text):
+        normalized = _normalize_table_candidate(match.group(1))
+        if normalized:
+            tables.add(normalized)
+
+    if not tables and "SKIP LOCKED" in block_text.upper() and driving_table:
+        tables.add(driving_table.upper())
+    return sorted(tables)
+
+
 def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
     """Return raw object blocks plus extracted semantics for code generation."""
     cleaned = _prepare_sql_text(sql_text)
@@ -615,6 +710,9 @@ def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
                 "object_type": item.object_type,
                 "raw_plsql": item.block_text.strip(),
                 "tables_used": semantics.get("tables_used", []),
+                "driving_table": semantics.get("driving_table", ""),
+                "target_tables": semantics.get("target_tables", []),
+                "skip_locked_tables": semantics.get("skip_locked_tables", []),
                 "operations_by_table": semantics.get("operations", {}),
                 "input_parameters": semantics.get("input_parameters", []),
                 "output_parameters": semantics.get("output_parameters", []),
@@ -1605,12 +1703,22 @@ def detect_cursor(code: str) -> Dict[str, Any]:
     if cursor_definitions:
         locking_values = [cursor.get("locking", "") for cursor in cursor_definitions if cursor.get("locking")]
         locking = locking_values[0] if locking_values else ""
+        cursor_tables: List[str] = []
+        for cursor in cursor_definitions:
+            for table in cursor.get("tables") or []:
+                normalized = _normalize_table_candidate(str(table))
+                if normalized and normalized not in cursor_tables:
+                    cursor_tables.append(normalized)
         result: Dict[str, Any] = {
             "type": "explicit_cursor",
             "locking": locking,
+            "tables": cursor_tables,
+            "driving_table": cursor_tables[0] if cursor_tables else "",
         }
         if locking:
             result["purpose"] = "concurrent-safe processing" if "SKIP LOCKED" in locking else "cursor-driven processing"
+            if "SKIP LOCKED" in locking and cursor_tables:
+                result["skip_locked_tables"] = list(cursor_tables)
         return result
 
     locking_match = re.search(
@@ -2463,6 +2571,9 @@ def build_semantic_analysis(ast: Dict[str, Any]) -> Dict[str, Any]:
         "cursor_semantics": cursor_semantics,
         "error_handling_semantics": error_handling_semantics,
         "process_classification": process_classification,
+        "driving_table": ast.get("driving_table", ""),
+        "target_tables": ast.get("target_tables", []),
+        "skip_locked_tables": ast.get("skip_locked_tables", []),
     }
     semantic_analysis["intent_summary"] = _build_semantic_intent_summary(semantic_analysis)
     return semantic_analysis
@@ -2580,6 +2691,9 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         bulk_operations = detect_bulk_operations(preliminary_ast)
         operations_by_table = _merge_bulk_operations_into_operations(operations_by_table, bulk_operations)
         tables_used = _synchronize_tables_used(tables_used, operations_by_table)
+        driving_table = _extract_driving_table(item.block_text, cursor_definitions, operations_by_table)
+        target_tables = _extract_target_tables(operations_by_table)
+        skip_locked_tables = _extract_skip_locked_tables(item.block_text, cursor_definitions, driving_table)
         sequence_dependencies = _extract_sequence_dependencies(item.block_text, sequence_names)
         select_assignments = _extract_select_into_assignments(item.block_text)
         scalar_assignments = _extract_scalar_assignments(
@@ -2610,6 +2724,9 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "collections": collections,
             "tables_used": tables_used,
             "operations": operations_by_table,
+            "driving_table": driving_table,
+            "target_tables": target_tables,
+            "skip_locked_tables": skip_locked_tables,
             "lookup_keys": lookup_keys,
             "sequence_dependencies": sequence_dependencies,
             "select_assignments": select_assignments,
@@ -2674,6 +2791,9 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "variables": local_variables,
             "collections": collections,
             "tables_used": tables_used,
+            "driving_table": driving_table,
+            "target_tables": target_tables,
+            "skip_locked_tables": skip_locked_tables,
             "operations": operations_by_table,
             "business_rules": business_rules,
             "lookup_keys": lookup_keys,
@@ -2750,6 +2870,9 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
                 "out": proc.get("output_parameters", []),
             },
             "tablesUsed": tables_used,
+            "drivingTable": proc.get("driving_table", ""),
+            "targetTables": proc.get("target_tables", []),
+            "skipLockedTables": proc.get("skip_locked_tables", []),
             "operations": sorted({op for ops in proc.get("operations", {}).values() for op in ops}),
             "operationsByTable": proc.get("operations", {}),
             "lookupKeys": proc.get("lookup_keys", {}),

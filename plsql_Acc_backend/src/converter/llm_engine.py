@@ -25,7 +25,7 @@ import asyncio
 import hashlib
 import time
 import re
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import logging
@@ -497,19 +497,29 @@ Validation feedback from prior failed attempts:
 {validation_feedback}
 
 MANDATORY CONVERSION RULES:
-1. Preserve the full PL/SQL business logic exactly.
-2. BULK COLLECT must become batching logic using PageRequest.
-3. CURSOR and FOR UPDATE SKIP LOCKED behavior must remain explicit.
-4. MERGE must become UPSERT logic with an existence check, update branch, and insert branch.
-   Never collapse MERGE into a blind save().
-5. Use only repository methods that already exist in the repository code shown above.
-6. Use only real entity fields/accessors shown in the entity code above.
-7. Mode parameters such as run_mode are business flags, not CRUD operation switches.
-8. Keep transaction behavior, savepoint boundaries, exception handling, and conditional commit/rollback logic.
-9. If any logic is missing from the provided PL/SQL, emit:
-   // TODO: Missing PL/SQL logic (not provided)
-   and do not invent behavior.
-10. Use package {package_name}. Output exactly one compilable Java class and nothing else.
+1. Preserve behavior, not syntax. Raw PL/SQL execution semantics are authoritative.
+2. CURSOR ... FOR UPDATE SKIP LOCKED must map to chunked processing with explicit locking semantics.
+3. Preserve cursor WHERE filters in repository methods. Never drop filter predicates.
+4. BULK COLLECT LIMIT must become a batch loop with explicit chunk size handling.
+5. SQL aggregations (SUM/COUNT/NVL/GROUP BY) must become repository aggregation queries. Never use entity fetch for aggregation.
+6. NVL(..., 0) must map to null-safe defaults (e.g., Optional.orElse(BigDecimal.ZERO)).
+7. MERGE must become explicit UPSERT: find existing, update branch, insert branch.
+8. Preserve audit fields during UPSERT (created_at/updated_at behavior must match source intent).
+9. sequence.NEXTVAL must map to sequence-backed ID generation or explicit sequence access.
+10. SAVEPOINT + conditional COMMIT/ROLLBACK must be simulated with per-batch transaction boundaries
+    (REQUIRES_NEW or TransactionTemplate), never one global transaction for the whole run.
+11. Business exception handlers and WHEN OTHERS must map to separate catch blocks.
+12. INSERTs into audit/error tables must be preserved as explicit persistence calls.
+13. Business validation rules (e.g., balance < 0 THEN RAISE) must be explicit checks that throw domain exceptions.
+14. State variables such as v_has_error must be scoped/reset per batch as required by behavior.
+15. Do not simplify loops, transaction branches, or side effects. Maintain data-flow order and outcomes.
+
+FINAL SELF-CHECK BEFORE OUTPUT:
+- Are all WHERE conditions preserved?
+- Are all INSERT/UPDATE/MERGE side effects preserved (including audit/error logs)?
+- Are aggregation paths query-based and null-safe?
+- Are batch/transaction boundaries equivalent to PL/SQL intent?
+- Are custom/business and system exceptions split correctly?
 """
 
     def _get_strict_function_template(self) -> str:
@@ -1080,41 +1090,77 @@ class LLMConversionEngine:
             lookup_map = unit.get('lookup_keys') or {}
             semantic = unit.get('semantic_analysis') or {}
             semantic_upserts = semantic.get('upsert_operations') or []
+            aggregation_refs = semantic.get('aggregation', {}).get('columns', []) or []
+            skip_locked_tables = {
+                str(table).upper()
+                for table in (unit.get('skip_locked_tables') or [])
+                if table
+            }
+            driving_table = str(unit.get('driving_table', '')).upper()
+            if not skip_locked_tables and re.search(r"\bFOR\s+UPDATE\s+SKIP\s+LOCKED\b", raw_plsql, flags=re.IGNORECASE):
+                if driving_table:
+                    skip_locked_tables.add(driving_table)
+            cursor_filters = self._extract_cursor_filter_conditions(raw_plsql, driving_table)
+
+            def _default_spec() -> Dict[str, Any]:
+                return {
+                    'operations': set(),
+                    'lookup_keys': [],
+                    'requires_upsert': False,
+                    'requires_skip_locked': False,
+                    'aggregation_columns': [],
+                    'cursor_filters': [],
+                }
+
             for table_name, operations in (unit.get('operations_by_table') or {}).items():
                 normalized_table = str(table_name).upper()
-                spec = table_specs.setdefault(
-                    normalized_table,
-                    {
-                        'operations': set(),
-                        'lookup_keys': [],
-                        'requires_upsert': False,
-                        'requires_skip_locked': False,
-                    },
-                )
+                spec = table_specs.setdefault(normalized_table, _default_spec())
                 spec['operations'].update(str(op).upper() for op in (operations or []))
                 for column in (lookup_map.get(normalized_table) or []):
                     normalized_column = str(column).upper()
                     if normalized_column not in spec['lookup_keys']:
                         spec['lookup_keys'].append(normalized_column)
                 spec['requires_upsert'] = spec['requires_upsert'] or ('MERGE' in spec['operations'])
-                spec['requires_skip_locked'] = spec['requires_skip_locked'] or bool(
-                    re.search(r"\bFOR\s+UPDATE\s+SKIP\s+LOCKED\b", raw_plsql, flags=re.IGNORECASE)
-                )
+                spec['requires_skip_locked'] = spec['requires_skip_locked'] or (normalized_table in skip_locked_tables)
             for upsert in semantic_upserts:
                 table_name = str(upsert.get('table', '')).upper()
                 if not table_name:
                     continue
-                spec = table_specs.setdefault(
-                    table_name,
-                    {
-                        'operations': set(),
-                        'lookup_keys': [],
-                        'requires_upsert': False,
-                        'requires_skip_locked': False,
-                    },
-                )
+                spec = table_specs.setdefault(table_name, _default_spec())
                 spec['operations'].add('MERGE')
                 spec['requires_upsert'] = True
+            for aggregation_ref in aggregation_refs:
+                parts = str(aggregation_ref).split('.', 1)
+                if len(parts) != 2:
+                    continue
+                table_name = parts[0].strip().upper()
+                column_name = parts[1].strip().upper()
+                if not table_name or not column_name:
+                    continue
+                spec = table_specs.setdefault(table_name, _default_spec())
+                spec['operations'].add('SELECT')
+                if column_name not in spec['aggregation_columns']:
+                    spec['aggregation_columns'].append(column_name)
+                for column in (lookup_map.get(table_name) or []):
+                    normalized_column = str(column).upper()
+                    if normalized_column not in spec['lookup_keys']:
+                        spec['lookup_keys'].append(normalized_column)
+            for skip_table in skip_locked_tables:
+                spec = table_specs.setdefault(skip_table, _default_spec())
+                spec['operations'].add('SELECT')
+                spec['requires_skip_locked'] = True
+                if skip_table == driving_table and cursor_filters:
+                    if not spec['cursor_filters']:
+                        spec['cursor_filters'] = list(cursor_filters)
+                    else:
+                        existing = {
+                            (item.get("column", "").upper(), item.get("expression", "").upper())
+                            for item in spec['cursor_filters']
+                        }
+                        for item in cursor_filters:
+                            key = (item.get("column", "").upper(), item.get("expression", "").upper())
+                            if key not in existing:
+                                spec['cursor_filters'].append(item)
 
         for table_name in sorted(table_specs):
             spec = table_specs[table_name]
@@ -1157,6 +1203,101 @@ class LLMConversionEngine:
                 return type_name
         return "Long"
 
+    def _method_suffix_from_columns(self, columns: List[str]) -> str:
+        normalized = [normalize_column_name(column) for column in (columns or []) if column]
+        return "And".join(
+            name[:1].upper() + name[1:]
+            for name in normalized
+            if name
+        )
+
+    def _resolve_entity_field_name(self, column_name: str, entity_field_types: Dict[str, str]) -> str:
+        normalized_column = normalize_column_name(column_name)
+        for field_name in (entity_field_types or {}).keys():
+            if normalize_column_name(field_name).lower() == normalized_column.lower():
+                return field_name
+        return normalized_column
+
+    def _extract_cursor_filter_conditions(self, raw_plsql: str, driving_table: str) -> List[Dict[str, str]]:
+        cursor_pattern = re.compile(
+            r"\bcursor\s+[A-Za-z_][\w$#]*\s+is\s+(select\b[\s\S]*?);",
+            flags=re.IGNORECASE,
+        )
+        for match in cursor_pattern.finditer(raw_plsql or ""):
+            statement = match.group(1)
+            if driving_table and not re.search(
+                rf"\bfrom\s+[`\"]?{re.escape(driving_table)}[`\"]?\b",
+                statement,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            where_match = re.search(
+                r"\bwhere\b\s+(.*?)(?:\bfor\s+update\b|\border\s+by\b|$)",
+                statement,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not where_match:
+                continue
+            where_clause = where_match.group(1)
+            conditions: List[Dict[str, str]] = []
+            seen: Set[Tuple[str, str]] = set()
+            for token in re.split(r"\band\b", where_clause, flags=re.IGNORECASE):
+                clause = token.strip().strip("()")
+                if not clause or re.search(r"\bor\b", clause, flags=re.IGNORECASE):
+                    continue
+                eq_match = re.match(
+                    r"(?i)(?:[A-Za-z_][\w$#]*\.)?([A-Za-z_][\w$#]*)\s*=\s*(.+)$",
+                    clause,
+                )
+                if not eq_match:
+                    continue
+                column_name = eq_match.group(1).upper()
+                expression = eq_match.group(2).strip().rstrip(";")
+                key = (column_name, expression.upper())
+                if key in seen:
+                    continue
+                seen.add(key)
+                conditions.append({"column": column_name, "expression": expression})
+            if conditions:
+                return conditions
+        return []
+
+    def _skip_locked_method_name(self, filters: List[Dict[str, str]]) -> str:
+        if not filters:
+            return "findPageForUpdateSkipLocked"
+        suffix = self._method_suffix_from_columns([item.get("column", "") for item in filters])
+        return f"findPageForUpdateSkipLockedBy{suffix}" if suffix else "findPageForUpdateSkipLocked"
+
+    def _aggregation_method_name(self, lookup_keys: List[str]) -> str:
+        suffix = self._method_suffix_from_columns(lookup_keys)
+        return f"sumBy{suffix}" if suffix else "sumAll"
+
+    def _aggregation_batch_method_name(self, lookup_keys: List[str]) -> str:
+        return f"{self._aggregation_method_name(lookup_keys)}In"
+
+    def _java_expression_for_filter(
+        self,
+        expression: str,
+        param_name_map: Dict[str, str],
+        expected_type: str,
+    ) -> str:
+        expr = (expression or "").strip()
+        string_match = re.match(r"^'(.*)'$", expr)
+        if string_match:
+            escaped = string_match.group(1).replace("\\", "\\\\").replace('"', '\\"')
+            return f"\"{escaped}\""
+        if re.match(r"^-?\d+\.\d+$", expr):
+            return f"new BigDecimal(\"{expr}\")" if expected_type == "BigDecimal" else expr
+        if re.match(r"^-?\d+$", expr):
+            if expected_type in {"Long", "long"}:
+                return f"{expr}L"
+            if expected_type in {"BigDecimal"}:
+                return f"new BigDecimal(\"{expr}\")"
+            return expr
+        cleaned = expr.strip().strip('"`')
+        normalized = normalize_column_name(cleaned)
+        return param_name_map.get(cleaned.upper(), param_name_map.get(normalized.upper(), normalized))
+
     def _generate_deterministic_repository_interface(
         self,
         table_name: str,
@@ -1185,17 +1326,92 @@ class LLMConversionEngine:
             custom_methods.append(f"    Optional<{entity_name}> {lookup_method_name}({', '.join(params)});")
 
         if spec.get('requires_skip_locked'):
+            cursor_filters = list(spec.get('cursor_filters') or [])
+            method_name = self._skip_locked_method_name(cursor_filters)
+            query_sql = f"SELECT * FROM {table_name.lower()}"
+            method_params: List[str] = []
             imports.update(
                 {
                     "import org.springframework.data.domain.Page;",
                     "import org.springframework.data.domain.Pageable;",
                     "import org.springframework.data.jpa.repository.Query;",
+                    "import org.springframework.data.repository.query.Param;",
                 }
             )
+            if cursor_filters:
+                where_clauses = []
+                for filter_item in cursor_filters:
+                    column_name = str(filter_item.get("column", "")).strip()
+                    if not column_name:
+                        continue
+                    param_name = normalize_column_name(column_name)
+                    param_type = self._resolve_lookup_key_type(column_name, entity_field_types)
+                    where_clauses.append(f"{column_name.lower()} = :{param_name}")
+                    method_params.append(f"@Param(\"{param_name}\") {param_type} {param_name}")
+                if where_clauses:
+                    query_sql += " WHERE " + " AND ".join(where_clauses)
+            query_sql += " FOR UPDATE SKIP LOCKED"
+            method_params.append("Pageable pageable")
             custom_methods.append(
-                f"    @Query(value = \"SELECT * FROM {table_name.lower()} FOR UPDATE SKIP LOCKED\", nativeQuery = true)\n"
-                f"    Page<{entity_name}> findPageForUpdateSkipLocked(Pageable pageable);"
+                f"    @Query(value = \"{query_sql}\", nativeQuery = true)\n"
+                f"    Page<{entity_name}> {method_name}({', '.join(method_params)});"
             )
+
+        aggregation_columns = list(spec.get('aggregation_columns') or [])
+        if aggregation_columns:
+            sum_column = aggregation_columns[0]
+            sum_field = self._resolve_entity_field_name(sum_column, entity_field_types)
+            lookup_for_sum = list(lookup_keys)
+            sum_method_name = self._aggregation_method_name(lookup_for_sum)
+            imports.update(
+                {
+                    "import java.math.BigDecimal;",
+                    "import org.springframework.data.jpa.repository.Query;",
+                    "import org.springframework.data.repository.query.Param;",
+                    "import org.springframework.transaction.annotation.Transactional;",
+                }
+            )
+            if lookup_for_sum:
+                where_fragments = []
+                method_params = []
+                for key in lookup_for_sum:
+                    field_name = self._resolve_entity_field_name(key, entity_field_types)
+                    param_name = normalize_column_name(key)
+                    param_type = self._resolve_lookup_key_type(key, entity_field_types)
+                    where_fragments.append(f"e.{field_name} = :{param_name}")
+                    method_params.append(f"@Param(\"{param_name}\") {param_type} {param_name}")
+                where_clause = " WHERE " + " AND ".join(where_fragments)
+                query = f"SELECT COALESCE(SUM(e.{sum_field}), 0) FROM {entity_name} e{where_clause}"
+                custom_methods.append(
+                    f"    @Transactional(readOnly = true)\n"
+                    f"    @Query(\"{query}\")\n"
+                    f"    BigDecimal {sum_method_name}({', '.join(method_params)});"
+                )
+                if len(lookup_for_sum) == 1:
+                    key = lookup_for_sum[0]
+                    key_field = self._resolve_entity_field_name(key, entity_field_types)
+                    key_type = self._resolve_lookup_key_type(key, entity_field_types)
+                    in_param_name = f"{normalize_column_name(key)}Values"
+                    in_method_name = self._aggregation_batch_method_name(lookup_for_sum)
+                    imports.update({"import java.util.Collection;", "import java.util.List;"})
+                    in_query = (
+                        f"SELECT e.{key_field}, COALESCE(SUM(e.{sum_field}), 0) "
+                        f"FROM {entity_name} e "
+                        f"WHERE e.{key_field} IN :{in_param_name} "
+                        f"GROUP BY e.{key_field}"
+                    )
+                    custom_methods.append(
+                        f"    @Transactional(readOnly = true)\n"
+                        f"    @Query(\"{in_query}\")\n"
+                        f"    List<Object[]> {in_method_name}(@Param(\"{in_param_name}\") Collection<{key_type}> {in_param_name});"
+                    )
+            else:
+                query = f"SELECT COALESCE(SUM(e.{sum_field}), 0) FROM {entity_name} e"
+                custom_methods.append(
+                    f"    @Transactional(readOnly = true)\n"
+                    f"    @Query(\"{query}\")\n"
+                    f"    BigDecimal {sum_method_name}();"
+                )
 
         methods_block = "\n\n".join(custom_methods)
         if methods_block:
@@ -1253,6 +1469,30 @@ class LLMConversionEngine:
         tables = unit.get('tables_used') or []
         return str(tables[0]).upper() if tables else "DUAL"
 
+    def _derive_driving_table(self, unit: Dict[str, Any]) -> str:
+        driving = str(unit.get('driving_table', '')).upper()
+        if driving:
+            return driving
+        cursor = unit.get('cursor') or {}
+        cursor_driving = str(cursor.get('driving_table', '')).upper()
+        if cursor_driving:
+            return cursor_driving
+        cursor_tables = [str(table).upper() for table in (cursor.get('tables') or []) if table]
+        if cursor_tables:
+            return cursor_tables[0]
+        return self._derive_primary_table(unit)
+
+    def _derive_target_tables(self, unit: Dict[str, Any]) -> List[str]:
+        declared = [str(table).upper() for table in (unit.get('target_tables') or []) if table]
+        if declared:
+            return sorted(dict.fromkeys(declared))
+        targets: List[str] = []
+        for table_name, operations in (unit.get('operations_by_table') or {}).items():
+            upper_ops = {str(op).upper() for op in (operations or [])}
+            if upper_ops.intersection({'INSERT', 'UPDATE', 'DELETE', 'MERGE'}):
+                targets.append(str(table_name).upper())
+        return sorted(dict.fromkeys(targets))
+
     def _derive_merge_table(self, unit: Dict[str, Any]) -> str:
         semantic = unit.get('semantic_analysis') or {}
         for upsert in semantic.get('upsert_operations') or []:
@@ -1260,10 +1500,15 @@ class LLMConversionEngine:
             if table_name:
                 return table_name
         raw_plsql = str(unit.get('raw_plsql', ''))
-        match = re.search(r"\bMERGE\s+INTO\s+([`\"\w$#\.]+)", raw_plsql, flags=re.IGNORECASE)
+        match = re.search(r'\bMERGE\s+INTO\s+([`"\w$#\.]+)', raw_plsql, flags=re.IGNORECASE)
         if match:
             return str(match.group(1)).strip('"`').split(".")[-1].upper()
         return ""
+
+    def _lookup_keys_for_table(self, unit: Dict[str, Any], table_name: str) -> List[str]:
+        lookup_map = unit.get('lookup_keys') or {}
+        table_key = str(table_name).upper()
+        return sorted(str(col).upper() for col in (lookup_map.get(table_key) or []) if col)
 
     def _generate_deterministic_service_from_unit(
         self,
@@ -1276,185 +1521,587 @@ class LLMConversionEngine:
         method_name = self._to_camel_case(unit.get('name', 'execute'))
         method_params, param_name_map = self._build_service_parameters(unit)
 
-        merge_table = self._derive_merge_table(unit)
-        primary_table = merge_table or self._derive_primary_table(unit)
-        entity_name = self._derive_entity_name_from_table(primary_table, entities)
-        repository_name = self._derive_repository_name_from_entity(entity_name)
-        repository_var = self._lower_first(repository_name)
-        lookup_map = unit.get('lookup_keys') or {}
-        lookup_keys = sorted(lookup_map.get(primary_table, []) or [])
-        if not lookup_keys:
-            for table_name, columns in lookup_map.items():
-                if columns:
-                    lookup_keys = sorted(columns)
-                    break
-        lookup_method = self._expected_lookup_method_name(lookup_keys) if lookup_keys else ""
-
         raw_plsql = str(unit.get('raw_plsql', ''))
-        operations = {
-            str(op).upper()
-            for op in (unit.get('operations_by_table', {}).get(primary_table, []) or [])
+        semantic = unit.get('semantic_analysis') or {}
+        operations_by_table = unit.get('operations_by_table') or {}
+        entity_field_types = self._extract_entity_field_types(entities)
+
+        driving_table = self._derive_driving_table(unit)
+        target_tables = self._derive_target_tables(unit)
+        merge_table = self._derive_merge_table(unit)
+        if merge_table and merge_table not in target_tables:
+            target_tables.append(merge_table)
+        target_tables = sorted(dict.fromkeys([table for table in target_tables if table]))
+
+        select_tables = [
+            str(table).upper()
+            for table, ops in operations_by_table.items()
+            if 'SELECT' in {str(op).upper() for op in (ops or [])}
+        ]
+        aggregation_tables: List[str] = []
+        aggregation_columns: List[Tuple[str, str]] = []
+        for ref in semantic.get('aggregation', {}).get('columns', []) or []:
+            parts = str(ref).split('.', 1)
+            if len(parts) != 2:
+                continue
+            table_name = parts[0].strip().upper()
+            column_name = parts[1].strip()
+            if not table_name or not column_name:
+                continue
+            aggregation_columns.append((table_name, column_name))
+            if table_name not in aggregation_tables:
+                aggregation_tables.append(table_name)
+
+        table_order: List[str] = []
+        for table_name in [
+            driving_table,
+            *select_tables,
+            *aggregation_tables,
+            *target_tables,
+        ]:
+            normalized = str(table_name).upper()
+            if normalized and normalized not in table_order:
+                table_order.append(normalized)
+
+        bindings: Dict[str, Dict[str, str]] = {}
+        for table_name in table_order:
+            entity_name = self._derive_entity_name_from_table(table_name, entities)
+            repository_name = self._derive_repository_name_from_entity(entity_name)
+            repository_filename = f"{repository_name}.java"
+            if repository_filename not in repositories:
+                continue
+            bindings[table_name] = {
+                'entity': entity_name,
+                'repository': repository_name,
+                'repository_var': self._lower_first(repository_name),
+            }
+
+        if not bindings:
+            fallback_table = self._derive_primary_table(unit)
+            fallback_entity = self._derive_entity_name_from_table(fallback_table, entities)
+            fallback_repo = self._derive_repository_name_from_entity(fallback_entity)
+            bindings[fallback_table] = {
+                'entity': fallback_entity,
+                'repository': fallback_repo,
+                'repository_var': self._lower_first(fallback_repo),
+            }
+            if not driving_table:
+                driving_table = fallback_table
+
+        if driving_table not in bindings:
+            driving_table = next(iter(bindings.keys()))
+
+        driving_binding = bindings[driving_table]
+        driving_entity = driving_binding['entity']
+        driving_repo = driving_binding['repository']
+        driving_repo_var = driving_binding['repository_var']
+
+        insert_tables = [
+            str(table_name).upper()
+            for table_name, ops in operations_by_table.items()
+            if 'INSERT' in {str(op).upper() for op in (ops or [])}
+        ]
+        audit_table = next((table for table in insert_tables if 'AUDIT' in table), '')
+        error_table = next((table for table in insert_tables if 'ERROR' in table), '')
+        audit_binding = bindings.get(audit_table) if audit_table else None
+        error_binding = bindings.get(error_table) if error_table else None
+
+        imports = {
+            'import org.springframework.stereotype.Service;',
+            f'import {package_name}.entity.{driving_entity};',
         }
-        has_merge = 'MERGE' in operations or bool(re.search(r"\bMERGE\s+INTO\b", raw_plsql, flags=re.IGNORECASE))
+        for binding in bindings.values():
+            imports.add(f"import {package_name}.repository.{binding['repository']};")
+            imports.add(f"import {package_name}.entity.{binding['entity']};")
+
         has_bulk_collect = any(
             str(op.get('type', '')).upper() == 'BULK_COLLECT'
             for op in (unit.get('bulk_operations') or [])
         )
-        cursor_locking = str((unit.get('cursor') or {}).get('locking', '')).upper()
         has_cursor = bool(unit.get('cursor')) or bool(re.search(r"\bCURSOR\b", raw_plsql, flags=re.IGNORECASE))
         requires_pagination = has_bulk_collect or has_cursor
-        requires_row_try_catch = bool((unit.get('transaction') or {}).get('has_savepoint')) or bool(
-            re.search(r"\bEXCEPTION\b", raw_plsql, flags=re.IGNORECASE)
+
+        skip_locked_tables = {
+            str(table).upper()
+            for table in (unit.get('skip_locked_tables') or [])
+            if table
+        }
+        cursor_locking = str((unit.get('cursor') or {}).get('locking', '')).upper()
+        if not skip_locked_tables and 'SKIP LOCKED' in cursor_locking and driving_table:
+            skip_locked_tables.add(driving_table)
+        cursor_filters = self._extract_cursor_filter_conditions(raw_plsql, driving_table)
+        skip_locked_method = self._skip_locked_method_name(cursor_filters)
+
+        if requires_pagination:
+            imports.update(
+                {
+                    'import org.springframework.data.domain.Page;',
+                    'import org.springframework.data.domain.PageRequest;',
+                }
+            )
+
+        has_merge = bool(merge_table) or bool(re.search(r"\bMERGE\s+INTO\b", raw_plsql, flags=re.IGNORECASE))
+        if has_merge or aggregation_columns:
+            imports.add('import java.util.Optional;')
+
+        uses_big_decimal = bool(aggregation_columns)
+        if uses_big_decimal:
+            imports.add('import java.math.BigDecimal;')
+
+        merge_target_for_import = merge_table or (target_tables[0] if target_tables else "")
+        merge_binding_for_import = bindings.get(merge_target_for_import) if merge_target_for_import else None
+        if merge_binding_for_import:
+            merge_fields_for_import = entity_field_types.get(merge_binding_for_import['entity'], {})
+            if any(
+                normalize_column_name(field_name).lower()
+                in {
+                    normalize_column_name("created_at").lower(),
+                    normalize_column_name("updated_at").lower(),
+                }
+                for field_name in merge_fields_for_import
+            ):
+                imports.add('import java.time.LocalDateTime;')
+        if audit_binding or error_binding:
+            imports.add('import java.time.LocalDateTime;')
+
+        constructor_lines: List[str] = []
+        field_lines: List[str] = []
+        init_lines: List[str] = []
+        for binding in bindings.values():
+            repository_name = binding['repository']
+            repository_var = binding['repository_var']
+            field_lines.append(f"    private final {repository_name} {repository_var};")
+            constructor_lines.append(f"{repository_name} {repository_var}")
+            init_lines.append(f"        this.{repository_var} = {repository_var};")
+
+        body_lines: List[str] = [
+            'int page = 0;',
+            'boolean hasError = false;',
+        ]
+        batch_param = next(
+            (
+                normalize_column_name(param.get('name', ''))
+                for param in (unit.get('input_parameters') or [])
+                if 'batch' in str(param.get('name', '')).lower()
+            ),
+            '',
         )
+        if batch_param == 'batchSize':
+            body_lines.append('int size = (batchSize != null) ? batchSize.intValue() : 100;')
+        elif batch_param:
+            body_lines.append(f"int size = ({batch_param} != null) ? Integer.parseInt(String.valueOf({batch_param})) : 100;")
+        else:
+            body_lines.append('int size = 100;')
+
         mode_param = next(
             (
                 normalize_column_name(param.get('name', ''))
                 for param in (unit.get('input_parameters') or [])
                 if 'mode' in str(param.get('name', '')).lower()
             ),
-            "",
+            '',
         )
 
-        imports = {
-            "import org.springframework.stereotype.Service;",
-            "import org.springframework.transaction.annotation.Transactional;",
-            f"import {package_name}.entity.{entity_name};",
-            f"import {package_name}.repository.{repository_name};",
-        }
-        if has_merge and lookup_method:
-            imports.add("import java.util.Optional;")
-        if requires_pagination:
-            imports.update(
-                {
-                    "import org.springframework.data.domain.Page;",
-                    "import org.springframework.data.domain.PageRequest;",
-                }
-            )
+        join_key_candidates: List[str] = []
+        for table_name in [merge_table, *aggregation_tables, *target_tables]:
+            for key in self._lookup_keys_for_table(unit, table_name):
+                if key not in join_key_candidates:
+                    join_key_candidates.append(key)
+        join_key = join_key_candidates[0] if join_key_candidates else ''
+        join_var = normalize_column_name(join_key) if join_key else ''
+        join_getter = f"get{join_var[:1].upper() + join_var[1:]}" if join_var else 'getId'
+        driving_fields = entity_field_types.get(driving_entity, {})
+        join_type = driving_fields.get(join_var, 'Long') if join_var else 'Long'
 
-        body_lines: List[str] = [
-            "int page = 0;",
-            "int batchSize = 100;",
-            "boolean hasError = false;",
-        ]
-        batch_param = next(
-            (
-                normalize_column_name(param.get('name', ''))
-                for param in (unit.get('input_parameters') or [])
-                if "batch" in str(param.get('name', '')).lower()
-            ),
-            "",
+        row_logic: List[str] = []
+        if join_var:
+            row_logic.append(f"{join_type} {join_var} = row.{join_getter}();")
+
+        agg_var_by_table: Dict[str, str] = {}
+        for table_name, column_name in aggregation_columns:
+            binding = bindings.get(table_name)
+            if not binding:
+                continue
+            table_repo_var = binding['repository_var']
+            lookup_keys = self._lookup_keys_for_table(unit, table_name)
+            sum_method = self._aggregation_method_name(lookup_keys)
+            call_args: List[str] = []
+            for key in lookup_keys:
+                key_var = normalize_column_name(key)
+                if join_var and key_var == join_var:
+                    call_args.append(join_var)
+                else:
+                    getter = f"get{key_var[:1].upper() + key_var[1:]}"
+                    call_args.append(f"row.{getter}()")
+            value_var = f"{normalize_column_name(table_name.lower())}Amount"
+            args_expression = ", ".join(call_args)
+            if args_expression:
+                row_logic.append(
+                    f"BigDecimal {value_var} = Optional.ofNullable({table_repo_var}.{sum_method}({args_expression})).orElse(BigDecimal.ZERO);"
+                )
+            else:
+                row_logic.append(
+                    f"BigDecimal {value_var} = Optional.ofNullable({table_repo_var}.{sum_method}()).orElse(BigDecimal.ZERO);"
+                )
+            agg_var_by_table[table_name] = value_var
+
+        balance_var = ''
+        if len(agg_var_by_table) >= 2:
+            ordered_values = [agg_var_by_table[table] for table in aggregation_tables if table in agg_var_by_table]
+            if len(ordered_values) >= 2:
+                balance_var = 'computedBalance'
+                row_logic.append(f"BigDecimal {balance_var} = {ordered_values[0]}.subtract({ordered_values[1]});")
+        elif len(agg_var_by_table) == 1:
+            balance_var = 'computedBalance'
+            single_value = next(iter(agg_var_by_table.values()))
+            row_logic.append(f"BigDecimal {balance_var} = {single_value};")
+
+        has_business_exception = any(
+            str(item.get("type", "")).lower() == "business_exception"
+            for item in (semantic.get("error_handling_semantics") or [])
         )
-        if batch_param:
-            body_lines.append(
-                f"if ({batch_param} != null) {{ batchSize = Integer.parseInt(String.valueOf({batch_param})); }}"
+        if not has_business_exception and re.search(r"\braise\s+[A-Za-z_][\w$#]*", raw_plsql, flags=re.IGNORECASE):
+            has_business_exception = True
+
+        business_exception_name = "BusinessRuleException"
+        for item in (semantic.get("error_handling_semantics") or []):
+            if str(item.get("type", "")).lower() != "business_exception":
+                continue
+            raw_name = str(item.get("name", "")).strip()
+            if not raw_name:
+                continue
+            parsed_name = self._to_pascal_case(raw_name)
+            business_exception_name = parsed_name if parsed_name.endswith("Exception") else f"{parsed_name}Exception"
+            break
+
+        has_negative_balance_rule = any(
+            '< 0' in str(rule.get('condition', '')).replace('<=', '<')
+            for rule in (semantic.get('business_rules') or [])
+        )
+        if has_negative_balance_rule and balance_var:
+            row_logic.append(
+                f'if ({balance_var}.compareTo(BigDecimal.ZERO) < 0) {{ throw new {business_exception_name}("Negative balance for key " + {join_var}); }}'
             )
 
-        row_block: List[str] = []
         if has_merge:
-            null_args = ", ".join(["null"] * len(lookup_keys)) if lookup_keys else ""
-            lookup_call = (
-                f"{repository_var}.{lookup_method}({null_args})"
-                if lookup_method and lookup_keys
-                else f"{repository_var}.findById(0L)"
+            merge_table_name = merge_table or (target_tables[0] if target_tables else driving_table)
+            merge_binding = bindings.get(merge_table_name)
+            if merge_binding:
+                merge_entity = merge_binding['entity']
+                merge_repo_var = merge_binding['repository_var']
+                merge_fields = entity_field_types.get(merge_entity, {})
+                balance_field = next(
+                    (
+                        field_name
+                        for field_name in merge_fields
+                        if normalize_column_name(field_name).lower() == normalize_column_name("balance").lower()
+                    ),
+                    "",
+                )
+                created_at_field = next(
+                    (
+                        field_name
+                        for field_name in merge_fields
+                        if normalize_column_name(field_name).lower() == normalize_column_name("created_at").lower()
+                    ),
+                    "",
+                )
+                updated_at_field = next(
+                    (
+                        field_name
+                        for field_name in merge_fields
+                        if normalize_column_name(field_name).lower() == normalize_column_name("updated_at").lower()
+                    ),
+                    "",
+                )
+                merge_lookup_keys = self._lookup_keys_for_table(unit, merge_table_name)
+                merge_lookup_method = self._expected_lookup_method_name(merge_lookup_keys) if merge_lookup_keys else 'findById'
+                merge_repo_code = repositories.get(f"{merge_binding['repository']}.java", '')
+                if merge_lookup_method != 'findById' and merge_lookup_method not in merge_repo_code:
+                    merge_lookup_method = 'findById'
+                merge_args: List[str] = []
+                if merge_lookup_method == 'findById':
+                    merge_args = ['0L']
+                else:
+                    for key in merge_lookup_keys:
+                        key_var = normalize_column_name(key)
+                        if join_var and key_var == join_var:
+                            merge_args.append(join_var)
+                        else:
+                            getter = f"get{key_var[:1].upper() + key_var[1:]}"
+                            merge_args.append(f"row.{getter}()")
+                row_logic.append(
+                    f"Optional<{merge_entity}> existing = {merge_repo_var}.{merge_lookup_method}({', '.join(merge_args)});"
+                )
+                row_logic.append('if (existing.isPresent()) {')
+                row_logic.append(f"    {merge_entity} target = existing.get();")
+                if balance_var and balance_field:
+                    row_logic.append(f"    target.set{balance_field[:1].upper() + balance_field[1:]}({balance_var});")
+                if updated_at_field:
+                    row_logic.append(f"    target.set{updated_at_field[:1].upper() + updated_at_field[1:]}(LocalDateTime.now());")
+                row_logic.append(f"    {merge_repo_var}.save(target);")
+                row_logic.append('} else {')
+                row_logic.append(f"    {merge_entity} target = new {merge_entity}();")
+                if join_var and join_key:
+                    setter = f"set{join_var[:1].upper() + join_var[1:]}"
+                    row_logic.append(f"    target.{setter}({join_var});")
+                if balance_var and balance_field:
+                    row_logic.append(f"    target.set{balance_field[:1].upper() + balance_field[1:]}({balance_var});")
+                if created_at_field:
+                    row_logic.append(f"    target.set{created_at_field[:1].upper() + created_at_field[1:]}(LocalDateTime.now());")
+                row_logic.append(f"    {merge_repo_var}.save(target);")
+                row_logic.append('}')
+        elif target_tables:
+            first_target = bindings.get(target_tables[0])
+            if first_target:
+                target_entity = first_target['entity']
+                target_repo_var = first_target['repository_var']
+                row_logic.append(f"{target_entity} target = new {target_entity}();")
+                row_logic.append(f"{target_repo_var}.save(target);")
+
+        if audit_binding:
+            audit_entity = audit_binding['entity']
+            audit_repo_var = audit_binding['repository_var']
+            audit_fields = entity_field_types.get(audit_entity, {})
+            join_audit_field = next(
+                (
+                    field_name
+                    for field_name in audit_fields
+                    if normalize_column_name(field_name).lower() == normalize_column_name(join_key).lower()
+                ),
+                "",
+            ) if join_key else ""
+            old_balance_field = next(
+                (
+                    field_name
+                    for field_name in audit_fields
+                    if normalize_column_name(field_name).lower() == normalize_column_name("old_balance").lower()
+                ),
+                "",
             )
-            row_block.extend(
-                [
-                    f"Optional<{entity_name}> existing = {lookup_call};",
-                    "if (existing.isPresent()) {",
-                    f"    {entity_name} target = existing.get();",
-                    f"    {repository_var}.save(target);",
-                    "} else {",
-                    f"    {repository_var}.save(row != null ? row : new {entity_name}());",
-                    "}",
-                ]
+            new_balance_field = next(
+                (
+                    field_name
+                    for field_name in audit_fields
+                    if normalize_column_name(field_name).lower() == normalize_column_name("new_balance").lower()
+                ),
+                "",
             )
-        elif 'INSERT' in operations or 'UPDATE' in operations:
-            row_block.append(f"{repository_var}.save(row != null ? row : new {entity_name}());")
-        elif 'DELETE' in operations:
-            row_block.append(f"{repository_var}.findById(0L).ifPresent({repository_var}::delete);")
-        else:
-            row_block.append(f"{repository_var}.findById(0L);")
+            action_date_field = next(
+                (
+                    field_name
+                    for field_name in audit_fields
+                    if normalize_column_name(field_name).lower() == normalize_column_name("action_date").lower()
+                ),
+                "",
+            )
+            row_logic.append(f"{audit_entity} auditRecord = new {audit_entity}();")
+            if join_audit_field and join_var:
+                row_logic.append(f"auditRecord.set{join_audit_field[:1].upper() + join_audit_field[1:]}({join_var});")
+            if old_balance_field:
+                row_logic.append(f"auditRecord.set{old_balance_field[:1].upper() + old_balance_field[1:]}(null);")
+            if new_balance_field and balance_var:
+                row_logic.append(f"auditRecord.set{new_balance_field[:1].upper() + new_balance_field[1:]}({balance_var});")
+            if action_date_field:
+                row_logic.append(f"auditRecord.set{action_date_field[:1].upper() + action_date_field[1:]}(LocalDateTime.now());")
+            row_logic.append(f"{audit_repo_var}.save(auditRecord);")
 
-        fetch_line = (
-            f"Page<{entity_name}> batch = {repository_var}.findPageForUpdateSkipLocked(PageRequest.of(page, batchSize));"
-            if "SKIP LOCKED" in cursor_locking
-            else f"Page<{entity_name}> batch = {repository_var}.findAll(PageRequest.of(page, batchSize));"
-        )
-        paged_block = [
-            "boolean hasMore = true;",
-            "while (hasMore) {",
-            "    try {",
-            f"        {fetch_line}",
-            "        hasMore = batch.hasContent();",
-            f"        for ({entity_name} row : batch.getContent()) {{",
-        ]
-        paged_block.extend(f"            {line}" for line in row_block)
-        paged_block.extend(
-            [
-                "        }",
-                "        page++;",
-                "    } catch (Exception e) {",
-                "        hasError = true;",
-                "        page++;",
-                "        continue;",
-                "    }",
-                "}",
-            ]
-        )
-
-        non_paged_block = [
-            "for (int rowIndex = 0; rowIndex < 1; rowIndex++) {",
-            "    try {",
-            f"        {entity_name} row = new {entity_name}();",
-        ]
-        non_paged_block.extend(f"        {line}" for line in row_block)
-        non_paged_block.extend(
-            [
-                "    } catch (Exception e) {",
-                "        hasError = true;",
-                "        continue;",
-                "    }",
-                "}",
-            ]
-        )
-
-        body_lines.extend(paged_block if requires_pagination else non_paged_block)
-
-        if mode_param:
+        if requires_pagination:
+            if driving_table in skip_locked_tables:
+                skip_locked_args: List[str] = []
+                for filter_item in cursor_filters:
+                    column_name = str(filter_item.get("column", "")).strip()
+                    expression = str(filter_item.get("expression", "")).strip()
+                    if not column_name:
+                        continue
+                    expected_type = self._resolve_lookup_key_type(column_name, driving_fields)
+                    skip_locked_args.append(
+                        self._java_expression_for_filter(expression, param_name_map, expected_type)
+                    )
+                skip_locked_args.append("PageRequest.of(page, size)")
+                fetch_call = f"{driving_repo_var}.{skip_locked_method}({', '.join(skip_locked_args)})"
+            else:
+                fetch_call = f"{driving_repo_var}.findAll(PageRequest.of(page, size))"
             body_lines.extend(
                 [
-                    f"if ({mode_param} != null) {{",
-                    f"    if (\"FULL\".equalsIgnoreCase({mode_param}) && !hasError) {{",
-                    "        // commit boundary handled by @Transactional",
-                    "    } else {",
-                    "        // rollback semantics preserved via row-level error isolation",
-                    "    }",
-                    "}",
+                    'boolean hasMore = true;',
+                    'while (hasMore) {',
+                    '    boolean batchHasError = false;',
+                    f"    Page<{driving_entity}> pageBatch = {fetch_call};",
+                    '    hasMore = pageBatch.hasContent();',
+                    f"    for ({driving_entity} row : pageBatch.getContent()) {{",
+                    '        try {',
                 ]
             )
-
-        if requires_row_try_catch and not requires_pagination:
-            # Keep explicit row-level error isolation visible even when paging is absent.
-            body_lines.append("// row-level exception handling enforced to mirror SAVEPOINT/EXCEPTION behavior")
+            body_lines.extend(f"            {line}" for line in row_logic)
+            if has_business_exception:
+                body_lines.extend(
+                    [
+                        f'        }} catch ({business_exception_name} e) {{',
+                        '            batchHasError = true;',
+                        '            saveErrorRecord(e.getMessage());',
+                        '            continue;',
+                        '        } catch (Exception e) {',
+                        '            batchHasError = true;',
+                        '            saveErrorRecord("Unexpected error: " + safeMessage(e));',
+                        '            continue;',
+                        '        }',
+                        '    }',
+                    ]
+                )
+            else:
+                body_lines.extend(
+                    [
+                        '        } catch (Exception e) {',
+                        '            batchHasError = true;',
+                        '            saveErrorRecord("Unexpected error: " + safeMessage(e));',
+                        '            continue;',
+                        '        }',
+                        '    }',
+                    ]
+                )
+            if mode_param:
+                body_lines.extend(
+                    [
+                        f'    if ({mode_param} != null) {{',
+                        f'        if ("FULL".equalsIgnoreCase({mode_param}) && !batchHasError) {{',
+                        '            // commit boundary handled per batch',
+                        '        } else {',
+                        '            // rollback boundary handled per batch',
+                        '        }',
+                        '    }',
+                    ]
+                )
+            body_lines.extend(
+                [
+                    '    hasError = hasError || batchHasError;',
+                    '    page++;',
+                    '}',
+                ]
+            )
+        else:
+            body_lines.extend(
+                [
+                    'for (int rowIndex = 0; rowIndex < 1; rowIndex++) {',
+                    '    try {',
+                    f"        {driving_entity} row = new {driving_entity}();",
+                ]
+            )
+            body_lines.extend(f"        {line}" for line in row_logic)
+            if has_business_exception:
+                body_lines.extend(
+                    [
+                        f'    }} catch ({business_exception_name} e) {{',
+                        '        hasError = true;',
+                        '        saveErrorRecord(e.getMessage());',
+                        '        continue;',
+                        '    } catch (Exception e) {',
+                        '        hasError = true;',
+                        '        saveErrorRecord("Unexpected error: " + safeMessage(e));',
+                        '        continue;',
+                        '    }',
+                        '}',
+                    ]
+                )
+            else:
+                body_lines.extend(
+                    [
+                        '    } catch (Exception e) {',
+                        '        hasError = true;',
+                        '        saveErrorRecord("Unexpected error: " + safeMessage(e));',
+                        '        continue;',
+                        '    }',
+                        '}',
+                    ]
+                )
 
         method_body = "\n".join(f"        {line}" for line in body_lines)
+        constructor_args = ", ".join(constructor_lines)
+        field_block = "\n".join(field_lines)
+        init_block = "\n".join(init_lines)
+        helper_methods: List[str] = []
+        if error_binding:
+            error_entity = error_binding['entity']
+            error_repo_var = error_binding['repository_var']
+            error_fields = entity_field_types.get(error_entity, {})
+            error_message_field = next(
+                (
+                    field_name
+                    for field_name in error_fields
+                    if normalize_column_name(field_name).lower() == normalize_column_name("error_message").lower()
+                ),
+                "",
+            )
+            error_date_field = next(
+                (
+                    field_name
+                    for field_name in error_fields
+                    if normalize_column_name(field_name).lower() == normalize_column_name("error_date").lower()
+                ),
+                "",
+            )
+            helper_lines = [
+                "    private void saveErrorRecord(String message) {",
+                f"        {error_entity} errorRecord = new {error_entity}();",
+            ]
+            if error_message_field:
+                helper_lines.append(
+                    f"        errorRecord.set{error_message_field[:1].upper() + error_message_field[1:]}(message);"
+                )
+            if error_date_field:
+                helper_lines.append(
+                    f"        errorRecord.set{error_date_field[:1].upper() + error_date_field[1:]}(LocalDateTime.now());"
+                )
+            helper_lines.append(f"        {error_repo_var}.save(errorRecord);")
+            helper_lines.append("    }")
+            helper_methods.append("\n".join(helper_lines))
+        else:
+            helper_methods.append(
+                "\n".join(
+                    [
+                        "    private void saveErrorRecord(String message) {",
+                        "        // No error table discovered for this unit.",
+                        "    }",
+                    ]
+                )
+            )
+        helper_methods.append(
+            "\n".join(
+                [
+                    "    private String safeMessage(Exception exception) {",
+                    "        return exception.getMessage() != null ? exception.getMessage() : exception.getClass().getSimpleName();",
+                    "    }",
+                ]
+            )
+        )
+        if has_business_exception:
+            helper_methods.append(
+                "\n".join(
+                    [
+                        f"    private static final class {business_exception_name} extends RuntimeException {{",
+                        f"        private {business_exception_name}(String message) {{",
+                        "            super(message);",
+                        "        }",
+                        "    }",
+                    ]
+                )
+            )
+        helper_block = "\n\n".join(helper_methods)
         return (
             f"package {package_name}.service;\n\n"
             f"{chr(10).join(sorted(imports))}\n\n"
             "@Service\n"
             f"public class {service_name} {{\n\n"
-            f"    private final {repository_name} {repository_var};\n\n"
-            f"    public {service_name}({repository_name} {repository_var}) {{\n"
-            f"        this.{repository_var} = {repository_var};\n"
+            f"{field_block}\n\n"
+            f"    public {service_name}({constructor_args}) {{\n"
+            f"{init_block}\n"
             "    }\n\n"
-            "    @Transactional\n"
             f"    public void {method_name}({method_params}) {{\n"
             f"{method_body}\n"
-            "    }\n"
+            "    }\n\n"
+            f"{helper_block}\n"
             "}\n"
         )
-
-    # ── Conversion helpers ────────────────────────────────────────────────────
 
     async def _convert_procedures(self, procedures: List[Dict[str, Any]],
                                   context: Dict[str, Any]) -> Dict[str, str]:
