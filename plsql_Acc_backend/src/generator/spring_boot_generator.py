@@ -49,7 +49,7 @@ FIXES APPLIED:
              Fix: downgraded to 1.1.4, the last version compatible with both
              Gradle 7.x and all 8.x releases. Also added _generate_gradle_wrapper()
              called from _generate_additional_configs() for Gradle projects, which
-             writes gradle/wrapper/gradle-wrapper.properties pinned to Gradle 8.7
+             writes gradle/wrapper/gradle-wrapper.properties pinned to Gradle 8.8
              so the build is self-contained and version-stable on any machine.
   SBG-23 : Repositories and services written in Stage 5 (generate_project) remain
              incomplete even after Stage 6 (generate_entities) populates _ddl_columns
@@ -1884,7 +1884,7 @@ public class GlobalExceptionHandler {{
     def _generate_gradle_wrapper(self):
         """
         SBG-19 FIX: Write gradle/wrapper/gradle-wrapper.properties pinned to
-        Gradle 8.7, which is the latest release fully compatible with
+        Gradle 8.8, which is the latest release fully compatible with
         io.spring.dependency-management 1.1.4 and Spring Boot 3.2.x.
         This prevents the getDirMode() API breakage introduced in Gradle 8.8.
         """
@@ -1893,7 +1893,7 @@ public class GlobalExceptionHandler {{
         props = (
             "distributionBase=GRADLE_USER_HOME\n"
             "distributionPath=wrapper/dists\n"
-            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.7-bin.zip\n"
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.8-bin.zip\n"
             "networkTimeout=10000\n"
             "validateDistributionUrl=true\n"
             "zipStoreBase=GRADLE_USER_HOME\n"
@@ -1901,7 +1901,7 @@ public class GlobalExceptionHandler {{
         )
         with open(wrapper_dir / 'gradle-wrapper.properties', 'w', encoding='utf-8') as f:
             f.write(props)
-        logger.info("Gradle wrapper properties generated (Gradle 8.7)")
+        logger.info("Gradle wrapper properties generated (Gradle 8.8)")
 
     def _generate_dockerfile(self) -> str:
         return f"""FROM openjdk:{self.java_version}-jdk-slim
