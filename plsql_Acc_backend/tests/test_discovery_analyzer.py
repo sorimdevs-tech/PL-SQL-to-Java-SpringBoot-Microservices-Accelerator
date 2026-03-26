@@ -323,3 +323,30 @@ def test_analyze_sql_source_adds_semantic_analysis_for_reconciliation_flow():
         semantic["intent_summary"]
         == "This procedure performs financial reconciliation using aggregated order and payment data, applies validation rules, performs upsert operations, and uses conditional transaction management with concurrency-safe batch processing."
     )
+
+
+def test_analyze_sql_source_distinguishes_package_body_from_package_spec():
+    sql = """
+    CREATE OR REPLACE PACKAGE emp_pkg AS
+        PROCEDURE add_employee;
+    END emp_pkg;
+    /
+    CREATE OR REPLACE PACKAGE BODY emp_pkg AS
+        PROCEDURE add_employee IS
+        BEGIN
+            INSERT INTO employees (emp_id) VALUES (1);
+        END;
+    END emp_pkg;
+    /
+    """
+
+    results = analyze_sql_source(sql)
+
+    assert len(results) == 2
+    object_types = {item["objectType"] for item in results}
+    assert object_types == {"PACKAGE", "PACKAGE BODY"}
+
+    body = next(item for item in results if item["objectType"] == "PACKAGE BODY")
+    assert "EMPLOYEES" in body["tablesUsed"]
+    assert "INSERT" in body["operations"]
+    assert body["conversionPreview"]["entities"] == ["Employees"]

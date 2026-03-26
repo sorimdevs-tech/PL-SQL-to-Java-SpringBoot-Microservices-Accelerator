@@ -90,6 +90,11 @@ function objectType(label: string): string {
   return match ? match[1].toUpperCase() : ""
 }
 
+function isSelectableDiscoveryObjectType(value: string): boolean {
+  const normalized = value.trim().toUpperCase()
+  return normalized === "PROCEDURE" || normalized === "FUNCTION" || normalized === "PACKAGE" || normalized === "PACKAGE BODY" || normalized === "TRIGGER"
+}
+
 function objectName(label: string): string {
   const namePart = label.replace(/\s*\([^)]+\)\s*$/, "").trim()
   const segments = namePart.split(".")
@@ -456,7 +461,7 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
 
   useEffect(() => {
     const procedureLabels = props.availableObjects.filter(
-      (label) => objectType(label) === "PROCEDURE" || objectType(label) === "FUNCTION",
+      (label) => isSelectableDiscoveryObjectType(objectType(label)),
     )
     props.setAvailableProcedures(procedureLabels)
     if (props.selectedProcedures.length === 0) {
@@ -724,8 +729,8 @@ export function OracleDiscovery(props: OracleDiscoveryProps) {
 
       {activeSelectorStep === 4 ? (
         <DualListSelector
-          title="Stored Procedures"
-          description="Step 4: Choose a procedure to preview analysis."
+          title="Stored Objects"
+          description="Step 4: Choose an object to preview analysis."
           availableItems={props.availableProcedures}
           selectedItems={props.selectedProcedures}
           onSelectedItemsChange={(items) => props.setSelectedProcedures(items.slice(0, 1))}

@@ -517,7 +517,7 @@ def _extract_objects(sql_text: str) -> List[ObjectSlice]:
     for index, match in enumerate(matches):
         start = match.start()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(sql_text)
-        raw_type = match.group(1).upper().replace(" BODY", "")
+        raw_type = " ".join(match.group(1).upper().split())
         name = _normalize_identifier(match.group(2))
         objects.append(ObjectSlice(object_type=raw_type, object_name=name, block_text=sql_text[start:end]))
     return objects

@@ -79,6 +79,46 @@ type SuggestedDependency = {
   coordinate?: string
 }
 
+const SQL_SOURCE_SELECTABLE_OBJECT_TYPES = new Set(["PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TRIGGER"])
+
+function isSqlSourceSelectableObjectType(objectType: string): boolean {
+  return SQL_SOURCE_SELECTABLE_OBJECT_TYPES.has(objectType.trim().toUpperCase())
+}
+
+function uniqueStrings(items: string[]): string[] {
+  return Array.from(new Set(items))
+}
+
+function getSqlSourceSelectableObjectNames(value: SqlDiscoveryAnalyzeResponse): string[] {
+  const namesFromObjects = uniqueStrings(
+    (value.objects ?? [])
+      .filter((item) => isSqlSourceSelectableObjectType(item.objectType))
+      .map((item) => item.procedureName),
+  )
+  if (namesFromObjects.length > 0) {
+    return namesFromObjects
+  }
+  if (isSqlSourceSelectableObjectType(value.objectType) && value.procedureName.trim().length > 0) {
+    return [value.procedureName]
+  }
+  return []
+}
+
+function selectPreferredSqlSourceObject(value: SqlDiscoveryAnalyzeResponse): SqlDiscoveryObject | SqlDiscoveryAnalyzeResponse {
+  const objects = value.objects ?? []
+  if (objects.length === 0) {
+    return value
+  }
+  const priority = ["PROCEDURE", "FUNCTION", "PACKAGE BODY", "PACKAGE", "TRIGGER"]
+  for (const preferredType of priority) {
+    const match = objects.find((item) => item.objectType.trim().toUpperCase() === preferredType)
+    if (match) {
+      return match
+    }
+  }
+  return objects[0]
+}
+
 interface ConnectPanelProps {
   sourceMethod: SourceMethod
   setSourceMethod: (method: SourceMethod) => void
@@ -1217,24 +1257,17 @@ function SqlSourceDiscovery(props: {
             props.setSuggestedDependencies([])
           }
         }
-        const objectNames = (analyzed.objects ?? []).map(
-          (item) => `${item.procedureName} (${item.objectType})`,
-        )
-        const procedureNames = (analyzed.objects ?? [])
-          .filter((item) => item.objectType.toUpperCase() === "PROCEDURE")
-          .map((item) => item.procedureName)
+        const objectNames = uniqueStrings((analyzed.objects ?? []).map((item) => `${item.procedureName} (${item.objectType})`))
+        const selectedObjectNames = getSqlSourceSelectableObjectNames(analyzed)
 
         if (!isCancelled) {
           setAnalysis(analyzed)
-          const defaultObject =
-            (analyzed.objects ?? []).find((item) => item.objectType.toUpperCase() === "PROCEDURE") ??
-            (analyzed.objects ?? [])[0] ??
-            analyzed
+          const defaultObject = selectPreferredSqlSourceObject(analyzed)
           setSelectedObjectKey(`${defaultObject.objectType}::${defaultObject.procedureName}`)
           props.setAvailableObjects(objectNames)
           props.setSelectedObjects(objectNames)
-          props.setAvailableProcedures(procedureNames)
-          props.setSelectedProcedures(procedureNames)
+          props.setAvailableProcedures(selectedObjectNames)
+          props.setSelectedProcedures(selectedObjectNames)
           setError(null)
         }
       } catch (requestError) {
@@ -1341,23 +1374,16 @@ function SqlSourceDiscovery(props: {
             props.setSuggestedDependencies([])
           }
         }
-        const objectNames = (analyzed.objects ?? []).map(
-          (item) => `${item.procedureName} (${item.objectType})`,
-        )
-        const procedureNames = (analyzed.objects ?? [])
-          .filter((item) => item.objectType.toUpperCase() === "PROCEDURE")
-          .map((item) => item.procedureName)
+        const objectNames = uniqueStrings((analyzed.objects ?? []).map((item) => `${item.procedureName} (${item.objectType})`))
+        const selectedObjectNames = getSqlSourceSelectableObjectNames(analyzed)
         if (!isCancelled) {
           setAnalysis(analyzed)
-          const defaultObject =
-            (analyzed.objects ?? []).find((item) => item.objectType.toUpperCase() === "PROCEDURE") ??
-            (analyzed.objects ?? [])[0] ??
-            analyzed
+          const defaultObject = selectPreferredSqlSourceObject(analyzed)
           setSelectedObjectKey(`${defaultObject.objectType}::${defaultObject.procedureName}`)
           props.setAvailableObjects(objectNames)
           props.setSelectedObjects(objectNames)
-          props.setAvailableProcedures(procedureNames)
-          props.setSelectedProcedures(procedureNames)
+          props.setAvailableProcedures(selectedObjectNames)
+          props.setSelectedProcedures(selectedObjectNames)
           setError(null)
         }
       } catch (requestError) {
@@ -1537,7 +1563,7 @@ function SqlSourceDiscovery(props: {
             <Card>
               <CardHeader>
                 <CardTitle>Active Object</CardTitle>
-                <CardDescription>Select which procedure/function drives the schema view.</CardDescription>
+                <CardDescription>Select which object drives the schema view.</CardDescription>
               </CardHeader>
               <CardContent>
                 <div className="flex flex-wrap items-center gap-3">
