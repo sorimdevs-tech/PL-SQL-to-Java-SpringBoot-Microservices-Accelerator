@@ -517,9 +517,94 @@ def test_direct_select_function_returns_lookup_value():
     services = _generate_services_from_payload(source_units, entities, repositories)
     code = services["GetCustomerNameService.java"]
     assert "public String getCustomerName(" in code
-    assert ".findByCustomerId(" in code
+    assert ".findByCustomerId(customerId)" in code
     assert "return found.map(XyCustomerEntity::getCustomerName).orElse(null);" in code
     assert "findAll(PageRequest.of(0, size))" not in code
+
+
+def test_direct_select_infers_lookup_keys_when_missing():
+    source_units = [
+        {
+            "name": "get_customer_name",
+            "object_type": "FUNCTION",
+            "raw_plsql": """
+                CREATE OR REPLACE FUNCTION get_customer_name(p_customer_id IN NUMBER) RETURN VARCHAR2 IS
+                BEGIN
+                  RETURN NULL;
+                END;
+            """,
+            "operations_by_table": {"XY_CUSTOMER": ["SELECT"]},
+            "driving_table": "XY_CUSTOMER",
+            "target_tables": [],
+            "lookup_keys": {},
+            "bulk_operations": [],
+            "cursor": {},
+            "transaction": {},
+            "input_parameters": [{"name": "p_customer_id", "type": "NUMBER", "direction": "IN"}],
+            "semantic_analysis": {},
+        }
+    ]
+    entities = {
+        "XyCustomerEntity.java": """
+            public class XyCustomerEntity {
+                private Long customerId;
+                private String customerName;
+                public String getCustomerName() { return customerName; }
+            }
+        """
+    }
+    repositories = {
+        "XyCustomerRepository.java": """
+            public interface XyCustomerRepository extends org.springframework.data.jpa.repository.JpaRepository<XyCustomerEntity, Long> {
+                java.util.Optional<XyCustomerEntity> findByCustomerId(Long customerId);
+            }
+        """
+    }
+
+    services = _generate_services_from_payload(source_units, entities, repositories)
+    code = services["GetCustomerNameService.java"]
+    assert ".findByCustomerId(customerId)" in code
+    assert "return found.map(XyCustomerEntity::getCustomerName).orElse(null);" in code
+
+
+def test_direct_aggregation_only_skips_findby_in_service():
+    source_units = [
+        {
+            "name": "view_items",
+            "object_type": "PROCEDURE",
+            "raw_plsql": "SELECT COUNT(*) INTO v_count FROM book WHERE bookid = p_item_id;",
+            "operations_by_table": {"BOOK": ["SELECT"]},
+            "driving_table": "BOOK",
+            "target_tables": [],
+            "lookup_keys": {"BOOK": ["BOOKID"]},
+            "bulk_operations": [],
+            "cursor": {},
+            "transaction": {},
+            "input_parameters": [{"name": "p_item_id", "type": "NUMBER", "direction": "IN"}],
+            "semantic_analysis": {"aggregation": {"columns": ["book.amount"]}},
+        }
+    ]
+    entities = {
+        "BookEntity.java": """
+            public class BookEntity {
+                private Long bookid;
+                private java.math.BigDecimal amount;
+            }
+        """
+    }
+    repositories = {
+        "BookRepository.java": """
+            public interface BookRepository extends org.springframework.data.jpa.repository.JpaRepository<BookEntity, Long> {
+                java.math.BigDecimal sumByBookid(Long bookid);
+                java.util.Optional<BookEntity> findByBookid(Long bookid);
+            }
+        """
+    }
+
+    services = _generate_services_from_payload(source_units, entities, repositories)
+    code = services["ViewItemsService.java"]
+    assert "bookRepository.sumByBookid(itemId)" in code
+    assert "bookRepository.findByBookid(" not in code
 
 
 def test_direct_delete_prefers_custom_delete_method():

@@ -121,7 +121,11 @@ class PipelineValidationEngine:
                 )
                 continue
             method_name = self._service_method_for_unit(unit)
-            if not re.search(rf"\bpublic\s+void\s+{re.escape(method_name)}\s*\(", service_code):
+            method_pattern = re.compile(
+                rf"\bpublic\s+(?:static\s+)?[\w<>\[\], ?]+\s+{re.escape(method_name)}\s*\(",
+                flags=re.IGNORECASE,
+            )
+            if not method_pattern.search(service_code):
                 issues.append(
                     PipelineIssue(
                         component="service",

@@ -158,7 +158,12 @@ import logging
 
 from ..utils.logger import get_logger
 from ..utils.config import get_config_value
-from ..utils.naming import normalize_column_name, to_pascal_case
+from ..utils.naming import (
+    is_java_reserved_identifier,
+    make_java_safe_identifier,
+    normalize_column_name,
+    to_pascal_case,
+)
 
 logger = get_logger(__name__)
 
@@ -1325,7 +1330,20 @@ app.build-time={self._get_current_time()}
                     self._ddl_columns[base.upper()] = \
                         self._extract_columns_from_entity_code(code)
 
-        for filename, code in java_code.items():
+        def _write_priority(item: Tuple[str, str]) -> int:
+            name, source = item
+            detected_type_name = self._extract_type_name(source)
+            detected_filename = f"{detected_type_name}.java" if detected_type_name else name
+            detected_type = self._classify_java_file(detected_filename, source)
+            order = {
+                'entity': 0,
+                'repository': 1,
+                'service': 2,
+                'controller': 3,
+            }
+            return order.get(detected_type, 9)
+
+        for filename, code in sorted(java_code.items(), key=_write_priority):
             type_name = self._extract_type_name(code)
             if (type_name in {'JpaRepository', 'CrudRepository'}
                     or filename.lower() in {'jparepository.java', 'crudrepository.java'}):
@@ -1346,6 +1364,8 @@ app.build-time={self._get_current_time()}
                     self._existing_repositories.add(repo_interface)
             elif file_type == 'entity':
                 payload = self._normalize_entity_code(target_filename, code)
+            elif file_type == 'service':
+                payload = self._normalize_service_code(target_filename, code)
             elif file_type == 'controller':
                 payload = self._normalize_controller_code(target_filename, code)
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -2038,8 +2058,104 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
             return value
         return value[0].upper() + value[1:]
 
+    def _safe_method_identifier(
+        self,
+        method_name: str,
+        method_context: str,
+        existing: Optional[Set[str]] = None,
+    ) -> str:
+        suffix = "Service" if method_context == "service" else "Method"
+        return make_java_safe_identifier(method_name, suffix=suffix, existing=existing)
+
+    def _sanitize_reserved_method_names(self, body: str, method_context: str) -> str:
+        """
+        Rename Java-keyword method identifiers (e.g. `assert`) to safe names.
+        `service` context uses a `Service` suffix; controller context uses `Method`.
+        """
+        if not body:
+            return body
+
+        method_decl_pat = re.compile(
+            r'(?m)^(\s*(?:public|protected|private)\s+'
+            r'(?:(?:static|final|synchronized|abstract|native|strictfp)\s+)*'
+            r'(?:<[^>\n]+>\s*)?[\w\[\]<>., ?@]+\s+)'
+            r'([A-Za-z_]\w*)(\s*\()'
+        )
+
+        declared_names = [match.group(2) for match in method_decl_pat.finditer(body)]
+        rename_map: Dict[str, str] = {}
+        taken_names = set(declared_names)
+
+        for method_name in sorted(set(declared_names)):
+            if not is_java_reserved_identifier(method_name):
+                continue
+            new_name = self._safe_method_identifier(
+                method_name,
+                method_context=method_context,
+                existing=taken_names | set(rename_map.values()),
+            )
+            rename_map[method_name] = new_name
+            taken_names.add(new_name)
+
+        if rename_map:
+            def _replace_method_decl(match: re.Match) -> str:
+                prefix, method_name, opening = match.groups()
+                return f"{prefix}{rename_map.get(method_name, method_name)}{opening}"
+
+            body = method_decl_pat.sub(_replace_method_decl, body)
+
+            for old_name, new_name in rename_map.items():
+                # Update both local calls (foo()) and qualified calls (obj.foo()).
+                body = re.sub(
+                    r'(?<![\w$.])' + re.escape(old_name) + r'(\s*\()',
+                    new_name + r'\1',
+                    body,
+                )
+                body = re.sub(
+                    r'(\.\s*)' + re.escape(old_name) + r'(\s*\()',
+                    r'\1' + new_name + r'\2',
+                    body,
+                )
+                body = re.sub(
+                    r'::\s*' + re.escape(old_name) + r'\b',
+                    f'::{new_name}',
+                    body,
+                )
+
+            logger.info(
+                "Renamed reserved %s method names: %s",
+                method_context,
+                ", ".join(f"{old}->{new}" for old, new in rename_map.items()),
+            )
+
+        # Controllers may call service methods directly; align reserved call names
+        # with the service sanitization convention (keyword + "Service").
+        if method_context == "controller":
+            qualified_call_pat = re.compile(r'(\.\s*)([A-Za-z_]\w*)(\s*\()')
+
+            def _replace_qualified_keyword_call(match: re.Match) -> str:
+                prefix, method_name, opening = match.groups()
+                if not is_java_reserved_identifier(method_name):
+                    return match.group(0)
+                safe_name = self._safe_method_identifier(method_name, "service")
+                return f"{prefix}{safe_name}{opening}"
+
+            body = qualified_call_pat.sub(_replace_qualified_keyword_call, body)
+
+        return body
+
     def _to_lower_camel_case(self, value: str) -> str:
         return normalize_column_name(value)
+
+    def _uses_optional_symbol(self, source: str) -> bool:
+        """
+        Detect bare Optional usage that requires `import java.util.Optional;`.
+        Matches Optional<...>, Optional.foo(...), Optional(...), but ignores
+        fully-qualified `java.util.Optional`.
+        """
+        if not source:
+            return False
+        return bool(re.search(r'(?<![\w.])Optional\s*(?:<|\.|\()', source))
 
     def _is_numeric_type(self, sql_type: str) -> bool:
         normalized = (sql_type or "").upper()
@@ -2473,7 +2589,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.time.LocalTime;')
         if 'List<' in code:
             import_lines.append('import java.util.List;')
-        if 'Optional<' in code:
+        if self._uses_optional_symbol(code):
             import_lines.append('import java.util.Optional;')
         if 'Page<' in code:
             import_lines.append('import org.springframework.data.domain.Page;')
@@ -2650,6 +2766,10 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         body = self._rewrite_missing_entity_accessors(body, entity_names)
         # Prefer actual custom repository methods over generic demo CRUD examples.
         body = self._rewrite_generic_crud_examples_to_repo_methods(body, entity_names, repository_names)
+        # Enforce call-site argument type compatibility with real entity/repository signatures.
+        body = self._align_service_call_argument_types(body, repository_names)
+        # Ensure generated service methods never use Java reserved identifiers.
+        body = self._sanitize_reserved_method_names(body, method_context="service")
 
         if 'LocalDateTime' in body:
             import_lines.append('import java.time.LocalDateTime;')
@@ -2659,7 +2779,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.time.LocalTime;')
         if 'List<' in body:
             import_lines.append('import java.util.List;')
-        if 'Optional<' in body:
+        if self._uses_optional_symbol(body):
             import_lines.append('import java.util.Optional;')
         if 'Page<' in body:
             import_lines.append('import org.springframework.data.domain.Page;')
@@ -2845,13 +2965,274 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             src = repo_file.read_text(encoding='utf-8', errors='replace')
         except Exception:
             return []
-        m = re.search(r'(?:void|int|\w+)\s+' + re.escape(method_name) + r'\s*\(([^;]+)\)\s*;', src, re.DOTALL)
+        m = re.search(
+            r'(?:public\s+)?(?:default\s+)?[A-Za-z_][\w.<>\[\]]*\s+'
+            + re.escape(method_name)
+            + r'\s*\(([^;]*)\)\s*;',
+            src,
+            re.DOTALL,
+        )
         if not m:
             return []
-        params = []
-        for param_match in re.finditer(r'@Param\("(\w+)"\)\s+([A-Za-z_][\w.<>\[\]]*)\s+([A-Za-z_]\w*)', m.group(1)):
-            params.append((param_match.group(1), param_match.group(2)))
+        params: List[Tuple[str, str]] = []
+        param_block = m.group(1).strip()
+        if not param_block:
+            return params
+
+        for raw_param in self._split_java_arguments(param_block):
+            chunk = raw_param.strip()
+            if not chunk:
+                continue
+
+            declared_name = ""
+            named_match = re.search(r'@Param\("(\w+)"\)', chunk)
+            if named_match:
+                declared_name = named_match.group(1)
+
+            chunk = re.sub(r'@\w+(?:\([^)]*\))?\s*', '', chunk)
+            chunk = re.sub(r'\bfinal\s+', '', chunk).strip()
+            match = re.search(r'([A-Za-z_][\w.<>\[\]]*(?:\.\.\.)?)\s+([A-Za-z_]\w*)$', chunk)
+            if not match:
+                continue
+
+            java_type = match.group(1).replace('...', '[]')
+            java_name = match.group(2)
+            params.append((declared_name or java_name, java_type))
+
         return params
+
+    def _split_java_arguments(self, args_block: str) -> List[str]:
+        """Split a Java argument/parameter list while respecting nested delimiters."""
+        if not args_block:
+            return []
+
+        items: List[str] = []
+        current: List[str] = []
+        round_depth = 0
+        angle_depth = 0
+        square_depth = 0
+        curly_depth = 0
+
+        for ch in args_block:
+            if ch == ',' and all(depth == 0 for depth in (round_depth, angle_depth, square_depth, curly_depth)):
+                token = ''.join(current).strip()
+                if token:
+                    items.append(token)
+                current = []
+                continue
+
+            current.append(ch)
+            if ch == '(':
+                round_depth += 1
+            elif ch == ')':
+                round_depth = max(0, round_depth - 1)
+            elif ch == '<':
+                angle_depth += 1
+            elif ch == '>':
+                angle_depth = max(0, angle_depth - 1)
+            elif ch == '[':
+                square_depth += 1
+            elif ch == ']':
+                square_depth = max(0, square_depth - 1)
+            elif ch == '{':
+                curly_depth += 1
+            elif ch == '}':
+                curly_depth = max(0, curly_depth - 1)
+
+        tail = ''.join(current).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _simple_java_type(self, java_type: str) -> str:
+        value = (java_type or '').strip()
+        if not value:
+            return ''
+        value = re.sub(r'\bfinal\s+', '', value).strip()
+        value = value.replace('...', '[]')
+        if '<' in value:
+            value = value.split('<', 1)[0]
+        value = value.replace('[]', '')
+        return value.split('.')[-1]
+
+    def _extract_declared_variable_types(self, body: str) -> Dict[str, str]:
+        """Collect declared field/local/method-parameter Java types by variable name."""
+        declared: Dict[str, str] = {}
+
+        # Fields and local variables.
+        var_pat = re.compile(
+            r'(?m)^\s*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*'
+            r'([A-Za-z_][\w.<>\[\]]*(?:\.\.\.)?)\s+([A-Za-z_]\w*)\s*(?:=|;)'
+        )
+        for match in var_pat.finditer(body):
+            declared[match.group(2)] = match.group(1).replace('...', '[]')
+
+        # Method parameters.
+        method_pat = re.compile(
+            r'(?:public|private|protected)\s+[A-Za-z_][\w.<>\[\]]*\s+\w+\s*\(([^)]*)\)',
+            re.DOTALL,
+        )
+        for method in method_pat.finditer(body):
+            for raw_param in self._split_java_arguments(method.group(1)):
+                param = re.sub(r'@\w+(?:\([^)]*\))?\s*', '', raw_param)
+                param = re.sub(r'\bfinal\s+', '', param).strip()
+                param_match = re.search(r'([A-Za-z_][\w.<>\[\]]*(?:\.\.\.)?)\s+([A-Za-z_]\w*)$', param)
+                if not param_match:
+                    continue
+                declared[param_match.group(2)] = param_match.group(1).replace('...', '[]')
+
+        return declared
+
+    def _infer_expression_type(self, expression: str, declared_types: Dict[str, str]) -> Optional[str]:
+        expr = (expression or '').strip()
+        if not expr:
+            return None
+
+        if re.match(r'^[A-Za-z_]\w*$', expr):
+            return declared_types.get(expr)
+        if re.match(r'^".*"$', expr) or re.match(r"^'.'$", expr):
+            return 'String'
+        if re.match(r'^\d+L$', expr):
+            return 'Long'
+        if re.match(r'^\d+$', expr):
+            return 'Integer'
+        if re.match(r'^\d+\.\d+$', expr):
+            return 'Double'
+        if expr in {'true', 'false'}:
+            return 'Boolean'
+        if expr.startswith('BigDecimal.') or expr.startswith('new BigDecimal('):
+            return 'BigDecimal'
+        if expr.endswith('.toString()'):
+            return 'String'
+        if expr.endswith('.longValue()'):
+            return 'Long'
+        return None
+
+    def _java_types_compatible(self, actual_type: str, expected_type: str) -> bool:
+        actual = self._simple_java_type(actual_type)
+        expected = self._simple_java_type(expected_type)
+        if not actual or not expected:
+            return True
+        if actual == expected:
+            return True
+
+        equivalent_groups = (
+            {'Long', 'long'},
+            {'Integer', 'int'},
+            {'Double', 'double'},
+            {'Float', 'float'},
+            {'Boolean', 'boolean'},
+        )
+        return any(actual in group and expected in group for group in equivalent_groups)
+
+    def _coerce_expression_to_type(self, expression: str, actual_type: str, expected_type: str) -> Optional[str]:
+        actual = self._simple_java_type(actual_type)
+        expected = self._simple_java_type(expected_type)
+        expr = expression.strip()
+        if not actual or not expected or actual == expected:
+            return None
+
+        primitive_numbers = {'long', 'int', 'double', 'float', 'short', 'byte'}
+
+        if expected == 'BigDecimal':
+            if actual in {'Long', 'long', 'Integer', 'int'}:
+                if actual in primitive_numbers:
+                    return f'BigDecimal.valueOf({expr})'
+                return f'({expr} == null ? null : BigDecimal.valueOf({expr}))'
+            if actual in {'Double', 'double', 'Float', 'float'}:
+                if actual in primitive_numbers:
+                    return f'BigDecimal.valueOf({expr})'
+                return f'({expr} == null ? null : BigDecimal.valueOf({expr}.doubleValue()))'
+            if actual == 'String':
+                return f'({expr} == null ? null : new BigDecimal({expr}))'
+
+        if expected == 'String':
+            if actual in {'Long', 'long', 'Integer', 'int', 'Double', 'double', 'Float', 'float', 'Boolean', 'boolean', 'BigDecimal'}:
+                if actual in primitive_numbers | {'boolean'}:
+                    return f'String.valueOf({expr})'
+                return f'({expr} == null ? null : String.valueOf({expr}))'
+
+        if expected in {'Long', 'long'}:
+            if actual == 'BigDecimal':
+                return f'({expr} == null ? null : {expr}.longValue())'
+            if actual in {'Integer', 'int', 'Short', 'short', 'Byte', 'byte'}:
+                if actual in primitive_numbers:
+                    return f'Long.valueOf({expr})'
+                return f'({expr} == null ? null : {expr}.longValue())'
+            if actual == 'String':
+                return f'({expr} == null ? null : Long.valueOf({expr}))'
+
+        return None
+
+    def _align_service_call_argument_types(self, body: str, repository_names: List[str]) -> str:
+        """
+        Coerce mismatched call arguments so service code matches actual
+        repository/entity method signatures (e.g. Long -> BigDecimal, Long -> String).
+        """
+        declared_types = self._extract_declared_variable_types(body)
+        for repo_name in repository_names:
+            repo_var = self._lower_first(repo_name)
+            declared_types.setdefault(repo_var, repo_name)
+
+        entity_field_cache: Dict[str, Dict[str, str]] = {}
+
+        def _field_types_for(entity_type: str) -> Dict[str, str]:
+            key = self._simple_java_type(entity_type)
+            if key not in entity_field_cache:
+                entity_field_cache[key] = self._get_entity_field_types(key)
+            return entity_field_cache.get(key, {})
+
+        call_pat = re.compile(
+            r'(\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\()([^;]*?)(\)\s*;)',
+            re.DOTALL,
+        )
+
+        def _rewrite_call(match: re.Match) -> str:
+            target_var = match.group(2)
+            method_name = match.group(3)
+            args_block = match.group(4)
+            args = self._split_java_arguments(args_block)
+            if not args:
+                return match.group(0)
+
+            target_type = declared_types.get(target_var, '')
+            expected_types: List[str] = []
+            simple_target_type = self._simple_java_type(target_type)
+
+            if simple_target_type.endswith('Entity') and method_name.startswith('set') and len(args) == 1:
+                setter_field = self._lower_first(method_name[3:])
+                field_types = _field_types_for(simple_target_type)
+                expected = field_types.get(setter_field)
+                if expected:
+                    expected_types = [expected]
+            elif simple_target_type.endswith('Repository'):
+                signature = self._get_repo_method_signature(simple_target_type, method_name)
+                expected_types = [java_type for _, java_type in signature]
+
+            if not expected_types:
+                return match.group(0)
+
+            rewrote = False
+            max_index = min(len(args), len(expected_types))
+            for idx in range(max_index):
+                arg_expr = args[idx].strip()
+                expected_type = expected_types[idx]
+                actual_type = self._infer_expression_type(arg_expr, declared_types)
+                if not actual_type:
+                    continue
+                if self._java_types_compatible(actual_type, expected_type):
+                    continue
+                coerced = self._coerce_expression_to_type(arg_expr, actual_type, expected_type)
+                if not coerced:
+                    continue
+                args[idx] = coerced
+                rewrote = True
+
+            if not rewrote:
+                return match.group(0)
+            return match.group(1) + ', '.join(args) + match.group(5)
+
+        return call_pat.sub(_rewrite_call, body)
 
     def _get_entity_field_types(self, entity_name: str) -> Dict[str, str]:
         """Read entity field types from the on-disk entity source."""
@@ -3170,6 +3551,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             and not line.strip().startswith('import ')
         ]
         body = '\n'.join(body_lines).strip()
+        body = self._sanitize_reserved_method_names(body, method_context="controller")
 
         import_lines = [
             'import org.springframework.web.bind.annotation.*;',
@@ -3199,7 +3581,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.time.LocalDate;')
         if 'LocalTime' in code:
             import_lines.append('import java.time.LocalTime;')  
-        if 'Optional<' in code:
+        if self._uses_optional_symbol(code):
             import_lines.append('import java.util.Optional;')
 
         import_lines = list(dict.fromkeys(import_lines))
@@ -3250,7 +3632,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.List;')
         if 'Collection<' in code:
             import_lines.append('import java.util.Collection;')
-        if 'Optional<' in code:
+        if self._uses_optional_symbol(code):
             import_lines.append('import java.util.Optional;')
         if 'LocalDateTime' in code:
             import_lines.append('import java.time.LocalDateTime;')
@@ -3323,7 +3705,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.Collection;')
         if 'List<' in body and 'import java.util.List;' not in import_lines:
             import_lines.append('import java.util.List;')
-        if 'Optional<' in body and 'import java.util.Optional;' not in import_lines:
+        if self._uses_optional_symbol(body) and 'import java.util.Optional;' not in import_lines:
             import_lines.append('import java.util.Optional;')
         if 'LocalDateTime' in body and 'import java.time.LocalDateTime;' not in import_lines:
             import_lines.append('import java.time.LocalDateTime;')

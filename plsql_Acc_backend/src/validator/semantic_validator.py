@@ -615,7 +615,15 @@ class SemanticValidator:
                         file_name=service_filename,
                     )
                 )
-            if transaction.get("has_savepoint") or has_exception_block:
+            has_bulk_collect = any(
+                str(item.get("type", "")).upper() == "BULK_COLLECT"
+                for item in (unit.get("bulk_operations") or [])
+            )
+            has_cursor_workflow = bool(cursor)
+            requires_row_level_try = bool(transaction.get("has_savepoint")) or (
+                has_exception_block and (has_bulk_collect or has_cursor_workflow)
+            )
+            if requires_row_level_try:
                 row_level_try_pattern = re.compile(
                     r"\b(for|while)\s*\([^\)]*\)\s*\{[\s\S]*?\btry\s*\{[\s\S]*?\}\s*catch\s*\(\s*Exception[^\)]*\)\s*\{[\s\S]*?\bcontinue\s*;",
                     flags=re.IGNORECASE,
@@ -627,6 +635,21 @@ class SemanticValidator:
                             object_name=object_name,
                             code="missing_row_level_try_catch",
                             message=f"{service_filename} must preserve SAVEPOINT/EXCEPTION semantics with row-level try/catch + continue",
+                            file_name=service_filename,
+                        )
+                    )
+            elif has_exception_block:
+                try_catch_pattern = re.compile(
+                    r"\btry\s*\{[\s\S]*?\}\s*catch\s*\(\s*Exception[^\)]*\)\s*\{",
+                    flags=re.IGNORECASE,
+                )
+                if not try_catch_pattern.search(service_code):
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="missing_exception_fallback",
+                            message=f"{service_filename} must preserve EXCEPTION fallback semantics with try/catch",
                             file_name=service_filename,
                         )
                     )

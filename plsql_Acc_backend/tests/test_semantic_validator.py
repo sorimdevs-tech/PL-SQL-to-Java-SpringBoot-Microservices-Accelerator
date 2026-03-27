@@ -184,3 +184,55 @@ def test_semantic_validator_flags_findall_misuse_for_bulk_collect():
     issue_codes = {issue.code for issue in report.issues}
     assert "findall_misuse" in issue_codes
     assert "bulk_collect_not_preserved" in issue_codes
+
+
+def test_semantic_validator_requires_generic_try_catch_for_non_iterative_exception_blocks():
+    validator = SemanticValidator("com.company.project")
+    source_units = [
+        {
+            "name": "login_customer",
+            "object_type": "PROCEDURE",
+            "raw_plsql": """
+                CREATE OR REPLACE PROCEDURE login_customer(p_user IN VARCHAR2) IS
+                BEGIN
+                  NULL;
+                EXCEPTION
+                  WHEN NO_DATA_FOUND THEN NULL;
+                END;
+            """,
+            "tables_used": ["CUSTOMER"],
+            "operations_by_table": {"CUSTOMER": ["SELECT"]},
+            "lookup_keys": {"CUSTOMER": ["USERNAME"]},
+            "bulk_operations": [],
+            "cursor": {},
+            "transaction": {"has_savepoint": False},
+            "input_parameters": [{"name": "p_user", "type": "VARCHAR2"}],
+        }
+    ]
+    entities = {"CustomerEntity.java": "public class CustomerEntity { private String username; }"}
+    repositories = {
+        "CustomerRepository.java": """
+            import org.springframework.data.jpa.repository.JpaRepository;
+            public interface CustomerRepository extends JpaRepository<CustomerEntity, Long> {
+                java.util.Optional<CustomerEntity> findByUsername(String username);
+            }
+        """
+    }
+    services = {
+        "LoginCustomerService.java": """
+            package com.company.project.service;
+            import org.springframework.stereotype.Service;
+            @Service
+            public class LoginCustomerService {
+                private CustomerRepository customerRepository;
+                public void loginCustomer(String user) {
+                    customerRepository.findByUsername(user);
+                }
+            }
+        """
+    }
+
+    report = validator.validate(source_units, entities, repositories, services)
+    issue_codes = {issue.code for issue in report.issues}
+    assert "missing_exception_fallback" in issue_codes
+    assert "missing_row_level_try_catch" not in issue_codes

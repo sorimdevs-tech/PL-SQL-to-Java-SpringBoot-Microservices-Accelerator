@@ -1176,6 +1176,45 @@ class PLSQLModernizationPipeline:
                 candidates.append(str(path.relative_to(project_root)).replace('\\', '/'))
         return candidates
 
+    def _enforce_repair_java_imports(self, rel_path: str, content: str) -> str:
+        """Apply compile-focused import guardrails to repaired Java files."""
+        if not isinstance(rel_path, str) or not rel_path.lower().endswith('.java'):
+            return content
+
+        normalized_path = rel_path.replace('\\', '/').lower()
+        filename = normalized_path.rsplit('/', 1)[-1]
+        looks_like_service = '/service/' in normalized_path or filename.endswith('service.java')
+        if not looks_like_service:
+            return content
+
+        # We only need import when bare Optional is referenced.
+        uses_bare_optional = bool(re.search(r'(?<![\w.])Optional\s*(?:<|\.|\()', content))
+        has_optional_import = bool(re.search(r'(?m)^\s*import\s+java\.util\.Optional\s*;\s*$', content))
+        if not uses_bare_optional or has_optional_import:
+            return content
+
+        lines = content.splitlines()
+        package_idx = next((i for i, line in enumerate(lines) if line.strip().startswith('package ')), None)
+        import_indices = [i for i, line in enumerate(lines) if line.strip().startswith('import ')]
+
+        if import_indices:
+            insert_idx = import_indices[-1] + 1
+            lines.insert(insert_idx, 'import java.util.Optional;')
+        elif package_idx is not None:
+            insert_idx = package_idx + 1
+            lines.insert(insert_idx, '')
+            lines.insert(insert_idx + 1, 'import java.util.Optional;')
+            if insert_idx + 2 >= len(lines) or lines[insert_idx + 2].strip():
+                lines.insert(insert_idx + 2, '')
+        else:
+            lines.insert(0, 'import java.util.Optional;')
+            lines.insert(1, '')
+
+        normalized = '\n'.join(lines)
+        if content.endswith('\n'):
+            normalized += '\n'
+        return normalized
+
     def _apply_repair_files(self, project_root: Path, files: List[Dict[str, str]]) -> List[str]:
         changed = []
         for item in files or []:
@@ -1189,6 +1228,7 @@ class PLSQLModernizationPipeline:
             except ValueError:
                 logger.warning("Skipping repair write outside project root: %s", rel_path)
                 continue
+            content = self._enforce_repair_java_imports(rel_path, content)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(content, encoding='utf-8')
             changed.append(str(target_path.relative_to(project_root)).replace('\\', '/'))

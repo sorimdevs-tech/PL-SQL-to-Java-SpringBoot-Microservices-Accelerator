@@ -1097,6 +1097,7 @@ class LLMConversionEngine:
         driving_fields: Dict[str, str],
         param_name_map: Dict[str, str],
         expected_type: str,
+        param_specs: Optional[List[Dict[str, str]]] = None,
         prebound_var: Optional[str] = None,
         prebound_column: Optional[str] = None,
     ) -> str:
@@ -1113,6 +1114,11 @@ class LLMConversionEngine:
         mapped_param = param_name_map.get(str(column_name).upper()) or param_name_map.get(normalized_column.upper())
         if mapped_param:
             return mapped_param
+
+        if param_specs:
+            inferred = self._best_param_for_field(column_name, param_specs, expected_type)
+            if inferred and inferred.get("java_name"):
+                return str(inferred["java_name"])
 
         return self._default_java_literal_for_type(expected_type)
 
@@ -1170,23 +1176,39 @@ class LLMConversionEngine:
         self,
         field_name: str,
         param_specs: List[Dict[str, str]],
+        expected_type: str = "",
     ) -> Optional[Dict[str, str]]:
         field_token = self._canonical_name_token(field_name)
         if not field_token:
             return None
-        exact_match: Optional[Dict[str, str]] = None
-        fuzzy_match: Optional[Dict[str, str]] = None
+
+        best_spec: Optional[Dict[str, str]] = None
+        best_score = -1
+        field_base = field_token[:-2] if field_token.endswith("id") else field_token
         for spec in param_specs:
             token = str(spec.get("token", "")).lower()
             if not token:
                 continue
+            if expected_type and not self._types_compatible(str(spec.get("java_type", "")), expected_type):
+                continue
+
+            score = -1
             if token == field_token:
-                exact_match = spec
-                break
-            if token.endswith(field_token) or field_token.endswith(token):
-                if fuzzy_match is None:
-                    fuzzy_match = spec
-        return exact_match or fuzzy_match
+                score = 100
+            elif token.endswith(field_token) or field_token.endswith(token):
+                score = 85
+            else:
+                token_base = token[:-2] if token.endswith("id") else token
+                if field_base and token_base and (field_base in token_base or token_base in field_base):
+                    score = 70
+                elif field_token.endswith("id") and token.endswith("id"):
+                    # Generic ID fallback when no exact semantic key is available.
+                    score = 40
+
+            if score > best_score:
+                best_score = score
+                best_spec = spec
+        return best_spec if best_score > 0 else None
 
     def _build_target_population_lines(
         self,
@@ -1744,7 +1766,22 @@ class LLMConversionEngine:
             java_type = spec["java_type"]
             raw_name = spec["raw_name"]
             params.append(f"{java_type} {param_name}")
-            name_map[raw_name.upper()] = param_name
+            normalized_raw = normalize_column_name(raw_name)
+            canonical_token = self._canonical_name_token(raw_name)
+            keys = {
+                raw_name.upper(),
+                normalized_raw.upper(),
+                canonical_token.upper() if canonical_token else "",
+                normalize_column_name(param_name).upper(),
+            }
+            # Map "p_customer_id" -> "CUSTOMER_ID" style lookups dynamically.
+            stripped = re.sub(r"^(?:p|v|l|aux|tmp)_*", "", str(raw_name), flags=re.IGNORECASE)
+            if stripped:
+                keys.add(stripped.upper())
+                keys.add(normalize_column_name(stripped).upper())
+            for key in keys:
+                if key:
+                    name_map[key] = param_name
         return ", ".join(params), name_map
 
     def _derive_primary_table(self, unit: Dict[str, Any]) -> str:
@@ -1879,6 +1916,39 @@ class LLMConversionEngine:
             if self._repository_has_method(repository_code, candidate):
                 return candidate
         return ""
+
+    def _infer_lookup_keys_from_repository(
+        self,
+        repository_code: str,
+        parameter_specs: List[Dict[str, str]],
+        table_fields: Dict[str, str],
+    ) -> List[str]:
+        candidates = re.findall(r"\bfindBy([A-Za-z0-9_]+)\s*\(", repository_code or "")
+        best_keys: List[str] = []
+        best_score = -1
+        for suffix in candidates:
+            parts = [part for part in re.split(r"And", suffix) if part]
+            if not parts:
+                continue
+            resolved_keys: List[str] = []
+            score = 0
+            valid = True
+            for part in parts:
+                key_name = normalize_column_name(part)
+                expected_type = self._resolve_lookup_key_type(key_name, table_fields)
+                param_spec = self._best_param_for_field(key_name, parameter_specs, expected_type)
+                if not param_spec:
+                    valid = False
+                    break
+                sql_key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(part)).upper()
+                resolved_keys.append(sql_key)
+                score += 10
+                if str(param_spec.get("token", "")).lower() == self._canonical_name_token(key_name):
+                    score += 4
+            if valid and score > best_score:
+                best_score = score
+                best_keys = resolved_keys
+        return best_keys
 
     def _generate_deterministic_service_from_unit(
         self,
@@ -2135,6 +2205,10 @@ class LLMConversionEngine:
                 imports.add("import java.util.Optional;")
             if method_return_type == "BigDecimal":
                 imports.add("import java.math.BigDecimal;")
+            error_message_literals = self._extract_plsql_error_literals(raw_plsql)
+            for idx, literal in enumerate(error_message_literals):
+                escaped_literal = self._escape_java_string_literal(literal)
+                direct_lines.append(f'String preservedPlsqlLiteral{idx} = "{escaped_literal}";')
 
             aggregation_return_var = ""
             for table_name, column_name in aggregation_columns:
@@ -2154,6 +2228,7 @@ class LLMConversionEngine:
                             driving_fields={},
                             param_name_map=param_name_map,
                             expected_type=expected_type,
+                            param_specs=parameter_specs,
                         )
                     )
                 args_expression = ", ".join(call_args)
@@ -2197,6 +2272,7 @@ class LLMConversionEngine:
                             driving_fields={},
                             param_name_map=param_name_map,
                             expected_type=expected_type,
+                            param_specs=parameter_specs,
                         )
                     )
 
@@ -2227,7 +2303,7 @@ class LLMConversionEngine:
                     for field_name, field_type in table_fields.items():
                         if normalize_column_name(field_name).upper() in {normalize_column_name(k).upper() for k in lookup_keys}:
                             continue
-                        param_spec = self._best_param_for_field(field_name, parameter_specs)
+                        param_spec = self._best_param_for_field(field_name, parameter_specs, field_type)
                         if not param_spec:
                             continue
                         if not self._types_compatible(param_spec.get("java_type", ""), field_type):
@@ -2242,7 +2318,7 @@ class LLMConversionEngine:
                     direct_lines.append(f"{table_entity} {target_var} = new {table_entity}();")
                     assigned_fields: Set[str] = set()
                     for field_name, field_type in table_fields.items():
-                        param_spec = self._best_param_for_field(field_name, parameter_specs)
+                        param_spec = self._best_param_for_field(field_name, parameter_specs, field_type)
                         if not param_spec:
                             continue
                         if not self._types_compatible(param_spec.get("java_type", ""), field_type):
@@ -2282,11 +2358,25 @@ class LLMConversionEngine:
                         direct_lines.append(f"{repository_var}.save({target_var});")
 
             if not has_mutation and select_tables:
-                select_table = driving_table if driving_table in bindings else select_tables[0]
-                binding = bindings.get(select_table)
-                if binding:
+                ranked_selects = [
+                    table_name
+                    for table_name in [driving_table, *select_tables]
+                    if table_name in bindings and table_name not in aggregation_only_tables
+                ]
+                if not ranked_selects:
+                    ranked_selects = [table_name for table_name in [driving_table, *select_tables] if table_name in bindings]
+                select_table = ranked_selects[0] if ranked_selects else ""
+                binding = bindings.get(select_table) if select_table else None
+                if binding and select_table not in aggregation_only_tables:
                     table_fields = entity_field_types.get(binding["entity"], {})
                     lookup_keys = self._lookup_keys_for_table(unit, select_table)
+                    repository_code = repositories.get(f"{binding['repository']}.java", "")
+                    if not lookup_keys:
+                        lookup_keys = self._infer_lookup_keys_from_repository(
+                            repository_code=repository_code,
+                            parameter_specs=parameter_specs,
+                            table_fields=table_fields,
+                        )
                     lookup_method = self._expected_lookup_method_name(lookup_keys) if lookup_keys else ""
                     lookup_args = []
                     for key in lookup_keys:
@@ -2297,9 +2387,10 @@ class LLMConversionEngine:
                                 driving_fields={},
                                 param_name_map=param_name_map,
                                 expected_type=expected_type,
+                                param_specs=parameter_specs,
                             )
                         )
-                    if lookup_method and lookup_args:
+                    if lookup_method and lookup_args and self._repository_has_method(repository_code, lookup_method):
                         direct_lines.append(
                             f"Optional<{binding['entity']}> found = {binding['repository_var']}.{lookup_method}({', '.join(lookup_args)});"
                         )
@@ -2331,6 +2422,22 @@ class LLMConversionEngine:
                     direct_lines.append(f"return {default_expr};")
                 else:
                     direct_lines.append("return null;")
+
+            if re.search(r"\bexception\b", raw_plsql, flags=re.IGNORECASE):
+                wrapped_lines: List[str] = ["try {"]
+                for line in direct_lines:
+                    wrapped_lines.append(f"    {line}")
+                wrapped_lines.append("} catch (Exception exception) {")
+                if method_return_type != "void":
+                    default_expr = self._default_value_for_java_type(method_return_type)
+                    default_expr = default_expr.replace("java.math.", "").replace("java.time.", "")
+                    if not default_expr:
+                        default_expr = "null"
+                    wrapped_lines.append(f"    return {default_expr};")
+                else:
+                    wrapped_lines.append("    // Preserve PL/SQL EXCEPTION fallback semantics.")
+                wrapped_lines.append("}")
+                direct_lines = wrapped_lines
 
             method_body = "\n".join(f"        {line}" for line in direct_lines) if direct_lines else "        // No deterministic operation could be inferred."
             constructor_args = ", ".join(constructor_lines)
@@ -2434,6 +2541,7 @@ class LLMConversionEngine:
                         driving_fields=driving_fields,
                         param_name_map=param_name_map,
                         expected_type=expected_type,
+                        param_specs=parameter_specs,
                         prebound_var=join_var if join_var else None,
                         prebound_column=join_key if join_key else None,
                     )
@@ -2487,6 +2595,7 @@ class LLMConversionEngine:
                         driving_fields=driving_fields,
                         param_name_map=param_name_map,
                         expected_type=expected_type,
+                        param_specs=parameter_specs,
                         prebound_var=join_var if join_var else None,
                         prebound_column=join_key if join_key else None,
                     )
@@ -2595,6 +2704,7 @@ class LLMConversionEngine:
                                 driving_fields=driving_fields,
                                 param_name_map=param_name_map,
                                 expected_type=expected_type,
+                                param_specs=parameter_specs,
                                 prebound_var=join_var if join_var else None,
                                 prebound_column=join_key if join_key else None,
                             )
@@ -3743,19 +3853,21 @@ public class {service_name} {{
             "6. Prefer the smallest safe edit that removes a compile error.\n"
             "7. If a method, annotation block, or trailing fragment is incomplete or syntactically broken, complete it or remove the broken fragment.\n"
             "8. If a type is used but not imported, add the exact missing import.\n"
-            "9. If a class/entity/repository name does not exist, replace it with the real existing generated class name instead of inventing a new one.\n"
-            "10. If an argument list, method signature, or generic type does not match existing code, rewrite it to match the declared existing signature exactly.\n"
-            "11. If the code references undefined local variables, replace them with existing in-scope variables or compile-safe literals/constants.\n"
-            "12. If a field accessor/mutator does not exist, switch to a real existing accessor/mutator or remove that line.\n"
-            "13. Never leave a file half-written. Every edited Java file must end with balanced braces and valid syntax.\n"
-            "14. In service classes, replace TODOs, placeholders, disconnected branches, and no-op CRUD logic with actual repository calls whenever the repository method already exists.\n"
-            "15. In service classes, prefer calling existing custom repository methods first; if none exist, use findById/save/deleteById as the compile-safe fallback.\n"
-            "16. If a service is not calling its repository at all, wire it to the matching repository instead of leaving the logic disconnected.\n"
-            "17. Do not make speculative runtime/business-logic improvements in this pass.\n"
-            "18. Focus first on the files named in the compiler output. Do not touch unrelated files unless one of those files cannot compile without it.\n"
-            "19. Assume the build will be rerun immediately. Your response should maximize the chance that the next compile has fewer errors, ideally zero.\n\n"
+            "9. In service classes, if Optional<...>, Optional., or Optional(...) appears, ensure `import java.util.Optional;` exists.\n"
+            "10. If imports are missing in a Java file that needs them, create a valid import section directly below the package declaration.\n"
+            "11. If a class/entity/repository name does not exist, replace it with the real existing generated class name instead of inventing a new one.\n"
+            "12. If an argument list, method signature, or generic type does not match existing code, rewrite it to match the declared existing signature exactly.\n"
+            "13. If the code references undefined local variables, replace them with existing in-scope variables or compile-safe literals/constants.\n"
+            "14. If a field accessor/mutator does not exist, switch to a real existing accessor/mutator or remove that line.\n"
+            "15. Never leave a file half-written. Every edited Java file must end with balanced braces and valid syntax.\n"
+            "16. In service classes, replace TODOs, placeholders, disconnected branches, and no-op CRUD logic with actual repository calls whenever the repository method already exists.\n"
+            "17. In service classes, prefer calling existing custom repository methods first; if none exist, use findById/save/deleteById as the compile-safe fallback.\n"
+            "18. If a service is not calling its repository at all, wire it to the matching repository instead of leaving the logic disconnected.\n"
+            "19. Do not make speculative runtime/business-logic improvements in this pass.\n"
+            "20. Focus first on the files named in the compiler output. Do not touch unrelated files unless one of those files cannot compile without it.\n"
+            "21. Assume the build will be rerun immediately. Your response should maximize the chance that the next compile has fewer errors, ideally zero.\n\n"
             "Common compile-only fixes allowed in this pass:\n"
-            "- add missing imports such as LocalTime, Timestamp, BigDecimal, Arrays, ArrayList, Pattern, AtomicReference\n"
+            "- add missing imports such as Optional, LocalTime, Timestamp, BigDecimal, Arrays, ArrayList, Pattern, AtomicReference\n"
             "- fix truncated repository/service/interface/class files\n"
             "- replace wrong lowercase entity names in JpaRepository generics/imports\n"
             "- remove duplicate annotations on a single repository method\n"
