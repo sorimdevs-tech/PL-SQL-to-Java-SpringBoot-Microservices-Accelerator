@@ -96,13 +96,17 @@ class FileExtractor:
             Dict[str, str]: Dictionary of filename -> content
         """
         files_content = {}
+        ignored_dirs = {'.git', '.svn', '.hg', '__pycache__', 'node_modules', '.idea', '.vscode'}
         
         for file_path in directory_path.rglob('*'):
+            if any(part in ignored_dirs for part in file_path.parts):
+                continue
             if file_path.is_file() and self._is_plsql_file(file_path):
                 try:
                     content = self._read_file(file_path)
-                    files_content[file_path.name] = content
-                    logger.debug(f"Extracted PL/SQL file: {file_path.name}")
+                    relative_key = str(file_path.relative_to(directory_path)).replace("\\", "/")
+                    files_content[relative_key] = content
+                    logger.debug(f"Extracted PL/SQL file: {relative_key}")
                 except Exception as e:
                     logger.warning(f"Failed to read file {file_path}: {e}")
         
@@ -121,6 +125,11 @@ class FileExtractor:
         """
         if file_path.suffix.lower() in self.supported_extensions:
             return True
+
+        # Restrict heuristics for unknown extensions to likely text containers.
+        heuristic_extensions = {'', '.txt', '.ddl', '.pkg'}
+        if file_path.suffix.lower() not in heuristic_extensions:
+            return False
         
         # Check content for PL/SQL keywords if extension is unknown
         try:
@@ -225,8 +234,8 @@ class FileExtractor:
             
             # Group results by object
             objects = {}
-            for name, type_, line, text in results:
-                key = f"{name}.{type_}"
+            for owner, name, type_, line, text in results:
+                key = f"{owner}.{name}.{type_}"
                 if key not in objects:
                     objects[key] = []
                 objects[key].append((line, text))
@@ -262,7 +271,7 @@ class FileExtractor:
             str: SQL query
         """
         query = """
-        SELECT name, type, line, text
+        SELECT owner, name, type, line, text
         FROM all_source
         WHERE 1=1
         """

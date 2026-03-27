@@ -25,9 +25,15 @@ from src.converter.llm_engine import LLMConversionEngine
 from src.generator.spring_boot_generator import SpringBootGenerator
 from src.validator.test_generator import TestGenerator
 from src.validator.semantic_validator import SemanticValidator, SemanticValidationReport
+from src.validator.pipeline_validator import PipelineValidationEngine, PipelineValidationReport
 from src.utils.file_utils import FileExtractor
 from src.parser.sql_table_discovery import extract_create_table_columns
 from src.parser.discovery_analyzer import build_conversion_units, build_discovery_model
+from src.parser.routine_recovery import (
+    classify_routine_type,
+    extract_package_body_routines,
+    merge_substitution_vars_into_unit,
+)
 from src.advanced.optimization_engine import create_optimization_engine
 from src.advanced.advanced_features import create_advanced_features
 
@@ -84,6 +90,9 @@ class PLSQLModernizationPipeline:
         self.generator = SpringBootGenerator(self.config.get('output', {}))
         self.test_generator = TestGenerator()
         self.semantic_validator = SemanticValidator(
+            self.config.get('output', {}).get('package_name', 'com.company.project')
+        )
+        self.pipeline_validator = PipelineValidationEngine(
             self.config.get('output', {}).get('package_name', 'com.company.project')
         )
         self.file_extractor = FileExtractor()
@@ -143,6 +152,7 @@ class PLSQLModernizationPipeline:
             repositories: Dict[str, str] = {}
             services: Dict[str, str] = {}
             semantic_validation = SemanticValidationReport(passed=False, issues=[])
+            pipeline_validation = PipelineValidationReport(passed=False, issues=[])
             repository_feedback: Dict[str, List[str]] = {}
             service_feedback: Dict[str, List[str]] = {}
             for attempt in range(3):
@@ -168,19 +178,48 @@ class PLSQLModernizationPipeline:
                     repositories,
                     services,
                 )
-                if semantic_validation.passed:
-                    break
-                repository_feedback = semantic_validation.feedback_by_component("repository")
-                service_feedback = semantic_validation.feedback_by_component("service")
-                logger.warning(
-                    "Semantic validation failed on attempt %s/3: %s",
-                    attempt + 1,
-                    "; ".join(issue.message for issue in semantic_validation.issues[:5]),
+                pipeline_validation = await self.validate_pipeline(
+                    semantic_model,
+                    entities,
+                    repositories,
+                    services,
+                    controllers={},
                 )
-            if not semantic_validation.passed:
-                raise ConversionError([issue.message for issue in semantic_validation.issues])
+                if semantic_validation.passed and pipeline_validation.passed:
+                    break
+                repository_feedback = self._merge_feedback_maps(
+                    repository_feedback,
+                    semantic_validation.feedback_by_component("repository"),
+                    pipeline_validation.feedback_by_component("repository"),
+                )
+                service_feedback = self._merge_feedback_maps(
+                    service_feedback,
+                    semantic_validation.feedback_by_component("service"),
+                    pipeline_validation.feedback_by_component("service"),
+                )
+                logger.warning(
+                    "Validation failed on attempt %s/3: %s",
+                    attempt + 1,
+                    "; ".join(
+                        [
+                            *(issue.message for issue in semantic_validation.issues[:3]),
+                            *(issue.message for issue in pipeline_validation.issues[:3]),
+                        ]
+                    ),
+                )
+            if not semantic_validation.passed or not pipeline_validation.passed:
+                raise ConversionError(
+                    [
+                        *(issue.message for issue in semantic_validation.issues),
+                        *(issue.message for issue in pipeline_validation.issues),
+                    ]
+                )
 
-            controllers = await self.generate_controllers(services, write_files=False)
+            controllers = await self.generate_controllers(
+                services,
+                semantic_model=semantic_model,
+                write_files=False,
+            )
             final_java_code = {}
             final_java_code.update(entities)
             final_java_code.update(repositories)
@@ -200,13 +239,19 @@ class PLSQLModernizationPipeline:
                 entities, repositories, services, controllers
             )
             test_results["semantic_validation"] = semantic_validation.to_dict()
+            test_results["pipeline_validation"] = pipeline_validation.to_dict()
             test_results["validation_passed"] = bool(
-                test_results.get("validation_passed", False) and semantic_validation.passed
+                test_results.get("validation_passed", False)
+                and semantic_validation.passed
+                and pipeline_validation.passed
             )
 
             # Stage 9: Build validation and backup-LLM repair
             logger.info("Stage 9: Validating generated project build...")
             repair_results = await self.repair_generated_project_if_needed(project_structure)
+            final_build = (repair_results or {}).get("final_build", {}) or {}
+            build_success = bool(final_build.get("success"))
+            build_skipped = bool(final_build.get("skipped"))
             
             # Generate migration report
             logger.info("Generating migration report...")
@@ -214,6 +259,24 @@ class PLSQLModernizationPipeline:
                 plsql_files, ast_results, dependency_graph, 
                 project_structure, entities, repositories, services, controllers, test_results, repair_results
             )
+
+            # Treat missing local build tooling as "validation skipped" rather
+            # than a hard conversion failure. Real build/compile failures still
+            # fail the pipeline.
+            if build_skipped:
+                logger.warning(
+                    "Build validation skipped: %s",
+                    str(final_build.get("combined_output") or "No build output captured"),
+                )
+            if not build_success and not build_skipped:
+                build_command = str(final_build.get("command") or "unknown")
+                build_output = str(final_build.get("combined_output") or "")
+                raise ConversionError(
+                    [
+                        f"Generated project build failed for command: {build_command}",
+                        build_output[:1200] if build_output else "No build output captured",
+                    ]
+                )
             
             logger.info("Pipeline completed successfully!")
             return self._build_pipeline_result(
@@ -294,9 +357,34 @@ class PLSQLModernizationPipeline:
 
         for filename, content in (plsql_files or {}).items():
             model = build_discovery_model(content)
-            file_units = build_conversion_units(content)
-            for unit in file_units:
+            top_level_units = [
+                unit
+                for unit in build_conversion_units(content)
+                if str(unit.get("object_type", "")).upper() != "PACKAGE BODY"
+            ]
+            recovered_units: List[Dict[str, Any]] = []
+            for routine in extract_package_body_routines(content):
+                routine_sql = str(routine.get("sql", "")).strip()
+                if not routine_sql:
+                    continue
+                for recovered in build_conversion_units(routine_sql):
+                    recovered["source_object_type"] = "PACKAGE BODY"
+                    recovered_units.append(recovered)
+
+            file_units: List[Dict[str, Any]] = []
+            seen_unit_keys: set[tuple[str, str, str]] = set()
+            for unit in [*top_level_units, *recovered_units]:
+                object_name = str(unit.get("name", "")).upper()
+                object_type = str(unit.get("object_type", "")).upper()
+                raw_sql = str(unit.get("raw_plsql", "")).strip()
+                unit_key = (object_name, object_type, raw_sql)
+                if unit_key in seen_unit_keys:
+                    continue
+                seen_unit_keys.add(unit_key)
+                merge_substitution_vars_into_unit(unit)
+                unit["routine_category"] = classify_routine_type(unit)
                 unit["source_file"] = filename
+                file_units.append(unit)
             units.extend(file_units)
 
             for table in model.get("schema", {}).get("tables", []):
@@ -364,6 +452,7 @@ class PLSQLModernizationPipeline:
                 sequence_mapping_keys.add(key)
                 merged_schema["sequence_mapping"].append(mapping)
 
+        self._enrich_schema_from_units(table_index, units)
         merged_schema["tables"] = sorted(table_index.values(), key=lambda item: item.get("name", ""))
         sequence_map: Dict[str, str] = {}
         for mapping in merged_schema.get("sequence_mapping", []):
@@ -412,6 +501,160 @@ class PLSQLModernizationPipeline:
             "schema": merged_schema,
             "sequences": sequence_map,
         }
+
+    async def validate_pipeline(
+        self,
+        semantic_model: Dict[str, Any],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+        services: Dict[str, str],
+        controllers: Dict[str, str],
+        ) -> PipelineValidationReport:
+        return self.pipeline_validator.validate(
+            semantic_model.get("source_units", []),
+            entities,
+            repositories,
+            services,
+            controllers,
+        )
+
+    def _upsert_inferred_column(
+        self,
+        table_index: Dict[str, Dict[str, Any]],
+        table_name: str,
+        column_name: str,
+        type_hint: str = "UNKNOWN",
+    ) -> None:
+        normalized_table = str(table_name or "").upper()
+        normalized_column = str(column_name or "").upper()
+        if not normalized_table or not normalized_column:
+            return
+        table_entry = table_index.setdefault(
+            normalized_table,
+            {
+                "name": normalized_table,
+                "columns": [],
+                "primary_keys": [],
+                "foreign_keys": [],
+                "source": "inferred",
+            },
+        )
+        existing = {
+            str(column.get("name", "")).upper(): column
+            for column in table_entry.get("columns", [])
+            if column.get("name")
+        }
+        if normalized_column in existing:
+            current_type = str(existing[normalized_column].get("type", "")).upper()
+            if current_type in {"", "UNKNOWN"} and type_hint and type_hint.upper() != "UNKNOWN":
+                existing[normalized_column]["type"] = type_hint
+            return
+        table_entry.setdefault("columns", []).append({"name": normalized_column, "type": type_hint or "UNKNOWN"})
+
+    def _infer_column_type_from_name(self, column_name: str) -> str:
+        normalized = str(column_name or "").lower()
+        if normalized.endswith("id") or normalized.endswith("_id"):
+            return "NUMBER"
+        if any(token in normalized for token in ("amount", "rate", "cost", "balance", "total", "vat", "fines")):
+            return "NUMBER(10,2)"
+        if any(token in normalized for token in ("date", "time", "timestamp")):
+            return "DATE"
+        if "status" in normalized or "code" in normalized or "name" in normalized or "text" in normalized:
+            return "VARCHAR2"
+        return "UNKNOWN"
+
+    def _enrich_schema_from_units(
+        self,
+        table_index: Dict[str, Dict[str, Any]],
+        units: List[Dict[str, Any]],
+    ) -> None:
+        for unit in units or []:
+            raw_plsql = str(unit.get("raw_plsql", ""))
+            if not raw_plsql:
+                continue
+
+            rowtype_map: Dict[str, str] = {}
+            for match in re.finditer(
+                r"\b([A-Za-z_][\w$#]*)\s+(?:in|out|in out)?\s*([A-Za-z_][\w$#]*)%rowtype",
+                raw_plsql,
+                flags=re.IGNORECASE,
+            ):
+                rowtype_map[match.group(1).upper()] = match.group(2).upper()
+
+            for match in re.finditer(
+                r"\b([A-Za-z_][\w$#]*)\s+([A-Za-z_][\w$#]*)\.([A-Za-z_][\w$#]*)%type",
+                raw_plsql,
+                flags=re.IGNORECASE,
+            ):
+                table_name = match.group(2).upper()
+                column_name = match.group(3).upper()
+                self._upsert_inferred_column(
+                    table_index,
+                    table_name,
+                    column_name,
+                    self._infer_column_type_from_name(column_name),
+                )
+
+            for match in re.finditer(r"\b([A-Za-z_][\w$#]*)\.([A-Za-z_][\w$#]*)\b", raw_plsql):
+                variable_name = match.group(1).upper()
+                column_name = match.group(2).upper()
+                table_name = rowtype_map.get(variable_name)
+                if not table_name:
+                    continue
+                self._upsert_inferred_column(
+                    table_index,
+                    table_name,
+                    column_name,
+                    self._infer_column_type_from_name(column_name),
+                )
+
+            for insert_match in re.finditer(
+                r"\binsert\s+into\s+([A-Za-z_][\w$#]*)\s*\(([^)]*)\)",
+                raw_plsql,
+                flags=re.IGNORECASE | re.DOTALL,
+            ):
+                table_name = insert_match.group(1).upper()
+                columns = [
+                    str(token).strip().strip('"`').upper()
+                    for token in insert_match.group(2).split(",")
+                    if str(token).strip()
+                ]
+                for column_name in columns:
+                    self._upsert_inferred_column(
+                        table_index,
+                        table_name,
+                        column_name,
+                        self._infer_column_type_from_name(column_name),
+                    )
+
+            for update_match in re.finditer(
+                r"\bupdate\s+([A-Za-z_][\w$#]*)\s+set\s+([\s\S]*?)(?:\bwhere\b|;)",
+                raw_plsql,
+                flags=re.IGNORECASE,
+            ):
+                table_name = update_match.group(1).upper()
+                set_clause = update_match.group(2)
+                for assignment in set_clause.split(","):
+                    name_match = re.match(r"\s*([A-Za-z_][\w$#]*)\s*=", assignment.strip(), flags=re.IGNORECASE)
+                    if not name_match:
+                        continue
+                    column_name = name_match.group(1).upper()
+                    self._upsert_inferred_column(
+                        table_index,
+                        table_name,
+                        column_name,
+                        self._infer_column_type_from_name(column_name),
+                    )
+
+    def _merge_feedback_maps(self, *maps: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        merged: Dict[str, List[str]] = {}
+        for mapping in maps:
+            for key, messages in (mapping or {}).items():
+                merged.setdefault(key, [])
+                for message in (messages or []):
+                    if message not in merged[key]:
+                        merged[key].append(message)
+        return merged
 
     def build_dependency_summary(self, semantic_model: Dict[str, Any]) -> Dict[str, Any]:
         tables = sorted(
@@ -638,7 +881,19 @@ class PLSQLModernizationPipeline:
             validation_feedback=validation_feedback,
         )
     
-    async def generate_controllers(self, services: Dict[str, str], write_files: bool = True) -> Dict[str, str]:
+    def _derive_service_filename_from_unit(self, unit: Dict[str, Any]) -> str:
+        words = [token.capitalize() for token in re.split(r"[^A-Za-z0-9]+", str(unit.get("name", ""))) if token]
+        base_name = "".join(words) or "Generated"
+        if not base_name.endswith("Service"):
+            base_name = f"{base_name}Service"
+        return f"{base_name}.java"
+
+    async def generate_controllers(
+        self,
+        services: Dict[str, str],
+        semantic_model: Optional[Dict[str, Any]] = None,
+        write_files: bool = True,
+    ) -> Dict[str, str]:
         """
         Generate REST controller classes
         
@@ -648,7 +903,19 @@ class PLSQLModernizationPipeline:
         Returns:
             Dict[str, str]: Generated controller files
         """
-        return self.generator.generate_controllers(services, write_files=write_files)
+        filtered_services = dict(services)
+        if semantic_model:
+            blocked_service_files = {
+                self._derive_service_filename_from_unit(unit)
+                for unit in semantic_model.get("source_units", [])
+                if str(unit.get("routine_category", "")).upper() == "BATCH_PROCESSING"
+            }
+            filtered_services = {
+                filename: code
+                for filename, code in services.items()
+                if filename not in blocked_service_files
+            }
+        return self.generator.generate_controllers(filtered_services, write_files=write_files)
     
     async def generate_tests_and_validate(self, entities: Dict[str, str], 
                                         repositories: Dict[str, str],
@@ -679,12 +946,24 @@ class PLSQLModernizationPipeline:
             'validation_results': [],
             'sql_validation_results': [],
             'test_report': '# Test generation disabled\n',
-            'validation_passed': True,
+            'validation_passed': False,
+            'validation_skipped': True,
         }
 
     async def repair_generated_project_if_needed(self, project_structure: Dict[str, Any]) -> Dict[str, Any]:
         project_root = self.output_directory
         initial_build = await self._run_generated_project_build(project_root)
+        if initial_build.get("skipped"):
+            self._last_repair_result = {
+                'enabled': bool(self.repair_config.get('enabled')),
+                'attempted': False,
+                'build_passed': False,
+                'build_skipped': True,
+                'iterations': [],
+                'final_build': initial_build,
+                'reason': str(initial_build.get('skip_reason') or 'build_validation_skipped'),
+            }
+            return self._last_repair_result
         if initial_build.get('success'):
             self._last_repair_result = {
                 'enabled': bool(self.repair_config.get('enabled')),
@@ -750,6 +1029,8 @@ class PLSQLModernizationPipeline:
         if not command:
             return {
                 'success': False,
+                'skipped': True,
+                'skip_reason': 'no_supported_build_command',
                 'command': None,
                 'stdout': '',
                 'stderr': 'No supported build command found for generated project',
@@ -780,6 +1061,7 @@ class PLSQLModernizationPipeline:
         combined_output = (stdout + "\n" + stderr).strip()
         return {
             'success': result.returncode == 0,
+            'skipped': False,
             'returncode': result.returncode,
             'command': " ".join(command),
             'stdout': stdout,
@@ -791,20 +1073,27 @@ class PLSQLModernizationPipeline:
     def _resolve_build_command(self, project_root: Path) -> List[str]:
         gradlew_unix = project_root / 'gradlew'
         gradlew = project_root / 'gradlew.bat'
+        gradle_kts = project_root / 'build.gradle.kts'
         gradle = project_root / 'build.gradle'
+        mvnw_sh = project_root / 'mvnw'
         mvnw = project_root / 'mvnw.cmd'
+        mvnw_bat = project_root / 'mvnw.bat'
         pom = project_root / 'pom.xml'
 
         if gradlew_unix.exists():
             return ['./gradlew', 'compileJava']
         if gradlew.exists():
             return [str(gradlew), 'compileJava']
-        if gradle.exists():
+        if gradle.exists() or gradle_kts.exists():
             gradle_cmd = shutil.which('gradle')
             if gradle_cmd:
                 return [gradle_cmd, 'compileJava']
+        if mvnw_sh.exists():
+            return [str(mvnw_sh), '-DskipTests', 'compile']
         if mvnw.exists():
             return [str(mvnw), '-DskipTests', 'compile']
+        if mvnw_bat.exists():
+            return [str(mvnw_bat), '-DskipTests', 'compile']
         if pom.exists():
             mvn_cmd = shutil.which('mvn')
             if mvn_cmd:
@@ -959,6 +1248,7 @@ class PLSQLModernizationPipeline:
             "backup_llm_repair_enabled": bool((repair_results or {}).get('enabled')),
             "backup_llm_repair_attempted": bool((repair_results or {}).get('attempted')),
             "build_validation_passed": bool((repair_results or {}).get('final_build', {}).get('success')),
+            "build_validation_skipped": bool((repair_results or {}).get('final_build', {}).get('skipped')),
             "repair_iterations": len((repair_results or {}).get('iterations', [])),
         }
         
@@ -994,8 +1284,10 @@ class PLSQLModernizationPipeline:
         validation_results = test_results.get('validation_results', []) if isinstance(test_results, dict) else []
         output_files = self._collect_output_files()
         report_path = self.output_directory / 'reports' / 'migration_report.json'
+        build_validation_passed = bool((repair_results or {}).get('final_build', {}).get('success'))
+        build_validation_skipped = bool((repair_results or {}).get('final_build', {}).get('skipped'))
         return {
-            'status': 'completed',
+            'status': 'completed' if (build_validation_passed or build_validation_skipped) else 'failed',
             'source_type': source_type,
             'source_path': source_path,
             'output_directory': str(self.output_directory),
@@ -1022,7 +1314,9 @@ class PLSQLModernizationPipeline:
                 'validation_results': len(validation_results),
                 'validation_passed': test_results.get('validation_passed', False),
                 'semantic_validation_passed': bool((test_results.get("semantic_validation") or {}).get("passed")),
-                'build_validation_passed': bool((repair_results or {}).get('final_build', {}).get('success')),
+                'pipeline_validation_passed': bool((test_results.get("pipeline_validation") or {}).get("passed")),
+                'build_validation_passed': build_validation_passed,
+                'build_validation_skipped': build_validation_skipped,
                 'repair_iterations': len((repair_results or {}).get('iterations', [])),
             },
             'artifacts': {

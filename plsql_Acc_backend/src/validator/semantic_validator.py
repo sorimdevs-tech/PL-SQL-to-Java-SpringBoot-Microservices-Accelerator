@@ -385,6 +385,11 @@ class SemanticValidator:
             has_exception_block = bool(re.search(r"\bexception\b", raw_plsql, flags=re.IGNORECASE))
             semantic = unit.get("semantic_analysis") or {}
             driving_table = str(unit.get("driving_table", "")).upper()
+            operations_by_table_map = {
+                str(table_name).upper(): {str(op).upper() for op in (ops or []) if op}
+                for table_name, ops in (unit.get("operations_by_table") or {}).items()
+                if table_name and not self._is_pseudo_table_name(str(table_name))
+            }
             target_tables = {str(table).upper() for table in (unit.get("target_tables") or []) if table}
             for ref in semantic.get("aggregation", {}).get("columns", []) or []:
                 parts = str(ref).split(".", 1)
@@ -394,7 +399,11 @@ class SemanticValidator:
                 target_tables.add(driving_table)
 
             for table_name in sorted(target_tables):
+                if self._is_pseudo_table_name(table_name):
+                    continue
                 repository_name = self._derive_repository_name_from_table(table_name)
+                if not repository_name:
+                    continue
                 repository_filename = f"{repository_name}.java"
                 if repository_filename not in repositories:
                     continue
@@ -414,8 +423,18 @@ class SemanticValidator:
                 for ref in (semantic.get("aggregation", {}).get("columns", []) or [])
                 if "." in str(ref)
             }
+            aggregation_only_tables = {
+                table_name
+                for table_name in aggregation_tables
+                if (not operations_by_table_map.get(table_name))
+                or operations_by_table_map.get(table_name, set()).issubset({"SELECT"})
+            }
             for table_name in sorted(aggregation_tables):
+                if self._is_pseudo_table_name(table_name):
+                    continue
                 repository_name = self._derive_repository_name_from_table(table_name)
+                if not repository_name:
+                    continue
                 repository_filename = f"{repository_name}.java"
                 repository_code = repositories.get(repository_filename, "")
                 if not repository_code:
@@ -441,7 +460,10 @@ class SemanticValidator:
                             file_name=service_filename,
                         )
                     )
-                if re.search(rf"\b{re.escape(repository_var)}\.findBy\w+\s*\(", service_code):
+                if table_name in aggregation_only_tables and re.search(
+                    rf"\b{re.escape(repository_var)}\.findBy\w+\s*\(",
+                    service_code,
+                ):
                     issues.append(
                         SemanticIssue(
                             component="service",
@@ -456,7 +478,10 @@ class SemanticValidator:
                 bool(unit.get("cursor"))
                 or any(str(op.get("type", "")).upper() == "BULK_COLLECT" for op in (unit.get("bulk_operations") or []))
             ):
-                driving_repo_name = self._derive_repository_name_from_table(driving_table)
+                if self._is_pseudo_table_name(driving_table):
+                    driving_repo_name = ""
+                else:
+                    driving_repo_name = self._derive_repository_name_from_table(driving_table)
                 driving_repo_var = self._lower_first(driving_repo_name)
                 if not re.search(
                     rf"\b{re.escape(driving_repo_var)}\.(findPageForUpdateSkipLocked\w*|findAll)\s*\(",
@@ -553,7 +578,11 @@ class SemanticValidator:
                     )
             if "SKIP LOCKED" in locking:
                 expected_table = driving_table or str(next(iter((unit.get("operations_by_table") or {}).keys()), "")).upper()
-                expected_repo = self._derive_repository_name_from_table(expected_table) if expected_table else ""
+                expected_repo = (
+                    self._derive_repository_name_from_table(expected_table)
+                    if expected_table and not self._is_pseudo_table_name(expected_table)
+                    else ""
+                )
                 repo_code = repositories.get(f"{expected_repo}.java", "") if expected_repo else ""
                 if "findPageForUpdateSkipLocked" not in repo_code:
                     issues.append(
@@ -634,29 +663,52 @@ class SemanticValidator:
         for unit in source_units:
             object_name = unit.get("name", "")
             lookup_map = unit.get("lookup_keys") or {}
-            operations_by_table = {
-                str(table_name).upper()
-                for table_name in (unit.get("operations_by_table") or {}).keys()
-                if table_name
+            operations_by_table_map: Dict[str, Set[str]] = {}
+            for table_name, ops in (unit.get("operations_by_table") or {}).items():
+                normalized_table = str(table_name).upper()
+                if not normalized_table or self._is_pseudo_table_name(normalized_table):
+                    continue
+                operations_by_table_map[normalized_table] = {
+                    str(op).upper() for op in (ops or []) if op
+                }
+            operations_by_table = set(operations_by_table_map.keys())
+            semantic = unit.get("semantic_analysis") or {}
+            aggregation_tables = {
+                str(ref).split(".", 1)[0].strip().upper()
+                for ref in (semantic.get("aggregation", {}).get("columns", []) or [])
+                if "." in str(ref)
             }
             skip_locked_tables = {
                 str(table).upper()
                 for table in (unit.get("skip_locked_tables") or [])
-                if table
+                if table and not self._is_pseudo_table_name(str(table))
             }
             driving_table = str(unit.get("driving_table", "")).upper()
             if not skip_locked_tables and re.search(r"\bSKIP\s+LOCKED\b", str(unit.get("raw_plsql", "")), flags=re.IGNORECASE):
-                if driving_table:
+                if driving_table and not self._is_pseudo_table_name(driving_table):
                     skip_locked_tables.add(driving_table)
             for table_name, lookup_keys in lookup_map.items():
                 if not lookup_keys:
                     continue
                 normalized_table = str(table_name).upper()
+                if self._is_pseudo_table_name(normalized_table):
+                    continue
                 if normalized_table not in operations_by_table and normalized_table not in skip_locked_tables:
                     # Ignore lookup hints from joined/read-only tables that are not directly
                     # represented as repository operations for this unit.
                     continue
+                table_ops = operations_by_table_map.get(normalized_table, set())
+                is_aggregation_only_table = (
+                    normalized_table in aggregation_tables
+                    and (not table_ops or table_ops.issubset({"SELECT"}))
+                )
+                if is_aggregation_only_table:
+                    # Aggregation-only tables should use sumBy... contracts, not
+                    # row fetch findBy... lookup contracts.
+                    continue
                 repository_name = self._derive_repository_name_from_table(str(table_name))
+                if not repository_name:
+                    continue
                 repository_code = repositories.get(f"{repository_name}.java", "")
                 contract = repository_contracts.get(repository_name)
                 if not contract:
@@ -796,7 +848,19 @@ class SemanticValidator:
 
     def _derive_repository_name_from_table(self, table_name: str) -> str:
         base = to_pascal_case(table_name)
-        return f"{base}Repository" if base else "GeneratedRepository"
+        if not base or self._is_pseudo_table_name(table_name):
+            return ""
+        return f"{base}Repository"
+
+    def _is_pseudo_table_name(self, table_name: str) -> bool:
+        normalized = str(table_name or "").strip().upper()
+        if not normalized:
+            return True
+        normalized = normalized.strip('"`')
+        normalized = normalized.split(".")[-1]
+        if normalized == "DUAL":
+            return True
+        return False
 
     def _has_run_mode_parameter(self, unit: Dict[str, Any]) -> bool:
         return any(

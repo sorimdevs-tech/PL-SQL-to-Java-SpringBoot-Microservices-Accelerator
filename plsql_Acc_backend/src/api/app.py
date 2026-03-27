@@ -936,6 +936,20 @@ class DiscoveryManager:
         analyses: List[Dict[str, Any]],
         discovery_model: Optional[Dict[str, Any]] = None,
     ) -> None:
+        type_priority = {
+            "PROCEDURE": 5,
+            "FUNCTION": 4,
+            "PACKAGE BODY": 3,
+            "PACKAGE": 2,
+            "TRIGGER": 1,
+        }
+
+        def score(item: Dict[str, Any]) -> tuple[int, int, int]:
+            object_type = str(item.get("objectType", "")).upper()
+            operations = len(item.get("operations", []) or [])
+            tables = len(item.get("tablesUsed", []) or [])
+            return (type_priority.get(object_type, 0), operations, tables)
+
         for item in analyses:
             name = item.get("procedureName")
             if not name:
@@ -945,7 +959,10 @@ class DiscoveryManager:
                 stored_item["discovery"] = discovery_model
             elif "discovery" in item:
                 stored_item["discovery"] = item["discovery"]
-            self.by_procedure[name.upper()] = stored_item
+            key = name.upper()
+            existing = self.by_procedure.get(key)
+            if existing is None or score(stored_item) >= score(existing):
+                self.by_procedure[key] = stored_item
 
     def get_analysis(self, procedure_name: str) -> Dict[str, Any]:
         item = self.by_procedure.get(procedure_name.upper())
@@ -1134,7 +1151,21 @@ async def analyze_discovery_source(request: DiscoveryAnalyzeRequest) -> Dict[str
             raise HTTPException(status_code=422, detail="No PROCEDURE/FUNCTION/PACKAGE objects found")
         discovery_manager.store_analyses(analyses, discovery_model)
 
-        primary = analyses[0] if analyses else {
+        type_priority = {
+            "PROCEDURE": 5,
+            "FUNCTION": 4,
+            "PACKAGE BODY": 3,
+            "PACKAGE": 2,
+            "TRIGGER": 1,
+        }
+
+        def analysis_score(item: Dict[str, Any]) -> tuple[int, int, int]:
+            object_type = str(item.get("objectType", "")).upper()
+            operations = len(item.get("operations", []) or [])
+            tables = len(item.get("tablesUsed", []) or [])
+            return (type_priority.get(object_type, 0), operations, tables)
+
+        primary = max(analyses, key=analysis_score) if analyses else {
             "procedureName": "",
             "objectType": "",
             "parameters": {"in": [], "out": []},

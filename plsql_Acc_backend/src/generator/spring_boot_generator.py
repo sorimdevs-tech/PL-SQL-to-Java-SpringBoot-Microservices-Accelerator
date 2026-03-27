@@ -2046,8 +2046,9 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
         return normalized.startswith(("NUMBER", "INT", "INTEGER", "SMALLINT", "BIGINT",
                                        "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL"))
 
-    def _map_sql_type_to_java(self, sql_type: str) -> str:
-        normalized = sql_type.upper()
+    def _map_sql_type_to_java(self, sql_type: str, column_name: str = "") -> str:
+        normalized = (sql_type or "").upper()
+        normalized_column = normalize_column_name(column_name or "").lower()
         if normalized.startswith(("VARCHAR", "CHAR", "CLOB", "NCLOB", "NVARCHAR")):
             return "String"
         if normalized.startswith("NUMBER"):
@@ -2062,6 +2063,13 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
             return "Double"
         if normalized.startswith(("DECIMAL", "NUMERIC")):
             return "BigDecimal"
+        # Heuristic fallback for unknown/inferred types.
+        if normalized_column.endswith("id") or normalized_column.endswith("_id"):
+            return "Long"
+        if any(token in normalized_column for token in ("amount", "rate", "cost", "balance", "total", "vat", "fines")):
+            return "BigDecimal"
+        if any(token in normalized_column for token in ("date", "time", "timestamp")):
+            return "LocalDateTime"
         return "String"
 
     def _generate_entity_from_ddl(
@@ -2092,7 +2100,7 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
 
         for col in columns:
             col_name = col["name"].upper()
-            java_type = self._map_sql_type_to_java(col.get("type", ""))
+            java_type = self._map_sql_type_to_java(col.get("type", ""), col.get("name", ""))
             if java_type == "LocalDateTime":
                 import_lines.append("import java.time.LocalDateTime;")
             if java_type == "LocalDate":
