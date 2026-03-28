@@ -2467,6 +2467,10 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.List;')
         if 'Optional<' in code:
             import_lines.append('import java.util.Optional;')
+        if re.search(r'(?<![\w.])TransactionTemplate\b', code):
+            import_lines.append('import org.springframework.transaction.support.TransactionTemplate;')
+        if re.search(r'(?<![\w.])PlatformTransactionManager\b', code):
+            import_lines.append('import org.springframework.transaction.PlatformTransactionManager;')
         if 'Page<' in code:
             import_lines.append('import org.springframework.data.domain.Page;')
         if 'Pageable' in code:
@@ -2653,6 +2657,10 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.List;')
         if 'Optional<' in body:
             import_lines.append('import java.util.Optional;')
+        if re.search(r'(?<![\w.])TransactionTemplate\b', body):
+            import_lines.append('import org.springframework.transaction.support.TransactionTemplate;')
+        if re.search(r'(?<![\w.])PlatformTransactionManager\b', body):
+            import_lines.append('import org.springframework.transaction.PlatformTransactionManager;')
         if 'Page<' in body:
             import_lines.append('import org.springframework.data.domain.Page;')
         if 'Pageable' in body:

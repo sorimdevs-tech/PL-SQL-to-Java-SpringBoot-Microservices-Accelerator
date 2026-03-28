@@ -4,7 +4,7 @@ Logging utilities for PL/SQL Modernization Platform
 
 import logging
 import sys
-from typing import Optional
+from typing import Any, Dict, Optional
 
 try:
     from rich.logging import RichHandler

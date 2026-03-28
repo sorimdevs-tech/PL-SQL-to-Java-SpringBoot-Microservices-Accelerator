@@ -887,6 +887,80 @@ class PLSQLModernizationPipeline:
                 candidates.append(str(path.relative_to(project_root)).replace('\\', '/'))
         return candidates
 
+<<<<<<< Updated upstream
+=======
+    def _enforce_repair_java_imports(self, rel_path: str, content: str) -> str:
+        """Apply compile-focused import guardrails to repaired Java files."""
+        if not isinstance(rel_path, str) or not rel_path.lower().endswith('.java'):
+            return content
+
+        normalized_path = rel_path.replace('\\', '/').lower()
+        filename = normalized_path.rsplit('/', 1)[-1]
+        looks_like_service = '/service/' in normalized_path or filename.endswith('service.java')
+        if not looks_like_service:
+            return content
+
+        required_imports: List[str] = []
+
+        # Only add imports when the simple type name is actually used.
+        uses_bare_optional = bool(re.search(r'(?<![\w.])Optional\s*(?:<|\.|\()', content))
+        has_optional_import = bool(re.search(r'(?m)^\s*import\s+java\.util\.Optional\s*;\s*$', content))
+        if uses_bare_optional and not has_optional_import:
+            required_imports.append('import java.util.Optional;')
+
+        uses_transaction_template = bool(re.search(r'(?<![\w.])TransactionTemplate\b', content))
+        has_transaction_template_import = bool(
+            re.search(
+                r'(?m)^\s*import\s+org\.springframework\.transaction\.support\.TransactionTemplate\s*;\s*$',
+                content,
+            )
+        )
+        if uses_transaction_template and not has_transaction_template_import:
+            required_imports.append('import org.springframework.transaction.support.TransactionTemplate;')
+
+        uses_platform_transaction_manager = bool(
+            re.search(r'(?<![\w.])PlatformTransactionManager\b', content)
+        )
+        has_platform_transaction_manager_import = bool(
+            re.search(
+                r'(?m)^\s*import\s+org\.springframework\.transaction\.PlatformTransactionManager\s*;\s*$',
+                content,
+            )
+        )
+        if uses_platform_transaction_manager and not has_platform_transaction_manager_import:
+            required_imports.append('import org.springframework.transaction.PlatformTransactionManager;')
+
+        if not required_imports:
+            return content
+
+        lines = content.splitlines()
+        package_idx = next((i for i, line in enumerate(lines) if line.strip().startswith('package ')), None)
+        import_indices = [i for i, line in enumerate(lines) if line.strip().startswith('import ')]
+
+        if import_indices:
+            insert_idx = import_indices[-1] + 1
+            for import_line in required_imports:
+                lines.insert(insert_idx, import_line)
+                insert_idx += 1
+        elif package_idx is not None:
+            insert_idx = package_idx + 1
+            lines.insert(insert_idx, '')
+            for offset, import_line in enumerate(required_imports, start=1):
+                lines.insert(insert_idx + offset, import_line)
+            after_imports_idx = insert_idx + len(required_imports) + 1
+            if after_imports_idx >= len(lines) or lines[after_imports_idx].strip():
+                lines.insert(after_imports_idx, '')
+        else:
+            for offset, import_line in enumerate(required_imports):
+                lines.insert(offset, import_line)
+            lines.insert(len(required_imports), '')
+
+        normalized = '\n'.join(lines)
+        if content.endswith('\n'):
+            normalized += '\n'
+        return normalized
+
+>>>>>>> Stashed changes
     def _apply_repair_files(self, project_root: Path, files: List[Dict[str, str]]) -> List[str]:
         changed = []
         for item in files or []:
