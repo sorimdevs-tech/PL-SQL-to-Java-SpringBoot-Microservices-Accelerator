@@ -211,6 +211,26 @@ class PLSQLASTBuilder(PlSqlListener):
                 'type': var_type
             }
             self.current_object['variables'].append(var)
+
+    def enterConstant_declaration(self, ctx):
+        """RC6 FIX: Handle CONSTANT declarations in package specs/bodies."""
+        if self.current_object is not None and 'constants' in self.current_object:
+            try:
+                name = _ctx_text(ctx.identifier(), "")
+                datatype = _ctx_text(ctx.datatype(), "UNKNOWN")
+                # expression() may be a list or single node
+                expr_node = ctx.expression()
+                if isinstance(expr_node, list):
+                    value = expr_node[0].getText() if expr_node else ""
+                else:
+                    value = expr_node.getText() if expr_node is not None else ""
+                self.current_object['constants'].append({
+                    'name': name,
+                    'type': datatype.strip().upper(),
+                    'value': value.strip("'"),
+                })
+            except Exception:
+                pass
     
     def enterSql_statement(self, ctx: PlSqlParser.Sql_statementContext):
         """Handle SQL statements"""
@@ -358,6 +378,22 @@ class PLSQLParser:
             handlers.append({"exception": match.group(1).upper(), "statements": []})
         return handlers
 
+    @staticmethod
+    def _fallback_constants(object_text: str) -> List[Dict[str, Any]]:
+        """RC6 FIX: extract CONSTANT declarations via regex for the fallback parser."""
+        constants: List[Dict[str, Any]] = []
+        pattern = re.compile(
+            r"^\s*([A-Za-z_][\w$#]*)\s+CONSTANT\s+([A-Za-z][\w$#]*(?:\s*\([^)]*\))?)\s*:=\s*(.+?)\s*;",
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        for match in pattern.finditer(object_text):
+            constants.append({
+                "name": match.group(1),
+                "type": match.group(2).strip().upper(),
+                "value": match.group(3).strip().strip("'"),
+            })
+        return constants
+
     def _fallback_parse(self, content: str) -> Optional[Dict[str, Any]]:
         """Build a lightweight AST when ANTLR parse fails."""
         matches = list(OBJECT_DECL_PATTERN.finditer(content))
@@ -425,7 +461,7 @@ class PLSQLParser:
                         "procedures": [],
                         "functions": [],
                         "variables": [],
-                        "constants": [],
+                        "constants": self._fallback_constants(object_text),
                         "types": [],
                     }
                 )

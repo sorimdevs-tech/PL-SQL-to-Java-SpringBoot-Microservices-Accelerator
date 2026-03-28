@@ -622,6 +622,41 @@ class SemanticValidator:
                         file_name=service_filename,
                     )
                 )
+
+            # RC4 FIX: if source has raise_application_error, Java must throw BusinessException
+            programmatic_raises = unit.get("programmatic_raises") or []
+            if programmatic_raises:
+                has_throw = bool(re.search(r"\bthrow\s+new\s+\w*[Ee]xception\b", service_code))
+                if not has_throw:
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="raise_application_error_not_preserved",
+                            message=(
+                                f"{service_filename} source has RAISE_APPLICATION_ERROR but "
+                                f"no 'throw new ...Exception' found in generated service"
+                            ),
+                            file_name=service_filename,
+                        )
+                    )
+
+            # RC8 FIX: if source has PRAGMA AUTONOMOUS_TRANSACTION, Java must use REQUIRES_NEW
+            if unit.get("autonomous_transaction"):
+                has_requires_new = "Propagation.REQUIRES_NEW" in service_code
+                if not has_requires_new:
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="autonomous_transaction_not_preserved",
+                            message=(
+                                f"{service_filename} source uses PRAGMA AUTONOMOUS_TRANSACTION but "
+                                f"generated service is missing @Transactional(propagation = Propagation.REQUIRES_NEW)"
+                            ),
+                            file_name=service_filename,
+                        )
+                    )
         return issues
 
     def _validate_deterministic_repository_contracts(

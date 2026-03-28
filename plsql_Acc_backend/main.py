@@ -887,8 +887,6 @@ class PLSQLModernizationPipeline:
                 candidates.append(str(path.relative_to(project_root)).replace('\\', '/'))
         return candidates
 
-<<<<<<< Updated upstream
-=======
     def _enforce_repair_java_imports(self, rel_path: str, content: str) -> str:
         """Apply compile-focused import guardrails to repaired Java files."""
         if not isinstance(rel_path, str) or not rel_path.lower().endswith('.java'):
@@ -960,7 +958,6 @@ class PLSQLModernizationPipeline:
             normalized += '\n'
         return normalized
 
->>>>>>> Stashed changes
     def _apply_repair_files(self, project_root: Path, files: List[Dict[str, str]]) -> List[str]:
         changed = []
         for item in files or []:
@@ -974,6 +971,7 @@ class PLSQLModernizationPipeline:
             except ValueError:
                 logger.warning("Skipping repair write outside project root: %s", rel_path)
                 continue
+            content = self._enforce_repair_java_imports(rel_path, content)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(content, encoding='utf-8')
             changed.append(str(target_path.relative_to(project_root)).replace('\\', '/'))

@@ -30,7 +30,7 @@ KEYWORD_BLOCKLIST = {
     "min",
     "max",
     "substr",
-    "nvl",
+    # RC3 FIX: nvl removed — NVL-wrapped params must be visible for null-safety detection
 }
 
 TABLE_NAME_BLOCKLIST = {
@@ -68,7 +68,7 @@ TYPE_BLOCKLIST = {
     "BLOB",
     "INTEGER",
     "PLS_INTEGER",
-    "BOOLEAN",
+    # RC2 FIX: BOOLEAN removed — it was swallowing boolean params before _map_plsql_type_to_java saw them
     "FLOAT",
     "DECIMAL",
 }
@@ -81,6 +81,30 @@ OBJECT_PATTERN = re.compile(
 )
 PARAM_PATTERN = re.compile(
     r"""^\s*["`]?([\w$#]+)["`]?\s+(?:(in\s+out|in|out)\s+)?(.+?)\s*$""",
+    flags=re.IGNORECASE,
+)
+
+# RC4 FIX: detect programmatic RAISE_APPLICATION_ERROR calls
+RAISE_APP_ERROR_PATTERN = re.compile(
+    r"\braise_application_error\s*\(\s*(-?\d+)\s*,\s*(.*?)\s*\)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+# RC8 FIX: detect PRAGMA AUTONOMOUS_TRANSACTION
+AUTONOMOUS_TX_PATTERN = re.compile(
+    r"\bpragma\s+autonomous_transaction\b",
+    flags=re.IGNORECASE,
+)
+
+# RC6 FIX: detect CONSTANT declarations in package specs/bodies
+CONSTANT_PATTERN = re.compile(
+    r"^\s*([A-Za-z_][\w$#]*)\s+CONSTANT\s+([A-Za-z][\w$#]*(?:\s*\([^)]*\))?)\s*:=\s*(.+?)\s*;",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+# RC3 FIX: detect NVL-wrapped parameter usage for null-safety
+NVL_PARAM_PATTERN = re.compile(
+    r"\bnvl\s*\(\s*([A-Za-z_][\w$#]*)\s*,",
     flags=re.IGNORECASE,
 )
 
@@ -729,6 +753,16 @@ def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
                 "business_rules": semantics.get("business_rules", []),
                 "issues": semantics.get("issues", []),
                 "semantic_analysis": semantics.get("semantic_analysis", {}),
+                # RC4 FIX
+                "programmatic_raises": semantics.get("programmatic_raises", []),
+                # RC8 FIX
+                "autonomous_transaction": semantics.get("autonomous_transaction", False),
+                # RC6 FIX
+                "package_constants": semantics.get("package_constants", []),
+                # RC3 FIX
+                "null_safe_params": semantics.get("null_safe_params", []),
+                # dependency graph for RC7
+                "dependency_graph": semantics.get("dependency_graph", {}),
             }
         )
 
@@ -2655,6 +2689,67 @@ def _enhance_business_rules(
     return rules
 
 
+def _extract_programmatic_raises(block_text: str) -> List[Dict[str, Any]]:
+    """RC4 FIX: extract all raise_application_error calls from the procedure body."""
+    raises: List[Dict[str, Any]] = []
+    for match in RAISE_APP_ERROR_PATTERN.finditer(block_text):
+        error_code = match.group(1).strip()
+        raw_message = " ".join(match.group(2).split())
+        raises.append({"error_code": error_code, "message": raw_message})
+    return raises
+
+
+def _has_autonomous_transaction(block_text: str) -> bool:
+    """RC8 FIX: detect PRAGMA AUTONOMOUS_TRANSACTION."""
+    return bool(AUTONOMOUS_TX_PATTERN.search(block_text))
+
+
+def _extract_package_constants(block_text: str) -> List[Dict[str, Any]]:
+    """RC6 FIX: extract CONSTANT declarations from package spec/body text."""
+    constants: List[Dict[str, Any]] = []
+    for match in CONSTANT_PATTERN.finditer(block_text):
+        constants.append({
+            "name": match.group(1),
+            "type": match.group(2).strip().upper(),
+            "value": match.group(3).strip().strip("'"),
+        })
+    return constants
+
+
+def _extract_null_safe_params(block_text: str, param_names: List[str]) -> List[str]:
+    """RC3 FIX: find parameters that appear inside NVL(...) — need null-safe guard in Java."""
+    known_upper = {name.upper() for name in param_names}
+    null_safe: List[str] = []
+    for match in NVL_PARAM_PATTERN.finditer(block_text):
+        candidate = match.group(1).upper()
+        if candidate in known_upper:
+            null_safe.append(match.group(1))
+    return sorted(set(null_safe))
+
+
+def _extract_inner_procedure_params(block_text: str) -> List[Dict[str, str]]:
+    """RC2 FIX: extract parameters from inner procedures inside package bodies (regex fallback)."""
+    params: List[Dict[str, str]] = []
+    proc_pat = re.compile(
+        r"\bprocedure\s+[\w$#]+\s*\(([^)]+)\)\s*(?:is|as)\b",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for proc_match in proc_pat.finditer(block_text):
+        param_section = proc_match.group(1)
+        for raw_param in _split_top_level_csv(param_section):
+            normalized = " ".join(raw_param.split())
+            match = PARAM_PATTERN.match(normalized)
+            if not match:
+                continue
+            name, direction, datatype = match.groups()
+            params.append({
+                "name": _normalize_identifier(name),
+                "type": datatype.strip().upper(),
+                "direction": (direction or "IN").upper().replace("  ", " "),
+            })
+    return params
+
+
 def build_discovery_model(sql_text: str) -> Dict[str, Any]:
     """Build a full-file discovery model for schema + procedure behavior."""
     cleaned = _prepare_sql_text(sql_text)
@@ -2699,6 +2794,25 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         target_tables = _extract_target_tables(operations_by_table)
         skip_locked_tables = _extract_skip_locked_tables(item.block_text, cursor_definitions, driving_table)
         sequence_dependencies = _extract_sequence_dependencies(item.block_text, sequence_names)
+
+        # RC4 FIX: extract programmatic raises
+        programmatic_raises = _extract_programmatic_raises(item.block_text)
+        # RC8 FIX: detect PRAGMA AUTONOMOUS_TRANSACTION
+        autonomous_transaction = _has_autonomous_transaction(item.block_text)
+        # RC6 FIX: extract package constants
+        package_constants = _extract_package_constants(item.block_text)
+        # RC3 FIX: extract null-safe params (NVL-wrapped)
+        all_param_names = [p["name"] for p in params["all"]]
+        null_safe_params = _extract_null_safe_params(item.block_text, all_param_names)
+        # RC2 FIX: if no params found from header (package body inner proc), try body regex
+        if not params["all"] and item.object_type.upper() == "PACKAGE":
+            inner_params = _extract_inner_procedure_params(item.block_text)
+            if inner_params:
+                params_in = [p for p in inner_params if "OUT" not in p.get("direction", "")]
+                params_out = [p for p in inner_params if "OUT" in p.get("direction", "")]
+                params = {"in": params_in, "out": params_out, "all": inner_params}
+                all_param_names = [p["name"] for p in inner_params]
+                null_safe_params = _extract_null_safe_params(item.block_text, all_param_names)
         select_assignments = _extract_select_into_assignments(item.block_text)
         scalar_assignments = _extract_scalar_assignments(
             item.block_text,
@@ -2846,6 +2960,14 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "issues": issues,
             "dependency_chain": dependency_chain,
             "semantic_analysis": semantic_analysis,
+            # RC4 FIX: programmatic raises (raise_application_error calls)
+            "programmatic_raises": programmatic_raises,
+            # RC8 FIX: autonomous transaction flag
+            "autonomous_transaction": autonomous_transaction,
+            # RC6 FIX: package constants
+            "package_constants": package_constants,
+            # RC3 FIX: null-safe params (NVL-wrapped booleans)
+            "null_safe_params": null_safe_params,
         }
         procedures.append(proc_entry)
 
@@ -2908,6 +3030,16 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
             "dependencyChain": proc.get("dependency_chain", []),
             "semantic_analysis": proc.get("semantic_analysis", {}),
             "semanticAnalysis": proc.get("semantic_analysis", {}),
+            # RC4 FIX
+            "programmatic_raises": proc.get("programmatic_raises", []),
+            # RC8 FIX
+            "autonomous_transaction": proc.get("autonomous_transaction", False),
+            # RC6 FIX
+            "package_constants": proc.get("package_constants", []),
+            # RC3 FIX
+            "null_safe_params": proc.get("null_safe_params", []),
+            # RC7 FIX: dependency_graph with procedures_called
+            "dependency_graph": proc.get("dependency_graph", {}),
         }
         results.append(entry)
     return results

@@ -1501,12 +1501,182 @@ class LLMConversionEngine:
             if object_type == 'TRIGGER':
                 continue
             filename = self._derive_service_filename(unit)
-            services[filename] = self._generate_deterministic_service_from_unit(
-                unit=unit,
-                entities=entities,
-                repositories=repositories,
-            )
+            # RC1 FIX: route no-SQL (utility) packages to a dedicated generator
+            if self._is_utility_unit(unit):
+                services[filename] = self._generate_utility_service_from_unit(
+                    unit=unit,
+                    all_units=source_units,
+                )
+            else:
+                services[filename] = self._generate_deterministic_service_from_unit(
+                    unit=unit,
+                    entities=entities,
+                    repositories=repositories,
+                    all_units=source_units,
+                )
         return services
+
+    def _is_utility_unit(self, unit: Dict[str, Any]) -> bool:
+        """RC1 FIX: True when the procedure/package has no SQL operations — pure control-flow logic."""
+        return not bool(unit.get('operations_by_table'))
+
+    def _generate_utility_service_from_unit(
+        self,
+        unit: Dict[str, Any],
+        all_units: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """RC1+RC5 FIX: generate a pure-logic (no-DB) service for utility/infrastructure packages."""
+        package_name = self.config.get('output', {}).get('package_name', 'com.company.project')
+        service_name = self._derive_service_name(unit.get('name', 'Generated'))
+        method_name = self._to_camel_case(unit.get('name', 'execute'))
+
+        imports: Set[str] = {
+            'import org.springframework.stereotype.Service;',
+        }
+
+        # RC8 FIX: PRAGMA AUTONOMOUS_TRANSACTION → REQUIRES_NEW
+        autonomous_transaction = unit.get('autonomous_transaction', False)
+        if autonomous_transaction:
+            imports.add('import org.springframework.transaction.annotation.Transactional;')
+            imports.add('import org.springframework.transaction.annotation.Propagation;')
+            tx_annotation = '    @Transactional(propagation = Propagation.REQUIRES_NEW)\n'
+        else:
+            tx_annotation = ''
+
+        # RC6 FIX: emit private static final constants
+        constants_lines: List[str] = []
+        for const in (unit.get('package_constants') or []):
+            java_type = self._map_plsql_type_to_java(const.get('type', 'VARCHAR2'), const.get('name', ''), 'IN')
+            value = const.get('value', '')
+            if java_type == 'String':
+                value_expr = f'"{value}"'
+            elif java_type == 'Boolean':
+                value_expr = value.lower() if value.lower() in ('true', 'false') else 'false'
+            else:
+                value_expr = value if value else '0'
+            const_name = re.sub(r'[^A-Z0-9_]', '_', const.get('name', 'CONSTANT').upper())
+            constants_lines.append(f'    private static final {java_type} {const_name} = {value_expr};')
+
+        # RC2 FIX: build method params — BOOLEAN correctly maps to Boolean here
+        method_params_parts: List[str] = []
+        null_safe_set = {p.upper() for p in (unit.get('null_safe_params') or [])}
+        for param in (unit.get('input_parameters') or []):
+            raw_name = str(param.get('name', '')).strip()
+            if not raw_name:
+                continue
+            param_name = normalize_column_name(raw_name)
+            java_type = self._map_plsql_type_to_java(
+                str(param.get('type', '')),
+                raw_name,
+                str(param.get('direction', 'IN')),
+            )
+            method_params_parts.append(f'{java_type} {param_name}')
+        method_params = ', '.join(method_params_parts)
+
+        # RC7 FIX: inject cross-service dependencies from procedures_called
+        dep_graph = unit.get('dependency_graph') or {}
+        procedures_called = dep_graph.get('procedures_called', [])
+        cross_service_fields: List[str] = []
+        cross_service_constructor_args: List[str] = []
+        cross_service_inits: List[str] = []
+        if all_units:
+            unit_name_to_service: Dict[str, str] = {
+                u.get('name', '').upper(): self._derive_service_name(u.get('name', 'Generated'))
+                for u in all_units
+                if u.get('name') and u.get('name', '').upper() != unit.get('name', '').upper()
+            }
+            for called in procedures_called:
+                svc_name = unit_name_to_service.get(called.upper())
+                if not svc_name:
+                    continue
+                svc_var = self._lower_first(svc_name)
+                cross_service_fields.append(f'    private final {svc_name} {svc_var};')
+                cross_service_constructor_args.append(f'{svc_name} {svc_var}')
+                cross_service_inits.append(f'        this.{svc_var} = {svc_var};')
+
+        # RC3/RC4 FIX: build method body — null-safe boolean guards + throw new BusinessException
+        body_lines: List[str] = []
+        programmatic_raises = unit.get('programmatic_raises') or []
+
+        for param in (unit.get('input_parameters') or []):
+            raw_name = str(param.get('name', '')).strip()
+            if not raw_name:
+                continue
+            param_name = normalize_column_name(raw_name)
+            java_type = self._map_plsql_type_to_java(str(param.get('type', '')), raw_name, 'IN')
+            if java_type == 'Boolean' and raw_name.upper() in null_safe_set:
+                # RC3 FIX: NVL(p_condition, false) → null-safe guard
+                if programmatic_raises:
+                    raise_info = programmatic_raises[0]
+                    error_code = raise_info.get('error_code', '-20000')
+                    body_lines.append(
+                        f'if ({param_name} == null || !{param_name}) {{'
+                    )
+                    body_lines.append(
+                        f'    throw new BusinessException({error_code}, "Assertion failed");'
+                    )
+                    body_lines.append('}')
+                else:
+                    body_lines.append(f'if ({param_name} == null || !{param_name}) {{')
+                    body_lines.append('    throw new BusinessException(-20000, "Assertion failed");')
+                    body_lines.append('}')
+            elif java_type == 'Boolean':
+                body_lines.append(f'if ({param_name} != null && !{param_name}) {{')
+                body_lines.append('    throw new BusinessException(-20000, "Assertion failed");')
+                body_lines.append('}')
+
+        # Emit any additional raises not already handled
+        for raise_info in programmatic_raises:
+            error_code = raise_info.get('error_code', '-20000')
+            message = raise_info.get('message', 'Error')
+            if not any('throw new BusinessException' in line for line in body_lines):
+                body_lines.append(
+                    f'// Source: RAISE_APPLICATION_ERROR({error_code}, ...)'
+                )
+                body_lines.append(
+                    f'throw new BusinessException({error_code}, "{message}");'
+                )
+
+        if not body_lines:
+            body_lines.append('// No SQL operations — pure utility/infrastructure logic preserved here.')
+
+        method_body = '\n'.join(f'        {line}' for line in body_lines)
+
+        # RC4 FIX: inner BusinessException class
+        helper_block = (
+            '\n'
+            '    private static final class BusinessException extends RuntimeException {\n'
+            '        private final int errorCode;\n'
+            '        BusinessException(int errorCode, String message) {\n'
+            '            super(message);\n'
+            '            this.errorCode = errorCode;\n'
+            '        }\n'
+            '        int getErrorCode() { return errorCode; }\n'
+            '    }\n'
+        )
+
+        constants_block = ('\n' + '\n'.join(constants_lines) + '\n') if constants_lines else ''
+        fields_block = '\n'.join(cross_service_fields) + ('\n' if cross_service_fields else '')
+        constructor_args_str = ', '.join(cross_service_constructor_args)
+        inits_block = '\n'.join(cross_service_inits) + ('\n' if cross_service_inits else '')
+
+        return (
+            f'package {package_name}.service;\n\n'
+            f'{chr(10).join(sorted(imports))}\n\n'
+            '@Service\n'
+            f'public class {service_name} {{\n'
+            f'{constants_block}'
+            f'{fields_block}\n'
+            f'    public {service_name}({constructor_args_str}) {{\n'
+            f'{inits_block}'
+            '    }\n\n'
+            f'{tx_annotation}'
+            f'    public void {method_name}({method_params}) {{\n'
+            f'{method_body}\n'
+            '    }\n'
+            f'{helper_block}'
+            '}\n'
+        )
 
     def _build_service_parameters(self, unit: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
         params = []
@@ -1578,6 +1748,7 @@ class LLMConversionEngine:
         unit: Dict[str, Any],
         entities: Dict[str, str],
         repositories: Dict[str, str],
+        all_units: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         package_name = self.config.get('output', {}).get('package_name', 'com.company.project')
         service_name = self._derive_service_name(unit.get('name', 'Generated'))
@@ -1692,7 +1863,12 @@ class LLMConversionEngine:
             or transaction.get('has_rollback')
             or re.search(r"\b(commit|rollback|savepoint)\b", raw_plsql, flags=re.IGNORECASE)
         )
-        if requires_transactional_method:
+        # RC8 FIX: PRAGMA AUTONOMOUS_TRANSACTION → Propagation.REQUIRES_NEW
+        autonomous_transaction = unit.get('autonomous_transaction', False)
+        if autonomous_transaction:
+            imports.add('import org.springframework.transaction.annotation.Transactional;')
+            imports.add('import org.springframework.transaction.annotation.Propagation;')
+        elif requires_transactional_method:
             imports.add('import org.springframework.transaction.annotation.Transactional;')
 
         skip_locked_tables = {
@@ -1747,6 +1923,27 @@ class LLMConversionEngine:
             field_lines.append(f"    private final {repository_name} {repository_var};")
             constructor_lines.append(f"{repository_name} {repository_var}")
             init_lines.append(f"        this.{repository_var} = {repository_var};")
+
+        # RC7 FIX: inject cross-service dependencies from procedures_called
+        dep_graph = unit.get('dependency_graph') or {}
+        procedures_called = dep_graph.get('procedures_called', [])
+        if all_units and procedures_called:
+            unit_name_to_service_map: Dict[str, str] = {
+                u.get('name', '').upper(): self._derive_service_name(u.get('name', 'Generated'))
+                for u in all_units
+                if u.get('name') and u.get('name', '').upper() != unit.get('name', '').upper()
+            }
+            seen_cross_services: Set[str] = set()
+            for called_proc in procedures_called:
+                svc_class = unit_name_to_service_map.get(called_proc.upper())
+                if not svc_class or svc_class in seen_cross_services:
+                    continue
+                seen_cross_services.add(svc_class)
+                svc_var = self._lower_first(svc_class)
+                field_lines.append(f"    private final {svc_class} {svc_var};")
+                constructor_lines.append(f"{svc_class} {svc_var}")
+                init_lines.append(f"        this.{svc_var} = {svc_var};")
+                imports.add(f"import {package_name}.service.{svc_class};")
 
         body_lines: List[str] = [
             'int page = 0;',
@@ -2161,7 +2358,11 @@ class LLMConversionEngine:
                 )
             )
         helper_block = "\n\n".join(helper_methods)
-        method_annotation = "    @Transactional\n" if requires_transactional_method else ""
+        method_annotation = (
+            "    @Transactional(propagation = Propagation.REQUIRES_NEW)\n"
+            if autonomous_transaction
+            else ("    @Transactional\n" if requires_transactional_method else "")
+        )
         return (
             f"package {package_name}.service;\n\n"
             f"{chr(10).join(sorted(imports))}\n\n"
@@ -2851,19 +3052,6 @@ public class {service_name} {{
             "6. Prefer the smallest safe edit that removes a compile error.\n"
             "7. If a method, annotation block, or trailing fragment is incomplete or syntactically broken, complete it or remove the broken fragment.\n"
             "8. If a type is used but not imported, add the exact missing import.\n"
-<<<<<<< Updated upstream
-            "9. If a class/entity/repository name does not exist, replace it with the real existing generated class name instead of inventing a new one.\n"
-            "10. If an argument list, method signature, or generic type does not match existing code, rewrite it to match the declared existing signature exactly.\n"
-            "11. If the code references undefined local variables, replace them with existing in-scope variables or compile-safe literals/constants.\n"
-            "12. If a field accessor/mutator does not exist, switch to a real existing accessor/mutator or remove that line.\n"
-            "13. Never leave a file half-written. Every edited Java file must end with balanced braces and valid syntax.\n"
-            "14. In service classes, replace TODOs, placeholders, disconnected branches, and no-op CRUD logic with actual repository calls whenever the repository method already exists.\n"
-            "15. In service classes, prefer calling existing custom repository methods first; if none exist, use findById/save/deleteById as the compile-safe fallback.\n"
-            "16. If a service is not calling its repository at all, wire it to the matching repository instead of leaving the logic disconnected.\n"
-            "17. Do not make speculative runtime/business-logic improvements in this pass.\n"
-            "18. Focus first on the files named in the compiler output. Do not touch unrelated files unless one of those files cannot compile without it.\n"
-            "19. Assume the build will be rerun immediately. Your response should maximize the chance that the next compile has fewer errors, ideally zero.\n\n"
-=======
             "9. In service classes, if Optional<...>, Optional., or Optional(...) appears, ensure `import java.util.Optional;` exists.\n"
             "10. In service classes, if TransactionTemplate appears, ensure `import org.springframework.transaction.support.TransactionTemplate;` exists.\n"
             "11. In service classes, if PlatformTransactionManager appears, ensure `import org.springframework.transaction.PlatformTransactionManager;` exists.\n"
@@ -2879,7 +3067,6 @@ public class {service_name} {{
             "21. Do not make speculative runtime/business-logic improvements in this pass.\n"
             "22. Focus first on the files named in the compiler output. Do not touch unrelated files unless one of those files cannot compile without it.\n"
             "23. Assume the build will be rerun immediately. Your response should maximize the chance that the next compile has fewer errors, ideally zero.\n\n"
->>>>>>> Stashed changes
             "Common compile-only fixes allowed in this pass:\n"
             "- add missing imports such as LocalTime, Timestamp, BigDecimal, Arrays, ArrayList, Pattern, AtomicReference\n"
             "- fix truncated repository/service/interface/class files\n"
