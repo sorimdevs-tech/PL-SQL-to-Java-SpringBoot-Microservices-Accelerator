@@ -5,6 +5,7 @@ import type {
   FileContentResponse,
   FilesResponse,
   GeneratedFile,
+  GitHubOutputConfig,
 } from "@/types/jobs-api"
 
 const API_BASE_URL = "http://127.0.0.1:8000"
@@ -38,6 +39,7 @@ export async function createDatabaseJob(
   payload: DatabaseJobRequest,
   configOverrides?: ConfigOverrides,
   outputDirectory?: string,
+  githubOutput?: GitHubOutputConfig,
 ): Promise<ConversionJob> {
   const connectionString = buildConnectionString(payload)
 
@@ -49,6 +51,7 @@ export async function createDatabaseJob(
       config_path: payload.configPath ?? "config.json",
       config_overrides: configOverrides,
       output_directory: outputDirectory,
+      github_output: githubOutput,
     }),
   })
 
@@ -60,6 +63,7 @@ export async function createFileJob(
   configPath = "config.json",
   configOverrides?: ConfigOverrides,
   outputDirectory?: string,
+  githubOutput?: GitHubOutputConfig,
 ): Promise<ConversionJob> {
   const formData = new FormData()
   formData.append("source_file", file)
@@ -69,6 +73,9 @@ export async function createFileJob(
   }
   if (outputDirectory) {
     formData.append("output_directory", outputDirectory)
+  }
+  if (githubOutput) {
+    formData.append("github_output", JSON.stringify(githubOutput))
   }
 
   const response = await fetch(toApiUrl("/api/jobs/file"), {
@@ -84,6 +91,7 @@ export async function createGitJob(
   configPath = "config.json",
   configOverrides?: ConfigOverrides,
   outputDirectory?: string,
+  githubOutput?: GitHubOutputConfig,
 ): Promise<ConversionJob> {
   const response = await fetch(toApiUrl("/api/jobs/git"), {
     method: "POST",
@@ -93,6 +101,7 @@ export async function createGitJob(
       config_path: configPath,
       config_overrides: configOverrides,
       output_directory: outputDirectory,
+      github_output: githubOutput,
     }),
   })
 

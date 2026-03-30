@@ -57,6 +57,7 @@ type SourceMethod = "git" | "oracle" | "sqlfile"
 type BuildTool = "mvn" | "gradle"
 type SpringConfigFormat = "properties" | "yaml"
 type PackagingType = "jar" | "war"
+type OutputDestination = "local" | "github"
 
 const DEFAULT_SPRING_DEPENDENCIES = [
   { id: "web", name: "Spring Web", description: "Build REST APIs with Spring MVC." },
@@ -1695,8 +1696,22 @@ interface StrategyPanelProps {
   setProjectDescription: (value: string) => void
   projectPackageName: string
   setProjectPackageName: (value: string) => void
+  outputDestination: OutputDestination
+  setOutputDestination: (value: OutputDestination) => void
   outputDirectory: string
   setOutputDirectory: (value: string) => void
+  githubOutputRepoUrl: string
+  setGithubOutputRepoUrl: (value: string) => void
+  githubOutputBranch: string
+  setGithubOutputBranch: (value: string) => void
+  githubOutputPath: string
+  setGithubOutputPath: (value: string) => void
+  githubOutputToken: string
+  setGithubOutputToken: (value: string) => void
+  githubOutputUsername: string
+  setGithubOutputUsername: (value: string) => void
+  githubCommitMessage: string
+  setGithubCommitMessage: (value: string) => void
   analyzedDependencies: DependencyInsight[]
   suggestedDependencies: SuggestedDependency[]
   selectedOptionalDependencies: string[]
@@ -1896,22 +1911,97 @@ function StrategyPanel(props: StrategyPanelProps) {
                 </div>
               ))}
               <div className="grid items-center gap-3 md:grid-cols-[140px_1fr]">
-                <p className="text-sm text-slate-700">Output directory</p>
-                <div className="flex items-center gap-3">
-                  <input
-                    value={props.outputDirectory}
-                    onChange={(event) => props.setOutputDirectory(event.target.value)}
-                    placeholder="C:\\projects\\output\\converted-app"
-                    className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
-                  />
-                  <button
-                    type="button"
-                    onClick={handlePickDirectory}
-                    disabled={isPickingDir}
-                    className="inline-flex h-9 items-center justify-center rounded-full border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {isPickingDir ? "Picking..." : "Choose"}
-                  </button>
+                <p className="text-sm text-slate-700">Output destination</p>
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-6 text-sm text-slate-800">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="output-destination"
+                        checked={props.outputDestination === "local"}
+                        onChange={() => props.setOutputDestination("local")}
+                        className="h-4 w-4 accent-green-500"
+                      />
+                      Local directory
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="output-destination"
+                        checked={props.outputDestination === "github"}
+                        onChange={() => props.setOutputDestination("github")}
+                        className="h-4 w-4 accent-green-500"
+                      />
+                      GitHub repository
+                    </label>
+                  </div>
+
+                  {props.outputDestination === "local" ? (
+                    <div className="flex items-center gap-3">
+                      <input
+                        value={props.outputDirectory}
+                        onChange={(event) => props.setOutputDirectory(event.target.value)}
+                        placeholder="C:\\projects\\output\\converted-app"
+                        className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={handlePickDirectory}
+                        disabled={isPickingDir}
+                        className="inline-flex h-9 items-center justify-center rounded-full border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isPickingDir ? "Picking..." : "Choose"}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50/70 p-3">
+                      <input
+                        value={props.githubOutputRepoUrl}
+                        onChange={(event) => props.setGithubOutputRepoUrl(event.target.value)}
+                        placeholder="https://github.com/org/converted-output.git"
+                        className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                      />
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <input
+                          value={props.githubOutputBranch}
+                          onChange={(event) => props.setGithubOutputBranch(event.target.value)}
+                          placeholder="main"
+                          className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                        />
+                        <input
+                          value={props.githubOutputPath}
+                          onChange={(event) => props.setGithubOutputPath(event.target.value)}
+                          placeholder="generated/my-app"
+                          className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                        />
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <input
+                          value={props.githubOutputUsername}
+                          onChange={(event) => props.setGithubOutputUsername(event.target.value)}
+                          placeholder="x-access-token"
+                          className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                        />
+                        <input
+                          type="password"
+                          value={props.githubOutputToken}
+                          onChange={(event) => props.setGithubOutputToken(event.target.value)}
+                          placeholder="GitHub personal access token"
+                          className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                        />
+                      </div>
+                      <input
+                        value={props.githubCommitMessage}
+                        onChange={(event) => props.setGithubCommitMessage(event.target.value)}
+                        placeholder="Add generated Spring Boot output"
+                        className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                      />
+                      <p className="text-xs text-slate-500">
+                        Use an HTTPS repo URL with a GitHub token, or an SSH repo URL if this machine already has push
+                        access configured.
+                      </p>
+                    </div>
+                  )}
                 </div>
                 {pickDirError ? <p className="text-xs text-rose-600">{pickDirError}</p> : null}
               </div>
@@ -2100,6 +2190,15 @@ interface SummaryPanelProps {
 }
 
 function SummaryPanel(props: SummaryPanelProps) {
+  function extractRepoName(repoUrl: string): string {
+    const normalized = repoUrl.trim().replace(/\/+$/, "")
+    if (!normalized) {
+      return "Repository not available"
+    }
+    const lastSegment = normalized.split("/").pop() ?? normalized
+    return lastSegment.replace(/\.git$/i, "") || "Repository not available"
+  }
+
   function formatDuration(ms: number | null | undefined): string {
     if (!Number.isFinite(ms) || ms === null || ms === undefined) {
       return "Not available"
@@ -2144,6 +2243,11 @@ function SummaryPanel(props: SummaryPanelProps) {
       : props.sourceMethod === "sqlfile"
         ? props.sourceFileName || "Not selected"
         : `${props.dbHost}:${props.dbPort}/${props.dbServiceName}`
+  const rawOutputLocation = props.conversionSnapshot?.outputDirectory ?? ""
+  const outputDisplayName = props.conversionSnapshot?.outputDisplayName ?? "not available"
+  const isGitOutput = rawOutputLocation.startsWith("http://") || rawOutputLocation.startsWith("https://")
+  const outputTitle = isGitOutput ? "Output Repository" : "Output Directory"
+  const outputSummaryName = isGitOutput ? extractRepoName(rawOutputLocation) : outputDisplayName
   const normalizedProcedures = props.selectedProcedures.map((name) => name.toLowerCase())
   const dominantDomains = []
   if (normalizedProcedures.some((name) => name.includes("validate") || name.includes("check"))) {
@@ -2202,8 +2306,8 @@ Generated outputs include ${backendSummary.entities_generated ?? 0} entities, ${
 
 Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configuration in ${
         props.springConfigFormat === "properties" ? "application.properties" : "application.yml"
-      }, baseline dependencies: ${defaultDependencyNames.join(", ")}. Output directory: ${
-        props.conversionSnapshot?.outputDirectory ?? "not available"
+      }, baseline dependencies: ${defaultDependencyNames.join(", ")}. ${outputTitle}: ${
+        outputSummaryName
       }.`
     : "Run a conversion to generate a real summary from the backend."
 
@@ -2383,10 +2487,11 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
             </p>
           </div>
           <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Output Directory</p>
+            <p className="text-xs uppercase tracking-wide text-slate-500">{outputTitle}</p>
             <p className="text-sm font-semibold break-words text-slate-800">
-              {props.conversionSnapshot?.outputDirectory ?? "Run conversion to get output path"}
+              {outputSummaryName === "not available" ? "Run conversion to get output path" : outputSummaryName}
             </p>
+            {rawOutputLocation ? <p className="mt-1 break-words text-xs text-slate-500">{rawOutputLocation}</p> : null}
           </div>
           <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-500">Generated File Paths</p>
@@ -2520,6 +2625,20 @@ interface PanelBodyProps {
   setProjectPackageName: (value: string) => void
   outputDirectory: string
   setOutputDirectory: (value: string) => void
+  outputDestination: OutputDestination
+  setOutputDestination: (value: OutputDestination) => void
+  githubOutputRepoUrl: string
+  setGithubOutputRepoUrl: (value: string) => void
+  githubOutputBranch: string
+  setGithubOutputBranch: (value: string) => void
+  githubOutputPath: string
+  setGithubOutputPath: (value: string) => void
+  githubOutputToken: string
+  setGithubOutputToken: (value: string) => void
+  githubOutputUsername: string
+  setGithubOutputUsername: (value: string) => void
+  githubCommitMessage: string
+  setGithubCommitMessage: (value: string) => void
   analyzedDependencies: DependencyInsight[]
   suggestedDependencies: SuggestedDependency[]
   selectedOptionalDependencies: string[]
@@ -2625,8 +2744,22 @@ function PanelBody(props: PanelBodyProps) {
               setProjectDescription={props.setProjectDescription}
               projectPackageName={props.projectPackageName}
               setProjectPackageName={props.setProjectPackageName}
+              outputDestination={props.outputDestination}
+              setOutputDestination={props.setOutputDestination}
               outputDirectory={props.outputDirectory}
               setOutputDirectory={props.setOutputDirectory}
+              githubOutputRepoUrl={props.githubOutputRepoUrl}
+              setGithubOutputRepoUrl={props.setGithubOutputRepoUrl}
+              githubOutputBranch={props.githubOutputBranch}
+              setGithubOutputBranch={props.setGithubOutputBranch}
+              githubOutputPath={props.githubOutputPath}
+              setGithubOutputPath={props.setGithubOutputPath}
+              githubOutputToken={props.githubOutputToken}
+              setGithubOutputToken={props.setGithubOutputToken}
+              githubOutputUsername={props.githubOutputUsername}
+              setGithubOutputUsername={props.setGithubOutputUsername}
+              githubCommitMessage={props.githubCommitMessage}
+              setGithubCommitMessage={props.setGithubCommitMessage}
               analyzedDependencies={props.analyzedDependencies}
               suggestedDependencies={props.suggestedDependencies}
               selectedOptionalDependencies={props.selectedOptionalDependencies}
@@ -2654,7 +2787,14 @@ function PanelBody(props: PanelBodyProps) {
             projectDisplayName={props.projectDisplayName}
             projectDescription={props.projectDescription}
             projectPackageName={props.projectPackageName}
+            outputDestination={props.outputDestination}
             outputDirectory={props.outputDirectory}
+            githubOutputRepoUrl={props.githubOutputRepoUrl}
+            githubOutputBranch={props.githubOutputBranch}
+            githubOutputPath={props.githubOutputPath}
+            githubOutputToken={props.githubOutputToken}
+            githubOutputUsername={props.githubOutputUsername}
+            githubCommitMessage={props.githubCommitMessage}
             optionalDependencies={props.selectedOptionalDependencies}
             onConversionStart={props.onConversionStart}
             onSnapshotChange={props.onSnapshotChange}
@@ -2728,7 +2868,14 @@ export function StepPanels({
   const [projectDisplayName, setProjectDisplayName] = useState("demo")
   const [projectDescription, setProjectDescription] = useState("Demo project for Spring Boot")
   const [projectPackageName, setProjectPackageName] = useState("com.example.demo")
+  const [outputDestination, setOutputDestination] = useState<OutputDestination>("local")
   const [outputDirectory, setOutputDirectory] = useState("")
+  const [githubOutputRepoUrl, setGithubOutputRepoUrl] = useState("")
+  const [githubOutputBranch, setGithubOutputBranch] = useState("main")
+  const [githubOutputPath, setGithubOutputPath] = useState("")
+  const [githubOutputToken, setGithubOutputToken] = useState("")
+  const [githubOutputUsername, setGithubOutputUsername] = useState("x-access-token")
+  const [githubCommitMessage, setGithubCommitMessage] = useState("")
   const [analyzedDependencies, setAnalyzedDependencies] = useState<DependencyInsight[]>([])
   const [suggestedDependencies, setSuggestedDependencies] = useState<SuggestedDependency[]>([])
   const [selectedOptionalDependencies, setSelectedOptionalDependencies] = useState<string[]>([])
@@ -2877,8 +3024,22 @@ export function StepPanels({
         setProjectDescription={setProjectDescription}
         projectPackageName={projectPackageName}
         setProjectPackageName={setProjectPackageName}
+        outputDestination={outputDestination}
+        setOutputDestination={setOutputDestination}
         outputDirectory={outputDirectory}
         setOutputDirectory={setOutputDirectory}
+        githubOutputRepoUrl={githubOutputRepoUrl}
+        setGithubOutputRepoUrl={setGithubOutputRepoUrl}
+        githubOutputBranch={githubOutputBranch}
+        setGithubOutputBranch={setGithubOutputBranch}
+        githubOutputPath={githubOutputPath}
+        setGithubOutputPath={setGithubOutputPath}
+        githubOutputToken={githubOutputToken}
+        setGithubOutputToken={setGithubOutputToken}
+        githubOutputUsername={githubOutputUsername}
+        setGithubOutputUsername={setGithubOutputUsername}
+        githubCommitMessage={githubCommitMessage}
+        setGithubCommitMessage={setGithubCommitMessage}
         analyzedDependencies={analyzedDependencies}
         suggestedDependencies={suggestedDependencies}
         selectedOptionalDependencies={selectedOptionalDependencies}

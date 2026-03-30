@@ -26,11 +26,31 @@ export interface ConfigOverrides {
   output?: OutputConfigOverrides
 }
 
+export interface GitHubOutputConfig {
+  repo_url: string
+  branch?: string
+  target_path?: string
+  access_token?: string
+  username?: string
+  commit_message?: string
+}
+
+export interface GitHubPublishResult {
+  published: boolean
+  repo_url: string
+  branch: string
+  target_path: string
+  message?: string
+  commit_message?: string
+  commit_hash?: string
+}
+
 export interface JobResult {
   output_directory?: string
   generated_files?: string[]
   summary?: string
   artifacts?: Record<string, unknown>
+  github_publish?: GitHubPublishResult
 }
 
 export interface ConversionJob {
@@ -44,6 +64,7 @@ export interface ConversionJob {
   error: string | null
   result: JobResult | null
   output_directory: string | null
+  github_output?: GitHubOutputConfig | null
   download_url: string | null
   files_url: string | null
 }

@@ -11,6 +11,31 @@ from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
 
+def _first_env_value(*env_names: str) -> Optional[str]:
+    """Return the first non-empty environment variable value."""
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            return value
+    return None
+
+
+def _resolve_llm_api_key(provider: Optional[str] = None) -> Optional[str]:
+    """Resolve an API key from provider-specific env vars with sensible aliases."""
+    provider_key_map = {
+        "openrouter": ("OPENROUTER_API_KEY", "CEREBRAS_API_KEY"),
+        "cerebras": ("CEREBRAS_API_KEY", "OPENROUTER_API_KEY"),
+        "openai": ("OPENAI_API_KEY",),
+        "anthropic": ("ANTHROPIC_API_KEY",),
+    }
+    provider_name = (provider or "").strip().lower()
+    provider_candidates = provider_key_map.get(provider_name, ())
+    generic_candidates = ("OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+    return _first_env_value(*provider_candidates, *generic_candidates)
+
+
 class LLMConfig(BaseModel):
     """LLM configuration settings"""
     provider: str = "openai"
@@ -23,15 +48,10 @@ class LLMConfig(BaseModel):
     retry_attempts: int = 3
     batch_size: int = 5
     
-    @validator('api_key')
-    def validate_api_key(cls, v):
+    @validator('api_key', always=True)
+    def validate_api_key(cls, v, values):
         if v is None:
-            # Try to get from environment variables
-            v = (
-                os.getenv('OPENAI_API_KEY')
-                or os.getenv('ANTHROPIC_API_KEY')
-                or os.getenv('OPENROUTER_API_KEY')
-            )
+            v = _resolve_llm_api_key(values.get('provider'))
         if v is None:
             raise ValueError("API key must be provided either in config or environment variables")
         return v
@@ -55,11 +75,7 @@ class BackupLLMConfig(BaseModel):
         if not values.get('enabled'):
             return v
         if v is None:
-            v = (
-                os.getenv('OPENROUTER_API_KEY')
-                or os.getenv('OPENAI_API_KEY')
-                or os.getenv('ANTHROPIC_API_KEY')
-            )
+            v = _resolve_llm_api_key(values.get('provider'))
         if v is None:
             raise ValueError("Backup LLM API key must be provided either in config or environment variables")
         return v
@@ -148,16 +164,16 @@ class LoggingConfig(BaseModel):
 
 class PlatformConfig(BaseModel):
     """Main platform configuration"""
-    llm: LLMConfig = LLMConfig()
-    backup_llm: BackupLLMConfig = BackupLLMConfig()
-    database: DatabaseConfig = DatabaseConfig()
-    output: OutputConfig = OutputConfig()
-    validation: ValidationConfig = ValidationConfig()
-    performance: PerformanceConfig = PerformanceConfig()
-    security: SecurityConfig = SecurityConfig()
-    enterprise: EnterpriseConfig = EnterpriseConfig()
-    templates: TemplatesConfig = TemplatesConfig()
-    logging: LoggingConfig = LoggingConfig()
+    llm: LLMConfig = Field(default_factory=LLMConfig)
+    backup_llm: BackupLLMConfig = Field(default_factory=BackupLLMConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    output: OutputConfig = Field(default_factory=OutputConfig)
+    validation: ValidationConfig = Field(default_factory=ValidationConfig)
+    performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
+    enterprise: EnterpriseConfig = Field(default_factory=EnterpriseConfig)
+    templates: TemplatesConfig = Field(default_factory=TemplatesConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
 class ConfigManager:
@@ -221,18 +237,17 @@ class ConfigManager:
         llm_api_key = self._resolve_env_placeholder(llm_config.get('api_key'))
         llm_config['api_key'] = llm_api_key
         if llm_api_key in (None, "", "your-api-key-here"):
-            api_key = (
-                os.getenv('OPENAI_API_KEY')
-                or os.getenv('ANTHROPIC_API_KEY')
-                or os.getenv('OPENROUTER_API_KEY')
-            )
+            api_key = _resolve_llm_api_key(llm_config.get('provider'))
             if api_key:
                 llm_config['api_key'] = api_key
                 config_data['llm'] = llm_config
 
         fallback_cfg = llm_config.get('fallback')
         if isinstance(fallback_cfg, dict):
-            fallback_cfg['api_key'] = self._resolve_env_placeholder(fallback_cfg.get('api_key'))
+            fallback_api_key = self._resolve_env_placeholder(fallback_cfg.get('api_key'))
+            if fallback_api_key in (None, "", "your-api-key-here"):
+                fallback_api_key = _resolve_llm_api_key(fallback_cfg.get('provider'))
+            fallback_cfg['api_key'] = fallback_api_key
             llm_config['fallback'] = fallback_cfg
             config_data['llm'] = llm_config
 
@@ -241,11 +256,7 @@ class ConfigManager:
             backup_api_key = self._resolve_env_placeholder(backup_llm_config.get('api_key'))
             backup_llm_config['api_key'] = backup_api_key
             if backup_llm_config.get('enabled') and backup_api_key in (None, "", "your-api-key-here"):
-                api_key = (
-                    os.getenv('OPENROUTER_API_KEY')
-                    or os.getenv('OPENAI_API_KEY')
-                    or os.getenv('ANTHROPIC_API_KEY')
-                )
+                api_key = _resolve_llm_api_key(backup_llm_config.get('provider'))
                 if api_key:
                     backup_llm_config['api_key'] = api_key
             config_data['backup_llm'] = backup_llm_config

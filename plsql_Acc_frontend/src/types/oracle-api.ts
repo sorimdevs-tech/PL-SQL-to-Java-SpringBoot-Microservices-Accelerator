@@ -1,4 +1,4 @@
-import type { ConfigOverrides } from "./jobs-api"
+import type { ConfigOverrides, GitHubOutputConfig } from "./jobs-api"
 
 export interface OracleConnectionPayload {
   host: string
@@ -17,6 +17,7 @@ export interface OracleConvertPayload extends OracleConnectionPayload {
   config_path: string
   config_overrides?: ConfigOverrides
   output_directory?: string
+  github_output?: GitHubOutputConfig
 }
 
 export interface OracleObjectItem {
