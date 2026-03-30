@@ -148,6 +148,78 @@ def test_build_conversion_units_extracts_lookup_keys_from_predicates():
     assert "UPDATED_AT" not in lookup_keys["CUSTOMER_BALANCE"]
 
 
+def test_build_conversion_units_splits_package_body_into_subprogram_units():
+    sql = """
+    CREATE OR REPLACE PACKAGE customer_pkg AS
+        PROCEDURE create_customer(p_customer_id IN NUMBER);
+        PROCEDURE delete_customer(p_customer_id IN NUMBER);
+    END customer_pkg;
+    /
+    CREATE OR REPLACE PACKAGE BODY customer_pkg AS
+        g_default_status CONSTANT VARCHAR2(10) := 'ACTIVE';
+
+        PROCEDURE create_customer(p_customer_id IN NUMBER) IS
+        BEGIN
+            INSERT INTO customers(customer_id, status)
+            VALUES (p_customer_id, g_default_status);
+        END create_customer;
+
+        PROCEDURE delete_customer(p_customer_id IN NUMBER) IS
+        BEGIN
+            DELETE FROM customers
+            WHERE customer_id = p_customer_id;
+        END delete_customer;
+    END customer_pkg;
+    /
+    """
+
+    units = build_conversion_units(sql)
+
+    assert len(units) == 2
+    by_subprogram = {unit["subprogram_name"]: unit for unit in units}
+
+    assert {"create_customer", "delete_customer"} == set(by_subprogram.keys())
+    assert all(unit["object_type"] == "PACKAGE_PROCEDURE" for unit in units)
+    assert all(unit["package_name"] == "customer_pkg" for unit in units)
+    assert all(unit["name"].startswith("customer_pkg_") for unit in units)
+    assert all(unit.get("package_constants") for unit in units)
+
+    create_unit = by_subprogram["create_customer"]
+    delete_unit = by_subprogram["delete_customer"]
+    assert create_unit["operations_by_table"]["CUSTOMERS"] == ["INSERT"]
+    assert delete_unit["operations_by_table"]["CUSTOMERS"] == ["DELETE"]
+
+
+def test_build_conversion_units_tracks_package_overloads_without_dropping_units():
+    sql = """
+    CREATE OR REPLACE PACKAGE BODY customer_pkg AS
+        PROCEDURE sync_customer(p_customer_id IN NUMBER) IS
+        BEGIN
+            UPDATE customers
+            SET status = 'SYNCED'
+            WHERE customer_id = p_customer_id;
+        END sync_customer;
+
+        PROCEDURE sync_customer(p_customer_id IN NUMBER, p_status IN VARCHAR2) IS
+        BEGIN
+            UPDATE customers
+            SET status = p_status
+            WHERE customer_id = p_customer_id;
+        END sync_customer;
+    END customer_pkg;
+    /
+    """
+
+    units = build_conversion_units(sql)
+
+    assert len(units) == 2
+    names = sorted(unit["name"] for unit in units)
+    assert names[0] == "customer_pkg_sync_customer"
+    assert names[1] == "customer_pkg_sync_customer_overload2"
+    assert all(unit["subprogram_name"] == "sync_customer" for unit in units)
+    assert sorted(unit["overload_index"] for unit in units) == [1, 2]
+
+
 def test_build_conversion_units_ignores_markdown_fences():
     sql = """
     CREATE OR REPLACE PROCEDURE fenced_demo IS

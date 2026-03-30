@@ -2770,7 +2770,10 @@ export function StepPanels({
       : sourceMethod === "sqlfile"
         ? Boolean(sourceFile)
         : hasValue(dbHost) && hasValue(dbPort) && hasValue(dbServiceName) && hasValue(dbUsername) && hasValue(dbPassword)
-  const isStep2Ready = selectedProcedures.length > 0
+  const isStep2Ready =
+    sourceMethod === "oracle"
+      ? selectedProcedures.length > 0
+      : selectedObjects.length > 0 || selectedProcedures.length > 0
   const isStep3Ready =
     hasValue(springBootVersion) &&
     hasValue(javaVersion) &&

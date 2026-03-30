@@ -112,7 +112,7 @@ class PLSQLErrorListener(ErrorListener):
     def syntaxError(self, recognizer, offendingSymbol, line, column, msg, e):
         error_msg = f"Line {line}:{column} - {msg}"
         self.errors.append(error_msg)
-        logger.error(f"PL/SQL parsing error: {error_msg}")
+        logger.debug(f"PL/SQL parsing error (fallback to regex parser): {error_msg}")
 
 
 class PLSQLASTBuilder(PlSqlListener):

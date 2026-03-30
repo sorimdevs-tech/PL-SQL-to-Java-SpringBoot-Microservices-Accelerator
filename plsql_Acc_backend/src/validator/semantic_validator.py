@@ -382,8 +382,12 @@ class SemanticValidator:
                 continue
             object_name = unit.get("name", "")
             raw_plsql = unit.get("raw_plsql", "")
+            expected_method_name = self._to_camel_case(
+                str(unit.get("subprogram_name") or unit.get("name") or "")
+            )
             has_exception_block = bool(re.search(r"\bexception\b", raw_plsql, flags=re.IGNORECASE))
             semantic = unit.get("semantic_analysis") or {}
+            required_operations = self._extract_required_operations(unit)
             driving_table = str(unit.get("driving_table", "")).upper()
             target_tables = {str(table).upper() for table in (unit.get("target_tables") or []) if table}
             for ref in semantic.get("aggregation", {}).get("columns", []) or []:
@@ -392,6 +396,87 @@ class SemanticValidator:
                     target_tables.add(parts[0].strip().upper())
             if driving_table:
                 target_tables.add(driving_table)
+
+            if expected_method_name and not re.search(
+                rf"\bpublic\s+\w+\s+{re.escape(expected_method_name)}\s*\(",
+                service_code,
+            ):
+                issues.append(
+                    SemanticIssue(
+                        component="service",
+                        object_name=object_name,
+                        code="missing_expected_service_method",
+                        message=f"{service_filename} is missing expected method {expected_method_name}(...)",
+                        file_name=service_filename,
+                    )
+                )
+
+            if required_operations and "No SQL operations" in service_code:
+                issues.append(
+                    SemanticIssue(
+                        component="service",
+                        object_name=object_name,
+                        code="placeholder_logic_for_dml_unit",
+                        message=f"{service_filename} contains placeholder utility logic despite PL/SQL DML operations",
+                        file_name=service_filename,
+                    )
+                )
+
+            if required_operations and re.search(
+                r"\b(TODO|UnsupportedOperationException|not\s+implemented)\b",
+                service_code,
+                flags=re.IGNORECASE,
+            ):
+                issues.append(
+                    SemanticIssue(
+                        component="service",
+                        object_name=object_name,
+                        code="unimplemented_logic_detected",
+                        message=f"{service_filename} contains TODO/not-implemented logic for an executable PL/SQL unit",
+                        file_name=service_filename,
+                    )
+                )
+
+            if required_operations:
+                repository_vars = self._extract_repository_variables(service_code)
+                has_repository_call = any(
+                    re.search(rf"\b{re.escape(repo_var)}\.\w+\s*\(", service_code)
+                    for repo_var in repository_vars
+                )
+                if not has_repository_call:
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="missing_repository_calls_for_dml",
+                            message=f"{service_filename} has DML semantics but no repository method invocations",
+                            file_name=service_filename,
+                        )
+                    )
+
+                operation_patterns = {
+                    "INSERT": [r"\.\s*(insert\w*|save|saveAndFlush)\s*\("],
+                    "UPDATE": [r"\.\s*(update\w*|save|saveAndFlush)\s*\("],
+                    "DELETE": [r"\.\s*(delete\w*|remove\w*)\s*\("],
+                    "SELECT": [r"\.\s*(find\w*|sumBy\w*|count\w*)\s*\("],
+                }
+                for operation in sorted(required_operations):
+                    if operation not in operation_patterns:
+                        continue
+                    patterns = operation_patterns[operation]
+                    if not any(re.search(pattern, service_code) for pattern in patterns):
+                        issues.append(
+                            SemanticIssue(
+                                component="service",
+                                object_name=object_name,
+                                code=f"operation_not_preserved_{operation.lower()}",
+                                message=(
+                                    f"{service_filename} does not preserve required {operation} behavior "
+                                    f"from the source PL/SQL unit"
+                                ),
+                                file_name=service_filename,
+                            )
+                        )
 
             for table_name in sorted(target_tables):
                 repository_name = self._derive_repository_name_from_table(table_name)
@@ -658,6 +743,18 @@ class SemanticValidator:
                         )
                     )
         return issues
+
+    def _extract_required_operations(self, unit: Dict[str, Any]) -> Set[str]:
+        required: Set[str] = set()
+        for operations in (unit.get("operations_by_table") or {}).values():
+            for operation in (operations or []):
+                op = str(operation).upper()
+                if op in {"SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"}:
+                    required.add(op)
+        for upsert in (unit.get("semantic_analysis") or {}).get("upsert_operations", []) or []:
+            if str(upsert.get("operation", "")).upper() == "UPSERT":
+                required.add("MERGE")
+        return required
 
     def _validate_deterministic_repository_contracts(
         self,

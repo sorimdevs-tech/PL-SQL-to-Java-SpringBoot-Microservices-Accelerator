@@ -129,6 +129,10 @@ class PLSQLModernizationPipeline:
             # Stage 2: Extract raw PL/SQL semantics and full object bodies
             logger.info("Stage 2: Extracting SQL semantics from raw PL/SQL...")
             semantic_model = await self.extract_conversion_semantics(plsql_files)
+            
+            # SBG-30: Register procedure metadata for dynamic logic extraction
+            logger.info("Stage 2b: Registering procedure metadata for dynamic Java generation...")
+            self._register_procedures_with_generator(semantic_model, plsql_files)
 
             # Diagnostic parse only. AST is no longer the LLM source of truth.
             logger.info("Stage 2a: Parsing PL/SQL for diagnostics...")
@@ -413,6 +417,76 @@ class PLSQLModernizationPipeline:
             "sequences": sequence_map,
         }
 
+    def _register_procedures_with_generator(self, semantic_model: Dict[str, Any], plsql_files: Dict[str, str]) -> None:
+        """
+        SBG-30: Register procedure metadata with the Spring Boot generator.
+        
+        Extracts procedures from semantic model and registers them with the generator
+        so that actual PL/SQL business logic is used for Java generation instead of
+        hardcoded templates.
+        
+        Args:
+            semantic_model: Extracted semantic model containing procedure definitions
+            plsql_files: Original PL/SQL source files for reference
+        """
+        try:
+            # Extract all procedures/functions from conversion units
+            # The discovery_analyzer already splits package procedures into individual units
+            procedures = []
+            all_units = semantic_model.get("source_units", [])
+            
+            logger.info(f"SBG-30: Scanning {len(all_units)} units for procedures...")
+            
+            for unit_idx, unit in enumerate(all_units):
+                object_type = unit.get("object_type", "").upper()
+                unit_name = unit.get("name", "")
+                raw_plsql = unit.get("raw_plsql", "")
+                subprogram_name = unit.get('subprogram_name', '')
+                package_name = unit.get('package_name', '')
+                
+                logger.debug(f"SBG-30: Unit[{unit_idx}] type={object_type}, name={unit_name}, subprogram={subprogram_name}, pkg={package_name}, source_len={len(raw_plsql)}")
+                
+                # Include procedures, functions, and package procedures/functions
+                if any(x in object_type for x in ["PROCEDURE", "FUNCTION"]):
+                    # This unit IS a procedure or function
+                    proc_entry = {
+                        'name': subprogram_name or unit_name,
+                        'package_name': package_name or '',
+                        'package': package_name or '',
+                        'raw_plsql': raw_plsql,
+                        'body': raw_plsql,
+                        'object_type': object_type,
+                        'parameters': unit.get('input_parameters', []),
+                        'output_parameters': unit.get('output_parameters', []),
+                    }
+                    procedures.append(proc_entry)
+                    
+                    # Log extracted procedure details
+                    proc_key = f"{package_name}.{subprogram_name}" if package_name else subprogram_name
+                    source_lines = len(raw_plsql.splitlines()) if raw_plsql else 0
+                    logger.info(f"SBG-30: ✓ Found PL/SQL {object_type}: {proc_key} ({source_lines} lines)")
+            
+            if procedures:
+                logger.info(f"SBG-30: === REGISTERING {len(procedures)} PROCEDURES ===")
+                for proc in procedures:
+                    logger.info(f"SBG-30:   - {proc['name']} from {proc['package_name'] or 'GLOBAL'}")
+                
+                self.generator.register_procedure_metadata(procedures, plsql_files)
+                
+                # Verify registration succeeded
+                registered_count = len(self.generator._procedure_metadata)
+                logger.info(f"SBG-30: === REGISTERED {registered_count} PROCEDURES IN GENERATOR ===")
+                
+                for key in list(self.generator._procedure_metadata.keys())[:5]:  # Show first 5
+                    logger.info(f"SBG-30:   Registered: {key}")
+            else:
+                logger.warning("SBG-30: ❌ NO PROCEDURES FOUND IN SEMANTIC MODEL - falling back to templates")
+                logger.debug(f"SBG-30: Available unit types: {[u.get('object_type') for u in all_units]}")
+                
+        except Exception as e:
+            logger.warning(f"SBG-30: Failed to register procedures: {e}", exc_info=True)
+            # Continue without procedure metadata - fall back to SBG-29 templates
+
     def build_dependency_summary(self, semantic_model: Dict[str, Any]) -> Dict[str, Any]:
         tables = sorted(
             {
@@ -631,8 +705,16 @@ class PLSQLModernizationPipeline:
         Returns:
             Dict[str, str]: Generated service files
         """
+        source_units = semantic_model.get("source_units", [])
+        logger.info(f"Stage 5: Passing {len(source_units)} source units to LLM for service generation")
+        for unit in source_units:
+            obj_type = unit.get("object_type", "")
+            unit_name = unit.get("name", "")
+            source_len = len(unit.get("raw_plsql", ""))
+            logger.debug(f"  - {obj_type}: {unit_name} ({source_len} bytes)")
+        
         return await self.llm_engine.generate_services_from_semantics(
-            semantic_model.get("source_units", []),
+            source_units,
             entities,
             repositories,
             validation_feedback=validation_feedback,
@@ -759,7 +841,7 @@ class PLSQLModernizationPipeline:
 
         pre_stdout = ""
         pre_stderr = ""
-        if command[0] == "./gradlew":
+        if command[0] == "./gradlew" and os.name != "nt":
             chmod_result = subprocess.run(
                 ["chmod", "+x", "gradlew"],
                 cwd=str(project_root),
@@ -795,10 +877,18 @@ class PLSQLModernizationPipeline:
         mvnw = project_root / 'mvnw.cmd'
         pom = project_root / 'pom.xml'
 
-        if gradlew_unix.exists():
-            return ['./gradlew', 'compileJava']
-        if gradlew.exists():
-            return [str(gradlew), 'compileJava']
+        if os.name == "nt":
+            if gradlew.exists():
+                return [str(gradlew), 'compileJava']
+            if gradlew_unix.exists():
+                bash_cmd = shutil.which('bash')
+                if bash_cmd:
+                    return [bash_cmd, './gradlew', 'compileJava']
+        else:
+            if gradlew_unix.exists():
+                return ['./gradlew', 'compileJava']
+            if gradlew.exists():
+                return [str(gradlew), 'compileJava']
         if gradle.exists():
             gradle_cmd = shutil.which('gradle')
             if gradle_cmd:

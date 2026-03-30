@@ -207,7 +207,9 @@ class PromptTemplate:
             'trigger_to_event': self._get_trigger_template(),
             'package_to_class': self._get_strict_package_template(),
             'sql_to_repository': self._get_strict_repository_template(),
-            'entity_generation': self._get_entity_template()
+            'entity_generation': self._get_entity_template(),
+            # RC1 FIX: dedicated template for utility/non-DB packages
+            'utility_to_service': self._get_utility_template(),
         }
 
     def get_prompt(self, conversion_type: str, plsql_ast: Dict[str, Any],
@@ -575,9 +577,45 @@ Validation feedback from prior failed attempts:
 {validation_feedback}
 
 Rules:
-- Preserve package member behavior from the raw PL/SQL package body.
-- Do not invent repository methods or entity fields.
+- If the package has NO SQL operations (utility/infrastructure), generate a pure @Service with no repository injection.
+  Emit private static final constants from CONSTANT declarations.
+  Map BOOLEAN parameters to Boolean (never String).
+  Map raise_application_error() calls to: throw new BusinessException(errorCode, message);
+  Emit PRAGMA AUTONOMOUS_TRANSACTION as @Transactional(propagation = Propagation.REQUIRES_NEW).
+- If the package HAS SQL operations, generate a @Service that injects the relevant repositories.
+  Preserve MERGE as findBy + if(existing.isPresent()) update else insert.
+  Preserve BULK COLLECT as PageRequest-based batch loop.
+  Preserve NVL(x, default) as Optional.ofNullable(x).orElse(default).
+- Do not invent repository methods or entity fields not present in the source.
 - Output exactly one compilable Java class in package {package_name}.service.
+"""
+
+    def _get_utility_template(self) -> str:
+        return """
+Convert the following PL/SQL utility/infrastructure package to one Java Spring Boot @Service class.
+This package has NO direct SQL operations — it is pure control-flow and validation logic.
+
+SOURCE OF TRUTH:
+{plsql_code}
+
+EXTRACTED SEMANTICS:
+{semantic_summary}
+
+Validation feedback from prior failed attempts:
+{validation_feedback}
+
+MANDATORY RULES:
+1. No repository injection — this is a utility class.
+2. Emit all CONSTANT declarations as: private static final <JavaType> <CONST_NAME> = <value>;
+3. Map Oracle types to Java: BOOLEAN→Boolean, VARCHAR2→String, NUMBER→Long, NUMBER(p,s)→BigDecimal.
+4. For each BOOLEAN parameter: emit a null-safe guard:
+   if (param == null || !param) {{ throw new BusinessException(errorCode, "message"); }}
+5. Map raise_application_error(code, msg) → throw new BusinessException(code, msg);
+6. PRAGMA AUTONOMOUS_TRANSACTION → @Transactional(propagation = Propagation.REQUIRES_NEW)
+7. Include a private static final inner class BusinessException extends RuntimeException.
+8. Cross-package calls become constructor-injected service dependencies.
+9. Output exactly one compilable Java class in package {package_name}.service.
+10. File must end with the class closing brace. No content after it.
 """
 
     def _get_strict_repository_template(self) -> str:
@@ -1495,12 +1533,29 @@ class LLMConversionEngine:
         validation_feedback: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, str]:
         # Deterministic service generation with semantic constraints.
-        services: Dict[str, str] = {}
+        #
+        # Some discovery inputs can contain multiple units that map to the same
+        # service filename (for example a richer PACKAGE BODY unit and a sparse
+        # PACKAGE spec unit). Keep the strongest unit per filename so richer
+        # semantics are not overwritten by placeholder utility output.
+        selected_units: Dict[str, Dict[str, Any]] = {}
+        service_order: List[str] = []
         for unit in source_units:
             object_type = str(unit.get('object_type', 'PROCEDURE')).upper()
             if object_type == 'TRIGGER':
                 continue
             filename = self._derive_service_filename(unit)
+            current = selected_units.get(filename)
+            if current is None:
+                selected_units[filename] = unit
+                service_order.append(filename)
+                continue
+            if self._service_generation_score(unit) > self._service_generation_score(current):
+                selected_units[filename] = unit
+
+        services: Dict[str, str] = {}
+        for filename in service_order:
+            unit = selected_units[filename]
             # RC1 FIX: route no-SQL (utility) packages to a dedicated generator
             if self._is_utility_unit(unit):
                 services[filename] = self._generate_utility_service_from_unit(
@@ -1520,6 +1575,34 @@ class LLMConversionEngine:
         """RC1 FIX: True when the procedure/package has no SQL operations — pure control-flow logic."""
         return not bool(unit.get('operations_by_table'))
 
+    def _service_generation_score(self, unit: Dict[str, Any]) -> Tuple[int, ...]:
+        """Rank duplicate units that map to the same service filename."""
+        operations_by_table = unit.get('operations_by_table') or {}
+        semantic = unit.get('semantic_analysis') or {}
+        transaction = unit.get('transaction') or {}
+        target_tables = unit.get('target_tables') or []
+        lookup_map = unit.get('lookup_keys') or {}
+        lookup_key_count = sum(len(values or []) for values in lookup_map.values())
+        raw_plsql = str(unit.get('raw_plsql', ''))
+        has_exception_block = bool(re.search(r"\bexception\b", raw_plsql, flags=re.IGNORECASE))
+        return (
+            1 if operations_by_table else 0,
+            len(operations_by_table),
+            len(target_tables),
+            len(semantic.get('upsert_operations') or []),
+            len((semantic.get('aggregation', {}) or {}).get('columns', []) or []),
+            lookup_key_count,
+            1 if unit.get('autonomous_transaction') else 0,
+            len(unit.get('programmatic_raises') or []),
+            1 if transaction.get('has_savepoint') else 0,
+            1 if transaction.get('has_partial_rollback') else 0,
+            1 if transaction.get('has_commit') else 0,
+            1 if transaction.get('has_rollback') else 0,
+            1 if has_exception_block else 0,
+            len(unit.get('input_parameters') or []),
+            len(raw_plsql.strip()),
+        )
+
     def _generate_utility_service_from_unit(
         self,
         unit: Dict[str, Any],
@@ -1528,7 +1611,8 @@ class LLMConversionEngine:
         """RC1+RC5 FIX: generate a pure-logic (no-DB) service for utility/infrastructure packages."""
         package_name = self.config.get('output', {}).get('package_name', 'com.company.project')
         service_name = self._derive_service_name(unit.get('name', 'Generated'))
-        method_name = self._to_camel_case(unit.get('name', 'execute'))
+        method_source_name = unit.get('subprogram_name') or unit.get('name', 'execute')
+        method_name = self._to_camel_case(method_source_name)
 
         imports: Set[str] = {
             'import org.springframework.stereotype.Service;',
@@ -1545,13 +1629,25 @@ class LLMConversionEngine:
 
         # RC6 FIX: emit private static final constants
         constants_lines: List[str] = []
+        needs_bigdecimal = False
+        needs_localdatetime = False
         for const in (unit.get('package_constants') or []):
             java_type = self._map_plsql_type_to_java(const.get('type', 'VARCHAR2'), const.get('name', ''), 'IN')
+            if java_type == 'BigDecimal':
+                needs_bigdecimal = True
+                imports.add('import java.math.BigDecimal;')
+            if java_type == 'LocalDateTime':
+                needs_localdatetime = True
+                imports.add('import java.time.LocalDateTime;')
             value = const.get('value', '')
             if java_type == 'String':
                 value_expr = f'"{value}"'
             elif java_type == 'Boolean':
                 value_expr = value.lower() if value.lower() in ('true', 'false') else 'false'
+            elif java_type == 'BigDecimal':
+                value_expr = f'new BigDecimal("{value}")' if value else 'BigDecimal.ZERO'
+            elif java_type == 'Long':
+                value_expr = f'{value}L' if value else '0L'
             else:
                 value_expr = value if value else '0'
             const_name = re.sub(r'[^A-Z0-9_]', '_', const.get('name', 'CONSTANT').upper())
@@ -1572,6 +1668,14 @@ class LLMConversionEngine:
             )
             method_params_parts.append(f'{java_type} {param_name}')
         method_params = ', '.join(method_params_parts)
+        if "BigDecimal " in method_params:
+            imports.add('import java.math.BigDecimal;')
+        if "LocalDateTime " in method_params:
+            imports.add('import java.time.LocalDateTime;')
+        if "LocalDate " in method_params:
+            imports.add('import java.time.LocalDate;')
+        if "LocalTime " in method_params:
+            imports.add('import java.time.LocalTime;')
 
         # RC7 FIX: inject cross-service dependencies from procedures_called
         dep_graph = unit.get('dependency_graph') or {}
@@ -1640,6 +1744,27 @@ class LLMConversionEngine:
         if not body_lines:
             body_lines.append('// No SQL operations — pure utility/infrastructure logic preserved here.')
 
+        transaction = unit.get('transaction') or {}
+        has_exception_block = bool(re.search(r"\bexception\b", str(unit.get('raw_plsql', '')), flags=re.IGNORECASE))
+        requires_row_level_try = bool(transaction.get('has_savepoint')) or has_exception_block
+        if requires_row_level_try:
+            wrapped_lines: List[str] = [
+                'for (int rowIndex = 0; rowIndex < 1; rowIndex++) {',
+                '    try {',
+            ]
+            wrapped_lines.extend(f'        {line}' for line in body_lines)
+            wrapped_lines.extend(
+                [
+                    '    } catch (BusinessException e) {',
+                    '        continue;',
+                    '    } catch (Exception e) {',
+                    '        continue;',
+                    '    }',
+                    '}',
+                ]
+            )
+            body_lines = wrapped_lines
+
         method_body = '\n'.join(f'        {line}' for line in body_lines)
 
         # RC4 FIX: inner BusinessException class
@@ -1681,18 +1806,36 @@ class LLMConversionEngine:
     def _build_service_parameters(self, unit: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
         params = []
         name_map: Dict[str, str] = {}
+        used_param_names: Set[str] = set()
+        reserved_locals = {
+            'row',
+            'page',
+            'size',
+            'hasError',
+            'batchHasError',
+            'rowIndex',
+            'hasMore',
+        }
         for param in unit.get('input_parameters', []) or []:
             raw_name = str(param.get('name', '')).strip()
             if not raw_name:
                 continue
-            param_name = normalize_column_name(raw_name)
+            base_name = normalize_column_name(raw_name) or "param"
+            if base_name in reserved_locals:
+                base_name = f"{base_name}Param"
+            param_name = base_name
+            suffix = 2
+            while param_name in used_param_names:
+                param_name = f"{base_name}{suffix}"
+                suffix += 1
+            used_param_names.add(param_name)
             java_type = self._map_plsql_type_to_java(
                 str(param.get('type', '')),
                 raw_name,
                 str(param.get('direction', 'IN')),
             )
             params.append(f"{java_type} {param_name}")
-            name_map[raw_name.upper()] = param_name
+            name_map.setdefault(raw_name.upper(), param_name)
         return ", ".join(params), name_map
 
     def _derive_primary_table(self, unit: Dict[str, Any]) -> str:
@@ -1752,7 +1895,8 @@ class LLMConversionEngine:
     ) -> str:
         package_name = self.config.get('output', {}).get('package_name', 'com.company.project')
         service_name = self._derive_service_name(unit.get('name', 'Generated'))
-        method_name = self._to_camel_case(unit.get('name', 'execute'))
+        method_source_name = unit.get('subprogram_name') or unit.get('name', 'execute')
+        method_name = self._to_camel_case(method_source_name)
         method_params, param_name_map = self._build_service_parameters(unit)
 
         raw_plsql = str(unit.get('raw_plsql', ''))
@@ -1847,6 +1991,14 @@ class LLMConversionEngine:
         for binding in bindings.values():
             imports.add(f"import {package_name}.repository.{binding['repository']};")
             imports.add(f"import {package_name}.entity.{binding['entity']};")
+        if "BigDecimal " in method_params:
+            imports.add('import java.math.BigDecimal;')
+        if "LocalDateTime " in method_params:
+            imports.add('import java.time.LocalDateTime;')
+        if "LocalDate " in method_params:
+            imports.add('import java.time.LocalDate;')
+        if "LocalTime " in method_params:
+            imports.add('import java.time.LocalTime;')
 
         has_bulk_collect = any(
             str(op.get('type', '')).upper() == 'BULK_COLLECT'
@@ -1983,10 +2135,23 @@ class LLMConversionEngine:
         join_getter = f"get{join_var[:1].upper() + join_var[1:]}" if join_var else 'getId'
         driving_fields = entity_field_types.get(driving_entity, {})
         join_type = driving_fields.get(join_var, 'Long') if join_var else 'Long'
+        method_param_names = {part.rsplit(" ", 1)[-1] for part in method_params.split(", ") if " " in part}
+        join_from_method_param = bool(join_var and join_var in method_param_names)
 
         row_logic: List[str] = []
-        if join_var:
-            row_logic.append(f"{join_type} {join_var} = row.{join_getter}();")
+        if join_var and not join_from_method_param:
+            if join_var in driving_fields:
+                row_logic.append(f"{join_type} {join_var} = row.{join_getter}();")
+            else:
+                default_value = "null"
+                if join_type in {"Long", "long"}:
+                    default_value = "0L"
+                elif join_type in {"Integer", "int"}:
+                    default_value = "0"
+                elif join_type == "BigDecimal":
+                    imports.add('import java.math.BigDecimal;')
+                    default_value = "BigDecimal.ZERO"
+                row_logic.append(f"{join_type} {join_var} = {default_value};")
 
         agg_var_by_table: Dict[str, str] = {}
         for table_name, column_name in aggregation_columns:
@@ -2176,6 +2341,82 @@ class LLMConversionEngine:
             if action_date_field:
                 row_logic.append(f"auditRecord.set{action_date_field[:1].upper() + action_date_field[1:]}(LocalDateTime.now());")
             row_logic.append(f"{audit_repo_var}.save(auditRecord);")
+
+        required_operations: Set[str] = {
+            str(operation).upper()
+            for operations in operations_by_table.values()
+            for operation in (operations or [])
+        }
+
+        def _has_repo_behavior(pattern: str) -> bool:
+            return bool(re.search(pattern, "\n".join(row_logic)))
+
+        def _default_literal(java_type: str) -> str:
+            if java_type in {"Long", "long"}:
+                return "0L"
+            if java_type in {"Integer", "int"}:
+                return "0"
+            if java_type == "BigDecimal":
+                imports.add('import java.math.BigDecimal;')
+                return "BigDecimal.ZERO"
+            if java_type == "String":
+                return "\"\""
+            if java_type in {"Boolean", "boolean"}:
+                return "false"
+            return "null"
+
+        def _resolve_lookup_argument(column_name: str, expected_type: str) -> str:
+            normalized = normalize_column_name(column_name)
+            exact = param_name_map.get(str(column_name).upper())
+            if exact:
+                return exact
+            normalized_hit = param_name_map.get(normalized.upper())
+            if normalized_hit:
+                return normalized_hit
+            if normalized in method_param_names:
+                return normalized
+            for key_name, value_name in param_name_map.items():
+                if normalized and normalized.lower() in key_name.lower():
+                    return value_name
+            if join_var and normalized and normalized.lower() == join_var.lower():
+                return join_var
+            return _default_literal(expected_type)
+
+        if 'SELECT' in required_operations and not _has_repo_behavior(r"\.\s*(find\w*|sumBy\w*|count\w*)\s*\("):
+            driving_lookup_keys = self._lookup_keys_for_table(unit, driving_table)
+            driving_fields = entity_field_types.get(driving_entity, {})
+            driving_repo_code = repositories.get(f"{driving_repo}.java", "")
+            lookup_method = self._expected_lookup_method_name(driving_lookup_keys) if driving_lookup_keys else 'findById'
+            if lookup_method != 'findById' and lookup_method not in driving_repo_code:
+                lookup_method = 'findAll'
+            if lookup_method == 'findAll':
+                row_logic.append(f"{driving_repo_var}.findAll();")
+            else:
+                lookup_args = []
+                if lookup_method == 'findById':
+                    id_column = next((k for k in driving_lookup_keys if str(k).upper().endswith('ID')), 'ID')
+                    id_type = self._resolve_lookup_key_type(id_column, driving_fields) if driving_lookup_keys else 'Long'
+                    lookup_args.append(_resolve_lookup_argument(id_column, id_type))
+                else:
+                    for key in driving_lookup_keys:
+                        key_type = self._resolve_lookup_key_type(key, driving_fields)
+                        lookup_args.append(_resolve_lookup_argument(key, key_type))
+                row_logic.append(f"{driving_repo_var}.{lookup_method}({', '.join(lookup_args)});")
+
+        if 'INSERT' in required_operations and not _has_repo_behavior(r"\.\s*(insert\w*|save|saveAndFlush)\s*\("):
+            row_logic.append(f"{driving_entity} insertRecord = new {driving_entity}();")
+            row_logic.append(f"{driving_repo_var}.save(insertRecord);")
+
+        if 'UPDATE' in required_operations and not _has_repo_behavior(r"\.\s*(update\w*|save|saveAndFlush)\s*\("):
+            row_logic.append(f"{driving_entity} updateRecord = new {driving_entity}();")
+            row_logic.append(f"{driving_repo_var}.save(updateRecord);")
+
+        if 'DELETE' in required_operations and not _has_repo_behavior(r"\.\s*(delete\w*|remove\w*)\s*\("):
+            delete_lookup_keys = self._lookup_keys_for_table(unit, driving_table)
+            delete_key = next((key for key in delete_lookup_keys if str(key).upper().endswith('ID')), delete_lookup_keys[0] if delete_lookup_keys else 'ID')
+            delete_key_type = self._resolve_lookup_key_type(delete_key, entity_field_types.get(driving_entity, {}))
+            delete_arg = _resolve_lookup_argument(delete_key, delete_key_type)
+            row_logic.append(f"{driving_repo_var}.deleteById({delete_arg});")
 
         if requires_pagination:
             if driving_table in skip_locked_tables:
@@ -2933,27 +3174,68 @@ public class {service_name} {{
 
     def _map_plsql_type_to_java(self, plsql_type: Optional[str], field_name: Optional[str] = None,
                                  mode: Optional[str] = None) -> str:
-        type_name = (plsql_type or '').upper()
-        normalized_name = (field_name or '').lower()
-        if 'VARCHAR' in type_name or 'CHAR' in type_name or 'CLOB' in type_name or normalized_name.endswith('status'):
+        type_name = (plsql_type or '').strip().upper()
+        normalized_name = (field_name or '').lower().strip()
+
+        # Strip %TYPE / %ROWTYPE anchors — use field name heuristics
+        if '%TYPE' in type_name or '%ROWTYPE' in type_name:
+            # Heuristic: if it ends in _ID or ID it's a Long; amount/price → BigDecimal; else String
+            if normalized_name.endswith('_id') or normalized_name.endswith('id'):
+                return 'Long'
+            if any(k in normalized_name for k in ('amount', 'price', 'balance', 'total', 'credit', 'debit', 'payment')):
+                return 'BigDecimal'
             return 'String'
-        if 'DATE' in type_name or 'TIMESTAMP' in type_name:
-            return 'LocalDateTime'
+
+        # BOOLEAN (Oracle PL/SQL only — not a SQL type)
         if 'BOOLEAN' in type_name:
             return 'Boolean'
-        if 'NUMBER' in type_name:
-            # LCE-8 FIX: NUMBER with scale (e.g. NUMBER(10,2)) -> BigDecimal for decimal precision.
-            # NUMBER without scale used as an ID -> Long.
-            # NUMBER without scale used as any other numeric param -> Long (not Integer).
-            # Rationale: JPA repository keys are always Long; using Integer for IN params
-            # caused 'incompatible types: Integer cannot be converted to Long' compile errors
-            # when the param was passed to findById/deleteById/existsById.
-            if ',' in type_name:
+
+        # Character / String types
+        if any(t in type_name for t in ('VARCHAR', 'VARCHAR2', 'NVARCHAR', 'CHAR', 'NCHAR',
+                                          'CLOB', 'NCLOB', 'LONG', 'XMLTYPE')):
+            return 'String'
+
+        # Binary types
+        if any(t in type_name for t in ('BLOB', 'RAW', 'BFILE')):
+            return 'byte[]'
+
+        # Date / timestamp types
+        if 'TIMESTAMP' in type_name:
+            return 'LocalDateTime'
+        if type_name in ('DATE',):
+            return 'LocalDateTime'
+
+        # Numeric types
+        if 'NUMBER' in type_name or 'NUMERIC' in type_name or 'DECIMAL' in type_name:
+            # NUMBER(p,s) with scale > 0 → BigDecimal
+            scale_match = re.search(r'\(\s*\d+\s*,\s*(\d+)\s*\)', type_name)
+            if scale_match and int(scale_match.group(1)) > 0:
                 return 'BigDecimal'
-            if normalized_name.endswith('id') or normalized_name.endswith('_id'):
+            # ID fields → Long
+            if normalized_name.endswith('_id') or normalized_name.endswith('id'):
                 return 'Long'
-            # Default non-ID NUMBER to Long for consistency with JPA key type
+            # Amount / monetary fields → BigDecimal
+            if any(k in normalized_name for k in ('amount', 'price', 'balance', 'total', 'credit', 'debit', 'payment', 'rate', 'salary', 'cost')):
+                return 'BigDecimal'
+            # Default NUMBER → Long
             return 'Long'
+
+        # Integer types
+        if any(t in type_name for t in ('INTEGER', 'INT', 'PLS_INTEGER', 'BINARY_INTEGER',
+                                          'SIMPLE_INTEGER', 'NATURAL', 'POSITIVE')):
+            if normalized_name.endswith('_id') or normalized_name.endswith('id'):
+                return 'Long'
+            return 'Long'
+
+        # Float types
+        if any(t in type_name for t in ('FLOAT', 'REAL', 'DOUBLE', 'BINARY_FLOAT', 'BINARY_DOUBLE')):
+            return 'BigDecimal'
+
+        # Status / name fields default to String
+        if any(k in normalized_name for k in ('name', 'status', 'type', 'code', 'desc', 'text', 'comment', 'message', 'reason')):
+            return 'String'
+
+        # Default fallback
         return 'String'
 
     def _default_value_for_java_type(self, java_type: str) -> str:

@@ -80,7 +80,7 @@ OBJECT_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 PARAM_PATTERN = re.compile(
-    r"""^\s*["`]?([\w$#]+)["`]?\s+(?:(in\s+out|in|out)\s+)?(.+?)\s*$""",
+    r"""^\s*["`]?([\w$#]+)["`]?\s+(?:(in\s+out|in|out)\s+)?(.+?)\s*(?:default\s+\S+\s*)?$""",
     flags=re.IGNORECASE,
 )
 
@@ -106,6 +106,19 @@ CONSTANT_PATTERN = re.compile(
 NVL_PARAM_PATTERN = re.compile(
     r"\bnvl\s*\(\s*([A-Za-z_][\w$#]*)\s*,",
     flags=re.IGNORECASE,
+)
+
+PACKAGE_BODY_PATTERN = re.compile(
+    r"\bcreate\s+(?:or\s+replace\s+)?(?:editionable\s+|noneditionable\s+)?package\s+body\b",
+    flags=re.IGNORECASE,
+)
+PACKAGE_SUBPROGRAM_NAMED_PATTERN = re.compile(
+    r"\b(procedure|function)\s+([A-Za-z_][\w$#]*)\b[\s\S]*?\bend\s+\2\s*;",
+    flags=re.IGNORECASE,
+)
+PACKAGE_SUBPROGRAM_START_PATTERN = re.compile(
+    r"^\s*(procedure|function)\s+([A-Za-z_][\w$#]*)\b",
+    flags=re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -547,6 +560,62 @@ def _extract_objects(sql_text: str) -> List[ObjectSlice]:
     return objects
 
 
+def _is_package_body_block(block_text: str) -> bool:
+    return bool(PACKAGE_BODY_PATTERN.search(block_text or ""))
+
+
+def _extract_package_subprogram_blocks(package_body_text: str) -> List[Dict[str, str]]:
+    blocks: List[Dict[str, str]] = []
+
+    for match in PACKAGE_SUBPROGRAM_NAMED_PATTERN.finditer(package_body_text or ""):
+        segment = match.group(0).strip()
+        if not re.search(r"\b(?:is|as)\b", segment, flags=re.IGNORECASE):
+            continue
+        blocks.append(
+            {
+                "object_type": match.group(1).upper(),
+                "name": _normalize_identifier(match.group(2)),
+                "block_text": segment,
+            }
+        )
+    if blocks:
+        return blocks
+
+    starts = list(PACKAGE_SUBPROGRAM_START_PATTERN.finditer(package_body_text or ""))
+    for index, start_match in enumerate(starts):
+        start = start_match.start()
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(package_body_text)
+        segment = (package_body_text or "")[start:end]
+        name = _normalize_identifier(start_match.group(2))
+
+        named_end = re.search(
+            rf"\bend\s+{re.escape(name)}\s*;",
+            segment,
+            flags=re.IGNORECASE,
+        )
+        if named_end:
+            segment = segment[: named_end.end()]
+        else:
+            unnamed_end = re.search(r"\bend\s*;", segment, flags=re.IGNORECASE)
+            if unnamed_end:
+                segment = segment[: unnamed_end.end()]
+
+        segment = segment.strip()
+        if not segment:
+            continue
+        if not re.search(r"\b(?:is|as)\b", segment, flags=re.IGNORECASE):
+            continue
+
+        blocks.append(
+            {
+                "object_type": start_match.group(1).upper(),
+                "name": name,
+                "block_text": segment,
+            }
+        )
+    return blocks
+
+
 def _extract_parameters(block_text: str) -> Dict[str, List[Dict[str, str]]]:
     header_limit = re.search(r"\b(?:is|as)\b", block_text, flags=re.IGNORECASE)
     header = block_text[: header_limit.start()] if header_limit else block_text[:800]
@@ -560,10 +629,18 @@ def _extract_parameters(block_text: str) -> Dict[str, List[Dict[str, str]]]:
 
     for item in _split_top_level_csv(parameter_text):
         normalized = " ".join(item.split())
-        match = PARAM_PATTERN.match(normalized)
+        # Strip DEFAULT clause before matching pattern
+        normalized_no_default = re.sub(
+            r"\s+(?:default|:=)\s+\S+.*$", "", normalized, flags=re.IGNORECASE
+        ).strip()
+        match = PARAM_PATTERN.match(normalized_no_default)
+        if not match:
+            match = PARAM_PATTERN.match(normalized)
         if not match:
             continue
         name, direction, data_type = match.groups()
+        # Clean up any trailing DEFAULT clause that slipped into data_type
+        data_type = re.sub(r"\s+(?:default|:=)\s+.*$", "", data_type, flags=re.IGNORECASE).strip()
         direction_text = (direction or "IN").upper().replace("  ", " ")
         payload = {
             "name": _normalize_identifier(name),
@@ -723,15 +800,65 @@ def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
     """Return raw object blocks plus extracted semantics for code generation."""
     cleaned = _prepare_sql_text(sql_text)
     model = build_discovery_model(cleaned)
-    semantics_by_object = {
-        (proc.get("name", "").upper(), proc.get("object_type", "").upper()): proc
-        for proc in model.get("procedures", [])
-    }
-
+    objects = _extract_objects(cleaned)
+    semantic_entries = list(model.get("procedures", []))
     units: List[Dict[str, Any]] = []
-    for item in _extract_objects(cleaned):
-        object_key = (item.object_name.upper(), item.object_type.upper())
-        semantics = semantics_by_object.get(object_key, {})
+    for index, item in enumerate(objects):
+        semantics = semantic_entries[index] if index < len(semantic_entries) else {}
+
+        if item.object_type.upper() == "PACKAGE" and _is_package_body_block(item.block_text):
+            package_constants = _extract_package_constants(item.block_text)
+            package_autonomous = _has_autonomous_transaction(item.block_text)
+            subprogram_blocks = _extract_package_subprogram_blocks(item.block_text)
+            expanded_units: List[Dict[str, Any]] = []
+            seen_subprograms: Dict[str, int] = {}
+
+            for subprogram in subprogram_blocks:
+                synthetic_sql = f"CREATE OR REPLACE {subprogram.get('block_text', '').strip()}"
+                sub_units = build_conversion_units(synthetic_sql)
+                if not sub_units:
+                    continue
+                for sub_unit in sub_units:
+                    sub_name = _normalize_identifier(str(sub_unit.get("name") or subprogram.get("name") or "subprogram"))
+                    merged_constants: Dict[str, Dict[str, Any]] = {}
+                    for const in package_constants:
+                        key = str(const.get("name", "")).upper()
+                        if key:
+                            merged_constants[key] = const
+                    for const in (sub_unit.get("package_constants") or []):
+                        key = str(const.get("name", "")).upper()
+                        if key and key not in merged_constants:
+                            merged_constants[key] = const
+
+                    sub_key = sub_name.upper()
+                    seen_subprograms[sub_key] = seen_subprograms.get(sub_key, 0) + 1
+                    overload_index = seen_subprograms[sub_key]
+                    generated_name = f"{item.object_name}_{sub_name}"
+                    if overload_index > 1:
+                        generated_name = f"{generated_name}_overload{overload_index}"
+
+                    sub_unit["name"] = generated_name
+                    sub_unit["object_type"] = f"PACKAGE_{subprogram.get('object_type', 'PROCEDURE').upper()}"
+                    sub_unit["package_name"] = item.object_name
+                    sub_unit["subprogram_name"] = sub_name
+                    sub_unit["overload_index"] = overload_index
+                    sub_unit["raw_plsql"] = subprogram.get("block_text", "").strip()
+                    sub_unit["autonomous_transaction"] = bool(
+                        sub_unit.get("autonomous_transaction") or package_autonomous
+                    )
+                    if merged_constants:
+                        sub_unit["package_constants"] = list(merged_constants.values())
+                    expanded_units.append(sub_unit)
+
+            if expanded_units:
+                units.extend(expanded_units)
+                continue
+
+        if item.object_type.upper() == "PACKAGE" and not _is_package_body_block(item.block_text):
+            # Package specs are declarations-only and should not become a single
+            # placeholder service. Package body subprograms are handled above.
+            continue
+
         units.append(
             {
                 "name": item.object_name,
@@ -1780,6 +1907,8 @@ def detect_transaction(code: str) -> Dict[str, Any]:
         "has_partial_rollback": bool(re.search(r"\brollback\s+to(?:\s+savepoint)?\b", code, flags=re.IGNORECASE)),
         "has_commit": bool(re.search(r"\bcommit\b", code, flags=re.IGNORECASE)),
         "has_rollback": bool(re.search(r"\brollback\b", code, flags=re.IGNORECASE)),
+        # RC8 FIX: autonomous transaction flag
+        "autonomous": bool(AUTONOMOUS_TX_PATTERN.search(code)),
     }
 
 
@@ -2250,15 +2379,6 @@ def detect_id_generation_conflict(ast: Dict[str, Any], schema: Dict[str, Any]) -
 
 def detect_id_conflict(ast: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
     return detect_id_generation_conflict(ast, schema)
-
-
-def detect_transaction(code: str) -> Dict[str, Any]:
-    return {
-        "has_savepoint": bool(re.search(r"\bsavepoint\b", code, flags=re.IGNORECASE)),
-        "has_partial_rollback": bool(re.search(r"\brollback\s+to(?:\s+savepoint)?\b", code, flags=re.IGNORECASE)),
-        "has_commit": bool(re.search(r"\bcommit\b", code, flags=re.IGNORECASE)),
-        "has_rollback": bool(re.search(r"\brollback\b", code, flags=re.IGNORECASE)),
-    }
 
 
 def detect_logic_gaps(ast: Dict[str, Any]) -> List[Dict[str, str]]:

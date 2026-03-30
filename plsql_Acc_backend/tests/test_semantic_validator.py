@@ -184,3 +184,54 @@ def test_semantic_validator_flags_findall_misuse_for_bulk_collect():
     issue_codes = {issue.code for issue in report.issues}
     assert "findall_misuse" in issue_codes
     assert "bulk_collect_not_preserved" in issue_codes
+
+
+def test_semantic_validator_rejects_placeholder_or_missing_dml_logic():
+    validator = SemanticValidator("com.company.project")
+    source_units = [
+        {
+            "name": "customer_pkg_create_customer",
+            "subprogram_name": "create_customer",
+            "object_type": "PACKAGE_PROCEDURE",
+            "raw_plsql": "BEGIN INSERT INTO customers(customer_id) VALUES (p_customer_id); END;",
+            "tables_used": ["CUSTOMERS"],
+            "operations_by_table": {"CUSTOMERS": ["INSERT"]},
+            "lookup_keys": {"CUSTOMERS": ["CUSTOMER_ID"]},
+            "bulk_operations": [],
+            "cursor": {},
+            "transaction": {},
+            "input_parameters": [{"name": "p_customer_id", "type": "NUMBER"}],
+        }
+    ]
+    entities = {
+        "CustomersEntity.java": """
+            package com.company.project.entity;
+            public class CustomersEntity {}
+        """
+    }
+    repositories = {
+        "CustomersRepository.java": """
+            package com.company.project.repository;
+            import org.springframework.data.jpa.repository.JpaRepository;
+            import com.company.project.entity.CustomersEntity;
+            public interface CustomersRepository extends JpaRepository<CustomersEntity, Long> {}
+        """
+    }
+    services = {
+        "CustomerPkgCreateCustomerService.java": """
+            package com.company.project.service;
+            import org.springframework.stereotype.Service;
+            @Service
+            public class CustomerPkgCreateCustomerService {
+                public void createCustomer(Long pCustomerId) {
+                    // No SQL operations — pure utility/infrastructure logic preserved here.
+                }
+            }
+        """
+    }
+
+    report = validator.validate(source_units, entities, repositories, services)
+    issue_codes = {issue.code for issue in report.issues}
+    assert "placeholder_logic_for_dml_unit" in issue_codes
+    assert "missing_repository_calls_for_dml" in issue_codes
+    assert "operation_not_preserved_insert" in issue_codes

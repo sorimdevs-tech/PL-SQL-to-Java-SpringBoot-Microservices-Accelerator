@@ -36,11 +36,27 @@ class FileExtractor:
     
     def __init__(self):
         """Initialize file extractor"""
-        self.supported_extensions = {'.sql', '.pls', '.pkb', '.pks', '.fnc', '.prc'}
+        self.supported_extensions = {
+            '.sql', '.pls', '.pkb', '.pks', '.pkg', '.pck', '.plb', '.prc', '.fnc', '.trg'
+        }
+        self.ignored_directories = {
+            '.git', '.hg', '.svn', '.venv', 'venv',
+            'node_modules', 'dist', 'build', 'target', '.idea', '.vscode',
+        }
         self.plsql_keywords = {
             'procedure', 'function', 'trigger', 'package', 'type', 
             'cursor', 'exception', 'pragma', 'declare', 'begin', 'end'
         }
+        self.plsql_strong_patterns = [
+            re.compile(
+                r"\bcreate\s+(?:or\s+replace\s+)?(?:editionable\s+|noneditionable\s+)?"
+                r"(?:package(?:\s+body)?|procedure|function|trigger|type(?:\s+body)?)\b",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(r"\bpragma\s+autonomous_transaction\b", flags=re.IGNORECASE),
+            re.compile(r"\braise_application_error\s*\(", flags=re.IGNORECASE),
+            re.compile(r"\bdeclare\b[\s\S]{0,1200}\bbegin\b", flags=re.IGNORECASE),
+        ]
     
     def extract_from_file(self, file_path: str) -> Dict[str, str]:
         """
@@ -95,14 +111,25 @@ class FileExtractor:
         Returns:
             Dict[str, str]: Dictionary of filename -> content
         """
-        files_content = {}
-        
-        for file_path in directory_path.rglob('*'):
-            if file_path.is_file() and self._is_plsql_file(file_path):
+        files_content: Dict[str, str] = {}
+
+        for root, dirs, files in os.walk(directory_path):
+            dirs[:] = [d for d in dirs if d not in self.ignored_directories]
+            root_path = Path(root)
+            for file_name in files:
+                file_path = root_path / file_name
+                if not self._is_plsql_file(file_path):
+                    continue
                 try:
                     content = self._read_file(file_path)
-                    files_content[file_path.name] = content
-                    logger.debug(f"Extracted PL/SQL file: {file_path.name}")
+                    relative_key = file_path.relative_to(directory_path).as_posix()
+                    dedup_key = relative_key
+                    suffix = 2
+                    while dedup_key in files_content:
+                        dedup_key = f"{relative_key}#{suffix}"
+                        suffix += 1
+                    files_content[dedup_key] = content
+                    logger.debug(f"Extracted PL/SQL file: {dedup_key}")
                 except Exception as e:
                     logger.warning(f"Failed to read file {file_path}: {e}")
         
@@ -119,15 +146,27 @@ class FileExtractor:
         Returns:
             bool: True if PL/SQL file
         """
+        if any(part in self.ignored_directories for part in file_path.parts):
+            return False
+
         if file_path.suffix.lower() in self.supported_extensions:
             return True
         
-        # Check content for PL/SQL keywords if extension is unknown
+        # For unknown extensions, require stronger PL/SQL evidence to avoid
+        # shell/git hook scripts being misclassified.
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read(1000)  # Read first 1000 chars
+                content = f.read(8000)
+                if not content.strip():
+                    return False
+
+                matched_strong = any(pattern.search(content) for pattern in self.plsql_strong_patterns)
+                if matched_strong:
+                    return True
+
                 content_lower = content.lower()
-                return any(keyword in content_lower for keyword in self.plsql_keywords)
+                keyword_hits = sum(1 for keyword in self.plsql_keywords if keyword in content_lower)
+                return keyword_hits >= 4 and ('begin' in content_lower and 'end' in content_lower)
         except:
             return False
     
