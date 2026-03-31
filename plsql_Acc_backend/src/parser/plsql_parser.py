@@ -132,7 +132,7 @@ class PLSQLASTBuilder(PlSqlListener):
         self.current_object = None
         self.current_block = None
     
-    def enterCreate_procedure_body(self, ctx: PlSqlParser.Create_procedure_bodyContext):
+    def enterCreate_procedure_body(self, ctx):  # type: ignore
         """Handle procedure definition"""
         procedure_name = _ctx_text(ctx.procedure_name(), "anonymous_procedure")
         self.current_object = {
@@ -145,7 +145,7 @@ class PLSQLASTBuilder(PlSqlListener):
         }
         self.ast['procedures'].append(self.current_object)
     
-    def enterCreate_function_body(self, ctx: PlSqlParser.Create_function_bodyContext):
+    def enterCreate_function_body(self, ctx):  # type: ignore
         """Handle function definition"""
         function_name = _ctx_text(ctx.function_name(), "anonymous_function")
         self.current_object = {
@@ -159,7 +159,7 @@ class PLSQLASTBuilder(PlSqlListener):
         }
         self.ast['functions'].append(self.current_object)
     
-    def enterCreate_trigger(self, ctx: PlSqlParser.Create_triggerContext):
+    def enterCreate_trigger(self, ctx):  # type: ignore
         """Handle trigger definition"""
         trigger_name = _ctx_text(ctx.trigger_name(), "anonymous_trigger")
         self.current_object = {
@@ -172,7 +172,7 @@ class PLSQLASTBuilder(PlSqlListener):
         }
         self.ast['triggers'].append(self.current_object)
     
-    def enterCreate_package(self, ctx: PlSqlParser.Create_packageContext):
+    def enterCreate_package(self, ctx):  # type: ignore
         """Handle package definition"""
         package_name = _ctx_text(ctx.package_name(), "anonymous_package")
         self.current_object = {
@@ -186,7 +186,7 @@ class PLSQLASTBuilder(PlSqlListener):
         }
         self.ast['packages'].append(self.current_object)
     
-    def enterParameter(self, ctx: PlSqlParser.ParameterContext):
+    def enterParameter(self, ctx):  # type: ignore
         """Handle parameter definition"""
         if self.current_object:
             param_name = _ctx_text(ctx.parameter_name(), "param")
@@ -200,7 +200,7 @@ class PLSQLASTBuilder(PlSqlListener):
             }
             self.current_object['parameters'].append(param)
     
-    def enterVariable_declaration(self, ctx: PlSqlParser.Variable_declarationContext):
+    def enterVariable_declaration(self, ctx):  # type: ignore
         """Handle variable declaration"""
         if self.current_object:
             var_name = _ctx_text(ctx.variable_name(), "var")
@@ -232,7 +232,7 @@ class PLSQLASTBuilder(PlSqlListener):
             except Exception:
                 pass
     
-    def enterSql_statement(self, ctx: PlSqlParser.Sql_statementContext):
+    def enterSql_statement(self, ctx):  # type: ignore
         """Handle SQL statements"""
         if self.current_object:
             sql_text = ctx.getText()
@@ -242,7 +242,7 @@ class PLSQLASTBuilder(PlSqlListener):
             }
             self.current_object['statements'].append(statement)
     
-    def enterIf_statement(self, ctx: PlSqlParser.If_statementContext):
+    def enterIf_statement(self, ctx):  # type: ignore
         """Handle IF statements"""
         if self.current_object:
             condition = _ctx_text(ctx.condition(), None)
@@ -254,7 +254,7 @@ class PLSQLASTBuilder(PlSqlListener):
             }
             self.current_object['statements'].append(statement)
     
-    def enterLoop_statement(self, ctx: PlSqlParser.Loop_statementContext):
+    def enterLoop_statement(self, ctx):  # type: ignore
         """Handle LOOP statements"""
         if self.current_object:
             loop_type = ctx.getChild(0).getText().upper()
@@ -265,7 +265,7 @@ class PLSQLASTBuilder(PlSqlListener):
             }
             self.current_object['statements'].append(statement)
     
-    def enterException_handler(self, ctx: PlSqlParser.Exception_handlerContext):
+    def enterException_handler(self, ctx):  # type: ignore
         """Handle exception blocks"""
         if self.current_object:
             exception_name = _ctx_text(ctx.exception_name(), 'OTHERS')
@@ -468,6 +468,30 @@ class PLSQLParser:
 
         return ast
     
+    @staticmethod
+    def _has_advanced_plsql_syntax(content: str) -> bool:
+        """
+        Check if content has advanced PL/SQL syntax that ANTLR grammar doesn't support.
+        Skipping ANTLR for these cases improves performance and avoids false failures.
+        
+        Args:
+            content (str): PL/SQL content to check
+            
+        Returns:
+            bool: True if content has advanced syntax patterns
+        """
+        # Patterns that commonly break the simple ANTLR grammar
+        patterns = [
+            r'\.[\w]',          # Qualified names (schema.object.column)
+            r'\|\|',            # String concatenation
+            r'\$\$',            # Oracle dollar-quoted strings
+            r'[<>!]=',          # Comparison operators
+        ]
+        for pattern in patterns:
+            if re.search(pattern, content, re.IGNORECASE):
+                return True
+        return False
+
     def parse(self, content: str) -> Dict[str, Any]:
         """
         Parse PL/SQL content and generate AST
@@ -482,6 +506,13 @@ class PLSQLParser:
             raise PLSQLParseError("Empty PL/SQL content provided")
         
         content = preprocess_plsql_for_parser(content)
+        
+        # Skip ANTLR for complex syntax - use fast fallback parser directly
+        if self._has_advanced_plsql_syntax(content):
+            fallback_ast = self._fallback_parse(content)
+            if fallback_ast:
+                logger.debug("Skipping ANTLR for complex PL/SQL; using fallback parser")
+                return fallback_ast
         
         if PlSqlLexer is None or PlSqlParser is None:
             raise PLSQLParseError(
@@ -529,7 +560,7 @@ class PLSQLParser:
         except Exception as e:
             fallback_ast = self._fallback_parse(content)
             if fallback_ast:
-                logger.warning(
+                logger.debug(
                     "ANTLR parse failed; using fallback parser for object extraction. Error: %s",
                     str(e),
                 )

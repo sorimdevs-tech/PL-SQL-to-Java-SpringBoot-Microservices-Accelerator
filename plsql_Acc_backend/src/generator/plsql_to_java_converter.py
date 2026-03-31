@@ -20,6 +20,7 @@ class ProcedureSignature:
     parameters: List[Dict[str, str]]
     return_type: Optional[str]
     body: str
+    has_autonomous_transaction: bool = False  # For pragma autonomous_transaction
     
 
 class PLSQLtoJavaConverter:
@@ -118,6 +119,28 @@ class PLSQLtoJavaConverter:
         return parts[0].lower() + ''.join(word.capitalize() for word in parts[1:])
     
     @staticmethod
+    def _is_java_keyword(name: str) -> bool:
+        """Check if name is a Java reserved keyword"""
+        java_keywords = {
+            'abstract', 'assert', 'boolean', 'break', 'byte', 'case', 'catch', 'char',
+            'class', 'const', 'continue', 'default', 'do', 'double', 'else', 'enum',
+            'extends', 'final', 'finally', 'float', 'for', 'goto', 'if', 'implements',
+            'import', 'instanceof', 'int', 'interface', 'long', 'native', 'new',
+            'package', 'private', 'protected', 'public', 'return', 'short', 'static',
+            'strictfp', 'super', 'switch', 'synchronized', 'this', 'throw', 'throws',
+            'transient', 'try', 'void', 'volatile', 'while', 'true', 'false', 'null'
+        }
+        return name.lower() in java_keywords
+    
+    @staticmethod
+    def _safe_method_name(name: str) -> str:
+        """Ensure method name is not a Java keyword"""
+        camel_name = PLSQLtoJavaConverter._to_camel_case(name)
+        if PLSQLtoJavaConverter._is_java_keyword(camel_name):
+            return camel_name + 'Method'  # e.g., assert -> assertMethod
+        return camel_name
+    
+    @staticmethod
     def _is_balanced_parens(expr: str) -> bool:
         """Check if parentheses are balanced in expression"""
         count = 0
@@ -167,13 +190,17 @@ class PLSQLtoJavaConverter:
             customer.customer_id -> customer.getCustomerId()
             invoice.invoice_status -> invoice.getInvoiceStatus()
             p_customer.cust_code -> customer.getCustCode()
+        
+        NOTE: Skips Java constants (LogConstants.LOG_LEVEL_DEBUG) and class method calls
         """
-        # Match patterns like entity.field_name
+        # Match patterns like entity.field_name BUT NOT Constants.CONST_NAME or Type.method()
+        # Negative lookbehind to exclude common Java classes
+        # Fields to translate should be lowercase or snake_case, not ALL_CAPS
         expr = re.sub(
-            r'(\w+)\.([a-z_]+?)\s*(?=[!=<>;\s,\)])',
+            r'(\w+)\.([a-z_][a-z0-9_]*)\s*(?=[!=<>;\s,\)])',
             lambda m: (
                 f"{m.group(1)}.get{PLSQLtoJavaConverter._field_to_getter_name(m.group(2))}()"
-                if not m.group(1) in ('true', 'false', 'null', 'and', 'or', 'not')
+                if not (m.group(1) in ('true', 'false', 'null', 'and', 'or', 'not') or m.group(1)[0].isupper())
                 else m.group(0)
             ),
             expr,
@@ -206,27 +233,36 @@ class PLSQLtoJavaConverter:
           NOT IN -> !{ contains }
         """
         java_field = PLSQLtoJavaConverter._to_camel_case(field)
+        java_message = message
+        # Convert parameter names in message (e.g., p_error_message -> errorMessage)
+        java_message = re.sub(
+            r'\b([pl])_([a-zA-Z0-9_]+)\b',
+            lambda m: PLSQLtoJavaConverter._to_camel_case('_' + m.group(2)),
+            java_message,
+            flags=re.IGNORECASE
+        )
+        
         condition_upper = condition.upper().strip()
         
         # IS NULL check
         if 'IS NULL' in condition_upper:
             return f'''if ({java_field} == null) {{
-            throw new BusinessException("{message}");
+            throw new BusinessException("{java_message}");
         }}'''
         
         # IS NOT NULL check
         if 'IS NOT NULL' in condition_upper:
             return f'''if ({java_field} != null) {{
-            throw new BusinessException("{message}");
+            throw new BusinessException("{java_message}");
         }}'''
         
         # Simple comparison checks (<=, >=, <, >, ==, !=)
         if any(op in condition_upper for op in ['<=', '>=', '<', '>', '==', '!=', '=']):
             # Replace parameter names with Java names
             java_condition = condition
-            java_condition = re.sub(r'\b([pl]_\w+)', lambda m: PLSQLtoJavaConverter._to_camel_case('_' + m.group(1)), java_condition, flags=re.IGNORECASE)
+            java_condition = re.sub(r'\b([pl])_(\w+)', lambda m: PLSQLtoJavaConverter._to_camel_case('_' + m.group(2)), java_condition, flags=re.IGNORECASE)
             return f'''if (!({java_condition})) {{
-            throw new BusinessException("{message}");
+            throw new BusinessException("{java_message}");
         }}'''
         
         # NVL checks
@@ -279,7 +315,7 @@ class PLSQLtoJavaConverter:
             
             java_code += f"entity.{setter_name}({val_clean});\n"
         
-        repo_name = entity_name[0].lower() + entity_name[1:] + 'Repository'
+        repo_name = PLSQLtoJavaConverter._entity_to_repository_name(entity_name)
         java_code += f"{repo_name}.save(entity);"
         
         return java_code
@@ -288,6 +324,9 @@ class PLSQLtoJavaConverter:
     def _translate_plsql_expression(expr: str) -> str:
         """
         Translate PL/SQL expressions to Java with proper operator conversion.
+        
+        CRITICAL: Parameter name conversion happens LAST after all function translations.
+        This ensures SUBSTR(p_text, 1, 255) becomes text.substring() not pText.substring().
         
         Examples:
             p_customer_id IS NOT NULL -> customerId != null
@@ -298,6 +337,8 @@ class PLSQLtoJavaConverter:
         """
         if not expr:
             return expr
+        
+        # =========== STEP 1: Core operator translations (no param conversion) ===========
         
         # CRITICAL ORDER: Handle IS NULL operators FIRST before other replacements
         # IS NOT NULL -> != null
@@ -318,7 +359,9 @@ class PLSQLtoJavaConverter:
         # Restore == operators
         expr = expr.replace('\x00DOUBLE_EQ\x00', '==')
         
-        # Translate COALESCE function
+        # =========== STEP 2: Function translations (before param name conversion) ===========
+        
+        # Translate COALESCE function (preserve original param names)
         expr = re.sub(
             r'(?i)COALESCE\s*\(\s*([^)]+)\s*\)',
             lambda m: PLSQLtoJavaConverter._translate_coalesce(m.group(1)),
@@ -326,6 +369,7 @@ class PLSQLtoJavaConverter:
         )
         
         # Translate NVL function: NVL(value, default) -> (value != null ? value : default)
+        # CRITICAL: Do NOT convert param names here, keep them as is
         expr = re.sub(
             r'(?i)NVL\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)',
             r'(\1 != null ? \1 : \2)',
@@ -333,9 +377,17 @@ class PLSQLtoJavaConverter:
         )
         
         # Translate SUBSTR(str, start, length) -> str.substring(start-1, start-1+length)
+        # CRITICAL: Extract variable name WITHOUT the p_ prefix before camelCase conversion
+        def translate_substr(m):
+            var_name = m.group(1)  # Keep original: p_text, p_amount, etc.
+            start = int(m.group(2))
+            length = int(m.group(3))
+            end = start - 1 + length
+            return f'{var_name}.substring({start-1}, {end})'
+        
         expr = re.sub(
             r'(?i)SUBSTR\s*\(\s*([a-zA-Z_]\w*)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)',
-            lambda m: f'{PLSQLtoJavaConverter._to_camel_case(m.group(1))}.substring({int(m.group(2))-1}, {int(m.group(2))-1 + int(m.group(3))})',
+            translate_substr,
             expr
         )
         
@@ -358,8 +410,19 @@ class PLSQLtoJavaConverter:
         # LOWER(string) -> string.toLowerCase()
         expr = re.sub(r'(?i)LOWER\s*\(\s*([^)]+)\s*\)', r'\1.toLowerCase()', expr)
         
-        # SYSDATE -> LocalDateTime.now()
-        expr = re.sub(r'(?i)SYSDATE\b', 'LocalDateTime.now()', expr)
+        # SYSDATE -> LocalDateTime.now() (current timestamp)
+        expr = re.sub(r'\bSYSDATE\b', 'LocalDateTime.now()', expr, flags=re.IGNORECASE)
+        
+        # =========== STEP 3: Constants and package references ===========
+        
+        # Translate standalone constants (c_xxx to Java constant)
+        # E.g., c_log_level_debug -> LogConstants.LOG_LEVEL_DEBUG
+        expr = re.sub(
+            r'\bc_([a-zA-Z0-9_]+)\b',
+            lambda m: f'LogConstants.{m.group(1).upper()}',
+            expr,
+            flags=re.IGNORECASE
+        )
         
         # Translate PL/SQL package constants to string placeholders
         # E.g., invoice_pkg.c_type_standard -> "STANDARD"
@@ -394,20 +457,15 @@ class PLSQLtoJavaConverter:
         # || (PL/SQL concatenation) -> + (Java concatenation)
         expr = expr.replace('||', ' + ')
         
-        # Convert variable names p_ and l_ to camelCase (do this after other replacements)
+        # =========== STEP 4: Parameter name conversion (LAST!) ===========
+        
+        # Convert variable names p_ and l_ to camelCase
+        # Must happen AFTER all function translations so p_text stays as p_text in SUBSTR
         expr = re.sub(
             r'\b([pl])_([a-zA-Z0-9_]+)\b',
             lambda m: PLSQLtoJavaConverter._to_camel_case('_' + m.group(2)),
             expr,
             flags=re.IGNORECASE
-        )
-        
-        # Convert non-prefixed variable names to camelCase (for variables without p_ or l_ prefix)
-        # This handles cases like 'CustomerId' -> 'customerId'
-        expr = re.sub(
-            r'\b([A-Z]{1}[a-zA-Z0-9]*)\b',
-            lambda m: PLSQLtoJavaConverter._to_camel_case(m.group(1)),
-            expr
         )
         
         # Translate field access patterns to JavaBean getters (e.g., entity.field_name -> entity.getFieldName())
@@ -456,16 +514,17 @@ class PLSQLtoJavaConverter:
         Translate PL/SQL UPDATE to Java repository call.
         """
         entity_name = PLSQLtoJavaConverter._table_to_entity(table)
+        repo_name = PLSQLtoJavaConverter._entity_to_repository_name(entity_name)
         
         java_code = f"// UPDATE {table}\n"
-        java_code += f"{entity_name} existing = {entity_name.lower()}Repository.find...();\n"
+        java_code += f"{entity_name} existing = {repo_name}.find...();\n"
         
         for col, val in assignments.items():
             setter = PLSQLtoJavaConverter._to_camel_case(col)
             val_clean = PLSQLtoJavaConverter._to_camel_case(val.lstrip('p_lv'))
             java_code += f"existing.set{setter.capitalize()}({val_clean});\n"
         
-        java_code += f"{entity_name.lower()}Repository.save(existing);"
+        java_code += f"{repo_name}.save(existing);"
         
         return java_code
     
@@ -653,6 +712,23 @@ class PLSQLtoJavaConverter:
         return ''.join(word.capitalize() for word in parts) + 'Entity'
     
     @staticmethod
+    def _entity_to_repository_name(entity_name: str) -> str:
+        """Convert entity name to repository variable name (camelCase)"""
+        # Remove 'Entity' suffix if present
+        if entity_name.endswith('Entity'):
+            entity_name = entity_name[:-6]
+        # Convert PascalCase to camelCase
+        if entity_name:
+            return entity_name[0].lower() + entity_name[1:] + 'Repository'
+        return 'repository'
+    
+    @staticmethod
+    def _table_to_repository_name(table_name: str) -> str:
+        """Convert table name directly to repository variable name (camelCase)"""
+        entity_name = PLSQLtoJavaConverter._table_to_entity(table_name)
+        return PLSQLtoJavaConverter._entity_to_repository_name(entity_name)
+    
+    @staticmethod
     def _plsql_type_to_java(plsql_type: str) -> str:
         """
         Convert PL/SQL type to corresponding Java type.
@@ -746,7 +822,7 @@ class PLSQLtoJavaConverter:
         if entity_names is None:
             entity_names = {}
         
-        method_name = PLSQLtoJavaConverter._to_camel_case(proc_name)
+        method_name = PLSQLtoJavaConverter._safe_method_name(proc_name)
         
         # Determine return type based on logic
         # Priority: extracted return_type from signature > inferred from logic > default void
@@ -812,6 +888,7 @@ class PLSQLtoJavaConverter:
                 if camel_name not in params_dict:
                     params_dict[camel_name] = f"{param_type} {camel_name}"
         
+        # Convert params_dict to params_str for method signature
         params_str = ', '.join(params_dict.values())
         
         # Build method body
@@ -828,11 +905,24 @@ class PLSQLtoJavaConverter:
                 message = validation.get('message', 'Validation failed')
                 
                 # Translate condition to proper Java
-                java_condition = PLSQLtoJavaConverter._translate_plsql_expression(condition)
+                condition_java = PLSQLtoJavaConverter._translate_plsql_expression(condition)
                 
-                body_lines.append(f"    if (!({java_condition})) {{")
-                body_lines.append(f'        throw new BusinessException("-{error_code}", "{message}");')
-                body_lines.append("    }")
+                # Check if message is a parameter reference (p_xxx, l_xxx, v_xxx)
+                if message and re.match(r'^[plv]_\w+$', message, re.IGNORECASE):
+                    # Extract just the parameter name without the prefix for camelCase conversion
+                    # p_error_message -> errorMessage
+                    if message[1] == '_':
+                        param_part = message[2:]  # Remove p_, l_, or v_
+                        message_java = PLSQLtoJavaConverter._to_camel_case(param_part)
+                    else:
+                        message_java = PLSQLtoJavaConverter._to_camel_case(message)
+                    body_lines.append(f"    if ({condition_java}) {{")
+                    body_lines.append(f'        throw new BusinessException("-{error_code}", {message_java});')
+                    body_lines.append("    }")
+                else:
+                    body_lines.append(f"    if ({condition_java}) {{")
+                    body_lines.append(f'        throw new BusinessException("-{error_code}", "{message}");')
+                    body_lines.append("    }")
             
             # Handle error_assertions (package.assert style)
             for assertion in logic.error_assertions:
@@ -842,9 +932,28 @@ class PLSQLtoJavaConverter:
                 # Translate condition to proper Java
                 java_condition = PLSQLtoJavaConverter._translate_plsql_expression(condition)
                 
-                body_lines.append(f"    if (!({java_condition})) {{")
-                body_lines.append(f'        throw new BusinessException("{message}");')
-                body_lines.append("    }")
+                # CRITICAL: assert(condition, message) in PL/SQL does:
+                # IF NOT NVL(condition, false) THEN RAISE...
+                # So in Java we need: IF !(condition) { throw ... }
+                # Wrap with NOT to match assert semantics
+                java_condition = f"!({java_condition})"
+                
+                # Check if message is a parameter reference (p_xxx, l_xxx, v_xxx)
+                if message and re.match(r'^[plv]_\w+$', message, re.IGNORECASE):
+                    # Extract just the parameter name without the prefix for camelCase conversion
+                    # p_error_message -> errorMessage
+                    if message[1] == '_':
+                        param_part = message[2:]  # Remove p_, l_, or v_
+                        message_var = PLSQLtoJavaConverter._to_camel_case(param_part)
+                    else:
+                        message_var = PLSQLtoJavaConverter._to_camel_case(message)
+                    body_lines.append(f"    if ({java_condition}) {{")
+                    body_lines.append(f'        throw new BusinessException({message_var});')
+                    body_lines.append("    }")
+                else:
+                    body_lines.append(f"    if ({java_condition}) {{")
+                    body_lines.append(f'        throw new BusinessException("{message}");')
+                    body_lines.append("    }")
         
         # 2. DERIVED VALUES LAYER
         declared_vars = set()  # Track which variables have been declared to avoid duplicates
@@ -928,7 +1037,7 @@ class PLSQLtoJavaConverter:
                 into_vars = select.get('into_variables', '')
                 entity_name = PLSQLtoJavaConverter._table_to_entity(table)
                 # Convert repository variable name properly (e.g., XyCustomerEntity -> xyCustomerRepository)
-                repo_name = table[0].lower() + table[1:] + 'Repository'  # xy_customer -> xyCustomerRepository
+                repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
                 var_name = PLSQLtoJavaConverter._to_camel_case(into_vars)
                 has_exception = select.get('has_exception', False)
                 
@@ -960,7 +1069,7 @@ class PLSQLtoJavaConverter:
                     table = insert.get('table', '')
                     record_var = insert.get('record_value', '')
                     entity_name = PLSQLtoJavaConverter._table_to_entity(table)
-                    repo_name = table[0].lower() + table[1:] + 'Repository'
+                    repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
                     
                     # Assume the record is already of entity type
                     if insert.get('returning_column'):
@@ -976,7 +1085,7 @@ class PLSQLtoJavaConverter:
                     entity_name = PLSQLtoJavaConverter._table_to_entity(table)
                     columns = insert.get('columns', [])
                     values = insert.get('values', [])
-                    repo_name = table[0].lower() + table[1:] + 'Repository'
+                    repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
                     
                     body_lines.append(f"    {entity_name} entity = new {entity_name}();")
                     
@@ -999,7 +1108,7 @@ class PLSQLtoJavaConverter:
                 table = update.get('table', '')
                 entity_name = PLSQLtoJavaConverter._table_to_entity(table)
                 assignments = update.get('assignments', {})
-                repo_name = table[0].lower() + table[1:] + 'Repository'
+                repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
                 
                 body_lines.append(f"    Optional<{entity_name}> existingOpt = {repo_name}.findOne(...);")
                 body_lines.append(f"    if (existingOpt.isPresent()) {{")
@@ -1019,7 +1128,7 @@ class PLSQLtoJavaConverter:
                 table = delete.get('table', '')
                 where = delete.get('where', '')
                 entity_name = PLSQLtoJavaConverter._table_to_entity(table)
-                repo_name = table[0].lower() + table[1:] + 'Repository'
+                repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
                 
                 if where and where.strip():
                     java_where = PLSQLtoJavaConverter._translate_plsql_expression(where)
@@ -1057,7 +1166,10 @@ class PLSQLtoJavaConverter:
         # Build final method
         final_code = ""
         if logic.has_commit or logic.inserts or logic.updates or logic.deletes or logic.logging_calls:
-            final_code += "    @Transactional\n"
+            if logic.has_autonomous_transaction:
+                final_code += "    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.REQUIRES_NEW)\n"
+            else:
+                final_code += "    @Transactional\n"
         
         final_code += f"public {return_type} {method_name}({params_str}) {{\n"
         final_code += "\n".join(body_lines) if body_lines else "        logger.info(\"Method executed\");"

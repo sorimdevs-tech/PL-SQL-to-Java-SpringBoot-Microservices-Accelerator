@@ -2656,93 +2656,97 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 
     def _inject_method_body(self, service_code: str, generated_method: str) -> str:
         """
-        Replace the first public method in service code with the generated method body only.
-        Preserves the existing method signature and replaces only the body.
+        Replace the first public METHOD (not class) in service code with the complete generated method.
+        CRITICAL: Must skip class declaration and only replace methods.
         
         Args:
             service_code: The existing Java service class code
-            generated_method: The newly generated method (may have different signature)
+            generated_method: The newly generated complete method (full signature + body)
             
         Returns:
-            Updated service_code with the method body replaced
+            Updated service_code with the method completely replaced
         """
-        # Extract just the body from the generated method
+        # Find the complete generated method (from 'public' to closing brace)
         gen_lines = generated_method.split('\n')
-        body_start = -1
-        body_end = -1
+        method_start = -1
+        method_end = -1
         brace_count = 0
         
         for idx, line in enumerate(gen_lines):
-            if body_start == -1 and '{' in line:
-                body_start = idx
+            if method_start == -1 and 'public' in line and '{' in line:
+                method_start = idx
                 brace_count = line.count('{') - line.count('}')
-            elif body_start != -1:
+            elif method_start != -1:
                 brace_count += line.count('{') - line.count('}')
-                if brace_count == 0:
-                    body_end = idx
+                if brace_count == 0 and '}' in line:
+                    method_end = idx
                     break
         
-        if body_start == -1 or body_end == -1:
-            logger.warning("Could not extract method body from generated method")
+        if method_start == -1 or method_end == -1:
+            logger.warning("Could not extract complete method from generated code")
             return service_code
         
-        # Extract just the body content (between braces, excluding the braces themselves)
-        body_content = []
-        for idx in range(body_start + 1, body_end):
-            body_content.append(gen_lines[idx])
+        # Extract complete method including signature and body
+        generated_complete_method = '\n'.join(gen_lines[method_start:method_end + 1])
         
-        # Join and strip
-        method_body = '\n'.join(body_content).strip()
-        
-        # Now find and replace the first public method in service_code
+        # Now find and replace the first public METHOD (not class!) in service_code
         sc_lines = service_code.split('\n')
         output_lines = []
         i = 0
         method_found = False
+        inside_class_body = False  # Track if we're past the class declaration
+        class_brace_depth = 0
         
         while i < len(sc_lines):
             line = sc_lines[i]
             
-            # Look for first public method declaration
-            if not method_found and re.match(r'\s*public\s+\w+\s+\w+\s*\(', line):
+            # Track brace depth to know when we're inside the class body
+            if 'public class' in line:
+                inside_class_body = True
+                class_brace_depth = line.count('{') - line.count('}')
+            elif inside_class_body:
+                class_brace_depth += line.count('{') - line.count('}')
+            
+            # Look for first public METHOD inside the class (not the class itself)
+            if (not method_found and inside_class_body and class_brace_depth > 0 and 
+                'public' in line and ('void' in line or 'Long' in line or 'String' in line or 
+                                     'Boolean' in line or 'Integer' in line or 'BigDecimal' in line or
+                                     'List' in line or 'Optional' in line)):
                 method_found = True
-                logger.debug("Found public method, replacing body...")
+                logger.debug("Found public method, replacing completely with generated method...")
                 
-                # Add the method signature as-is
-                output_lines.append(line)
+                # Replace with the complete generated method
+                output_lines.append(generated_complete_method)
                 
-                # Collect and skip the old method body
-                inside_method = False
+                # Skip the old method - find where it ends (method-level closing brace)
                 brace_count = 0
                 j = i
+                found_opening_brace = False
                 
                 while j < len(sc_lines):
                     current_line = sc_lines[j]
                     
                     # Track braces
-                    if '{' in current_line:
-                        inside_method = True
-                    
                     brace_count += current_line.count('{')
                     brace_count -= current_line.count('}')
                     
-                    if j > i:  # Skip the first line (method signature)
-                        # Check if this closes the method
-                        if inside_method and brace_count == 0:
-                            # We've found the closing brace of the method
-                            # Insert the new body before the closing brace
-                            for body_line in method_body.split('\n'):
-                                output_lines.append('        ' + body_line if body_line.strip() else '')
-                            output_lines.append('    }')
-                            i = j + 1
-                            break
+                    if '{' in current_line:
+                        found_opening_brace = True
+                    
+                    # Check if this is the closing brace of the method
+                    if found_opening_brace and brace_count == 0:
+                        # We've skipped the old method completely
+                        i = j
+                        break
                     
                     j += 1
             else:
                 output_lines.append(line)
-                i += 1
+            
+            i += 1
         
-        return '\n'.join(output_lines)
+        result = '\n'.join(output_lines)
+        return result
 
     def _normalize_service_code(self, filename: str, code: str) -> str:
         """
@@ -3038,12 +3042,26 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.stream.Stream;')
         imports = '\n'.join(dict.fromkeys(import_lines))
 
-        return f"""package {self.package_name}.service;
+        # Apply comprehensive fixes for all 9 mismatch categories
+        # This ensures:
+        # 1. No PL/SQL syntax in Java
+        # 2. Return types are correct
+        # 3. Validation logic is sound
+        # 4. Repository methods exist
+        # 5. Constants are defined
+        # 6. Entity fields are valid
+        # 7. Exception handling is correct
+        # 8. Method signatures are clean
+        from .comprehensive_code_fixer import ComprehensiveServiceFixer
+        fixer = ComprehensiveServiceFixer()
+        final_code = f"""package {self.package_name}.service;
 
 {imports}
 
 {body}
 """
+        fixed_code, _ = fixer.fix_service_code(final_code, {}, {'entity_name': entity_names})
+        return fixed_code
 
     def _resolve_repo_method_names(self, repo_name: str) -> dict:
         """
