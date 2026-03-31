@@ -35,6 +35,13 @@ export interface GitHubOutputConfig {
   commit_message?: string
 }
 
+export interface GitHubRepoBranchesResponse {
+  repo_url: string
+  default_branch?: string
+  branches: string[]
+  count?: number
+}
+
 export interface GitHubPublishResult {
   published: boolean
   repo_url: string

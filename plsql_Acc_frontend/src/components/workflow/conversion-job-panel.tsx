@@ -4,6 +4,7 @@ import { Download, FileText, LoaderCircle, Play } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { parseGitHubRepoInput } from "@/lib/github-url"
 import {
   createFileJob,
   createGitJob,
@@ -360,10 +361,11 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       let createdJob: ConversionJob | null = null
       const configPath = props.dbConfigPath || "config.json"
       const isGitHubOutput = props.outputDestination === "github"
+      const parsedGitHubOutput = parseGitHubRepoInput(props.githubOutputRepoUrl)
       const githubOutput: GitHubOutputConfig | undefined = isGitHubOutput
         ? {
-            repo_url: props.githubOutputRepoUrl.trim(),
-            branch: props.githubOutputBranch.trim() || undefined,
+            repo_url: parsedGitHubOutput.repoUrl.trim(),
+            branch: props.githubOutputBranch.trim() || parsedGitHubOutput.branch || undefined,
             target_path: props.githubOutputPath.trim() || undefined,
             access_token: props.githubOutputToken.trim() || undefined,
             username: props.githubOutputUsername.trim() || undefined,

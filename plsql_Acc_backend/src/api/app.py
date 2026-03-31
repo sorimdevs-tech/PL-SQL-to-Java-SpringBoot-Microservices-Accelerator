@@ -140,6 +140,12 @@ class GitRepoTreeRequest(BaseModel):
     path: Optional[str] = None
 
 
+class GitRepoBranchesRequest(BaseModel):
+    """Request body for listing git branches for a repository."""
+
+    repo_url: str = Field(..., min_length=1)
+
+
 class DiscoveryAnalyzeRequest(BaseModel):
     """Request body for discovery metadata analysis."""
 
@@ -384,6 +390,55 @@ def _list_git_tree(request: GitRepoTreeRequest) -> Dict[str, Any]:
             "entries": entries,
             "count": len(entries),
         }
+
+
+def _list_git_branches(request: GitRepoBranchesRequest) -> Dict[str, Any]:
+    """Return the remote branches for a repository plus its default branch."""
+    if not _is_valid_repo_url(request.repo_url):
+        raise ValueError("Invalid repo_url. Use an HTTPS or SSH git URL.")
+
+    try:
+        import git
+    except ImportError as exc:
+        raise RuntimeError("GitPython is required for git branches endpoint") from exc
+
+    try:
+        git_cmd = git.Git()
+        head_output = git_cmd.ls_remote("--symref", request.repo_url, "HEAD")
+        heads_output = git_cmd.ls_remote("--heads", request.repo_url)
+    except git.exc.GitCommandError as exc:
+        error_text = str(exc).lower()
+        if any(token in error_text for token in ("not found", "repository", "could not read", "authentication")):
+            raise FileNotFoundError(f"Repository not found or not accessible: {request.repo_url}") from exc
+        raise RuntimeError(f"Failed to inspect repository branches: {exc}") from exc
+
+    default_branch: Optional[str] = None
+    for line in head_output.splitlines():
+        line = line.strip()
+        if line.startswith("ref: refs/heads/") and "\tHEAD" in line:
+            default_branch = line[len("ref: refs/heads/") :].split("\t", 1)[0].strip()
+            break
+
+    branches: List[str] = []
+    for line in heads_output.splitlines():
+        line = line.strip()
+        if "\trefs/heads/" not in line:
+            continue
+        branch_name = line.split("\trefs/heads/", 1)[1].strip()
+        if branch_name:
+            branches.append(branch_name)
+
+    unique_branches = sorted(set(branches), key=lambda value: value.lower())
+    if default_branch and default_branch in unique_branches:
+        unique_branches.remove(default_branch)
+        unique_branches.insert(0, default_branch)
+
+    return {
+        "repo_url": request.repo_url,
+        "default_branch": default_branch,
+        "branches": unique_branches,
+        "count": len(unique_branches),
+    }
 
 
 def _build_oracle_connection_string(request: OracleConnectionRequest) -> str:
@@ -1398,6 +1453,19 @@ async def list_git_tree(request: GitRepoTreeRequest) -> Dict[str, Any]:
     """List folders/files for a git repository path."""
     try:
         return await asyncio.to_thread(_list_git_tree, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {exc}") from exc
+
+
+@app.post("/api/github/branches")
+async def list_github_branches(request: GitRepoBranchesRequest) -> Dict[str, Any]:
+    """List remote branches for a Git repository."""
+    try:
+        return await asyncio.to_thread(_list_git_branches, request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
