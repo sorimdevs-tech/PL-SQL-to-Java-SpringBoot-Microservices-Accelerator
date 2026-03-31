@@ -426,8 +426,11 @@ class SpringBootGenerator:
         "spring-boot-starter-validation",
         "springdoc-openapi-starter-webmvc-ui",
         "ojdbc8",
+        "ojdbc11",
         "mysql-connector-j",
         "postgresql",
+        "mssql-jdbc",
+        "spring-boot-starter-data-mongodb",
         "spring-boot-starter-test",
         "testcontainers",
         "junit-jupiter",
@@ -657,6 +660,10 @@ class SpringBootGenerator:
             "mysql": "mysql-connector-j",
             "postgres": "postgresql",
             "postgresql": "postgresql",
+            "sqlserver": "mssql-jdbc",
+            "mssql": "mssql-jdbc",
+            "mongodb": "spring-boot-starter-data-mongodb",
+            "mongo": "spring-boot-starter-data-mongodb",
             "oracle": "ojdbc8",
         }
         dep_id = alias_map.get(dep_id, dep_id)
@@ -687,6 +694,10 @@ class SpringBootGenerator:
             ),
             "postgresql": BuildDependency(
                 group="org.postgresql", artifact="postgresql",
+                scope="runtime", gradle_configuration="runtimeOnly",
+            ),
+            "mssql-jdbc": BuildDependency(
+                group="com.microsoft.sqlserver", artifact="mssql-jdbc",
                 scope="runtime", gradle_configuration="runtimeOnly",
             ),
         }
@@ -762,6 +773,16 @@ class SpringBootGenerator:
                 group="org.postgresql", artifact="postgresql",
                 scope="runtime", gradle_configuration="runtimeOnly",
             )
+        if db_type in ("sqlserver", "mssql", "microsoft sql server"):
+            return BuildDependency(
+                group="com.microsoft.sqlserver", artifact="mssql-jdbc",
+                scope="runtime", gradle_configuration="runtimeOnly",
+            )
+        if db_type in ("mongodb", "mongo"):
+            return BuildDependency(
+                group="org.springframework.boot", artifact="spring-boot-starter-data-mongodb",
+                gradle_configuration="implementation",
+            )
         return None
 
     def _dedupe_dependencies(self, deps: List[BuildDependency]) -> List[BuildDependency]:
@@ -802,9 +823,9 @@ class SpringBootGenerator:
 
     def _build_dependency_list(self, config: Dict[str, Any]) -> List[BuildDependency]:
         deps: List[BuildDependency] = []
+        db_type = self._get_database_type(config)
         deps.extend([
             BuildDependency("org.springframework.boot", "spring-boot-starter-web", gradle_configuration="implementation"),
-            BuildDependency("org.springframework.boot", "spring-boot-starter-data-jpa", gradle_configuration="implementation"),
             BuildDependency("org.springframework.boot", "spring-boot-starter-validation", gradle_configuration="implementation"),
             BuildDependency("org.springdoc", "springdoc-openapi-starter-webmvc-ui", version="2.5.0", gradle_configuration="implementation"),
             BuildDependency("org.springframework.boot", "spring-boot-starter-test", scope="test", gradle_configuration="testImplementation"),
@@ -814,6 +835,10 @@ class SpringBootGenerator:
             BuildDependency("com.h2database", "h2", scope="test", gradle_configuration="testRuntimeOnly"),
             BuildDependency("org.springframework.boot", "spring-boot-devtools", scope="runtime", optional=True, gradle_configuration="developmentOnly"),
         ])
+        if db_type not in ("mongodb", "mongo"):
+            deps.append(
+                BuildDependency("org.springframework.boot", "spring-boot-starter-data-jpa", gradle_configuration="implementation")
+            )
 
         db_dep = self._select_database_dependency(config)
         if db_dep:
@@ -845,6 +870,8 @@ class SpringBootGenerator:
                 ("com.oracle.database.jdbc", "ojdbc11"),
                 ("com.mysql", "mysql-connector-j"),
                 ("org.postgresql", "postgresql"),
+                ("com.microsoft.sqlserver", "mssql-jdbc"),
+                ("org.springframework.boot", "spring-boot-starter-data-mongodb"),
             }
             deps = [
                 dep for dep in deps
@@ -858,7 +885,9 @@ class SpringBootGenerator:
             return "testing"
         if dep.artifact in ("spring-boot-devtools",):
             return "devtools"
-        if dep.group in ("com.oracle.database.jdbc", "com.mysql", "org.postgresql"):
+        if dep.group in ("com.oracle.database.jdbc", "com.mysql", "org.postgresql", "com.microsoft.sqlserver"):
+            return "database"
+        if dep.key() == ("org.springframework.boot", "spring-boot-starter-data-mongodb"):
             return "database"
         return "core"
 
@@ -1209,6 +1238,33 @@ tasks.named('test') {{
         logger.info("Application configuration files generated")
 
     def _generate_application_yml(self) -> str:
+        db_config = self._get_application_database_config()
+        if db_config["kind"] == "mongodb":
+            return f"""# Spring Boot Application Configuration
+spring:
+  application:
+    name: {self.project_name}
+
+  # MongoDB Configuration
+  data:
+    mongodb:
+      uri: {db_config["uri"]}
+      database: your_database
+
+server:
+  port: 8080
+
+# Logging Configuration
+logging:
+  level:
+    {self.package_name}: DEBUG
+
+# Custom Application Properties
+app:
+  version: 1.0.0
+  description: {self.description}
+  build-time: {self._get_current_time()}
+"""
         # SBG-2: server: is a top-level key, NOT nested under spring:
         return f"""# Spring Boot Application Configuration
 spring:
@@ -1217,10 +1273,10 @@ spring:
 
   # Database Configuration
   datasource:
-    url: jdbc:oracle:thin:@localhost:1521:xe
+    url: {db_config["url"]}
     username: your_username
     password: your_password
-    driver-class-name: oracle.jdbc.OracleDriver
+    driver-class-name: {db_config["driver"]}
 
   # JPA Configuration
   jpa:
@@ -1229,7 +1285,7 @@ spring:
     show-sql: true
     properties:
       hibernate:
-        dialect: org.hibernate.dialect.OracleDialect
+        dialect: {db_config["dialect"]}
         format_sql: true
 
 # SBG-2 FIX: server is top-level, not under spring:
@@ -1251,20 +1307,40 @@ app:
 """
 
     def _generate_application_properties(self) -> str:
+        db_config = self._get_application_database_config()
+        if db_config["kind"] == "mongodb":
+            return f"""# Spring Boot Application Configuration
+spring.application.name={self.project_name}
+
+# MongoDB Configuration
+spring.data.mongodb.uri={db_config["uri"]}
+spring.data.mongodb.database=your_database
+
+# SBG-1 FIX: correct key (was spring.server.port)
+server.port=8080
+
+# Logging Configuration
+logging.level.{self.package_name}=DEBUG
+
+# Custom Application Properties
+app.version=1.0.0
+app.description={self.description}
+app.build-time={self._get_current_time()}
+"""
         # SBG-1: correct key is server.port, not spring.server.port
         return f"""# Spring Boot Application Configuration
 spring.application.name={self.project_name}
 
 # Database Configuration
-spring.datasource.url=jdbc:oracle:thin:@localhost:1521:xe
+spring.datasource.url={db_config["url"]}
 spring.datasource.username=your_username
 spring.datasource.password=your_password
-spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.datasource.driver-class-name={db_config["driver"]}
 
 # JPA Configuration
 spring.jpa.hibernate.ddl-auto=update
 spring.jpa.show-sql=true
-spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.OracleDialect
+spring.jpa.properties.hibernate.dialect={db_config["dialect"]}
 spring.jpa.properties.hibernate.format_sql=true
 
 # SBG-1 FIX: correct key (was spring.server.port)
@@ -1280,6 +1356,41 @@ app.version=1.0.0
 app.description={self.description}
 app.build-time={self._get_current_time()}
 """
+
+    def _get_application_database_config(self) -> Dict[str, str]:
+        db_type = self._get_database_type(self.config)
+        if db_type == "mysql":
+            return {
+                "kind": "relational",
+                "url": "jdbc:mysql://localhost:3306/your_database",
+                "driver": "com.mysql.cj.jdbc.Driver",
+                "dialect": "org.hibernate.dialect.MySQLDialect",
+            }
+        if db_type in ("postgresql", "postgres"):
+            return {
+                "kind": "relational",
+                "url": "jdbc:postgresql://localhost:5432/your_database",
+                "driver": "org.postgresql.Driver",
+                "dialect": "org.hibernate.dialect.PostgreSQLDialect",
+            }
+        if db_type in ("sqlserver", "mssql", "microsoft sql server"):
+            return {
+                "kind": "relational",
+                "url": "jdbc:sqlserver://localhost:1433;databaseName=your_database;encrypt=true;trustServerCertificate=true",
+                "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+                "dialect": "org.hibernate.dialect.SQLServerDialect",
+            }
+        if db_type in ("mongodb", "mongo"):
+            return {
+                "kind": "mongodb",
+                "uri": "mongodb://localhost:27017/your_database",
+            }
+        return {
+            "kind": "relational",
+            "url": "jdbc:oracle:thin:@localhost:1521:xe",
+            "driver": "oracle.jdbc.OracleDriver",
+            "dialect": "org.hibernate.dialect.OracleDialect",
+        }
 
     def _normalize_build_tool(self, value: str) -> str:
         if not value:

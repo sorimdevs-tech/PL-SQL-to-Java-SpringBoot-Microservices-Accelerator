@@ -64,7 +64,6 @@ const DEFAULT_SPRING_DEPENDENCIES = [
   { id: "validation", name: "Validation", description: "Jakarta Bean Validation annotations." },
   { id: "actuator", name: "Actuator", description: "Health checks and metrics endpoints." },
   { id: "lombok", name: "Lombok", description: "Boilerplate reduction for model and DTO classes." },
-  { id: "oracle-driver", name: "Oracle Driver", description: "Oracle JDBC runtime driver support." },
 ]
 
 type DependencyInsight = {
@@ -1128,11 +1127,6 @@ function SqlSourceDiscovery(props: {
         name: "Spring Data JPA",
         reason: "Tables detected in SQL statements; JPA repositories will be generated.",
       })
-      dependencies.push({
-        id: "oracle-driver",
-        name: "Oracle Driver",
-        reason: "SQL tables detected; JDBC driver is required for runtime access.",
-      })
     }
 
     if (operations.length > 0) {
@@ -1674,6 +1668,66 @@ function DiscoveryPanel(props: DiscoveryPanelProps) {
     )
   }
 
+type TargetDatabase = "mysql" | "oracle" | "postgresql" | "sqlserver" | "mongodb"
+
+type DatabaseConfig = {
+  label: string
+  icon: string
+  description: string
+  mavenDependency: string
+  gradleDependency: string
+  dependencyId: string
+  dependencyName: string
+}
+
+const DATABASE_CONFIGS: Record<TargetDatabase, DatabaseConfig> = {
+  mysql: {
+    label: "MySQL",
+    icon: "🐬",
+    description: "MySQL JDBC Driver",
+    dependencyId: "mysql-connector-j",
+    dependencyName: "MySQL Connector/J",
+    mavenDependency: `<dependency>\n  <groupId>com.mysql</groupId>\n  <artifactId>mysql-connector-j</artifactId>\n  <scope>runtime</scope>\n</dependency>`,
+    gradleDependency: `runtimeOnly 'com.mysql:mysql-connector-j'`,
+  },
+  oracle: {
+    label: "Oracle Database",
+    icon: "🔴",
+    description: "Oracle JDBC Driver (ojdbc11)",
+    dependencyId: "ojdbc11",
+    dependencyName: "Oracle JDBC Driver",
+    mavenDependency: `<dependency>\n  <groupId>com.oracle.database.jdbc</groupId>\n  <artifactId>ojdbc11</artifactId>\n  <scope>runtime</scope>\n</dependency>`,
+    gradleDependency: `runtimeOnly 'com.oracle.database.jdbc:ojdbc11'`,
+  },
+  postgresql: {
+    label: "PostgreSQL",
+    icon: "🐘",
+    description: "PostgreSQL JDBC Driver",
+    dependencyId: "postgresql",
+    dependencyName: "PostgreSQL Driver",
+    mavenDependency: `<dependency>\n  <groupId>org.postgresql</groupId>\n  <artifactId>postgresql</artifactId>\n  <scope>runtime</scope>\n</dependency>`,
+    gradleDependency: `runtimeOnly 'org.postgresql:postgresql'`,
+  },
+  sqlserver: {
+    label: "Microsoft SQL Server",
+    icon: "🪟",
+    description: "Microsoft JDBC Driver for SQL Server",
+    dependencyId: "mssql-jdbc",
+    dependencyName: "SQL Server JDBC Driver",
+    mavenDependency: `<dependency>\n  <groupId>com.microsoft.sqlserver</groupId>\n  <artifactId>mssql-jdbc</artifactId>\n  <scope>runtime</scope>\n</dependency>`,
+    gradleDependency: `runtimeOnly 'com.microsoft.sqlserver:mssql-jdbc'`,
+  },
+  mongodb: {
+    label: "MongoDB",
+    icon: "🍃",
+    description: "Spring Data MongoDB starter",
+    dependencyId: "spring-boot-starter-data-mongodb",
+    dependencyName: "Spring Data MongoDB",
+    mavenDependency: `<dependency>\n  <groupId>org.springframework.boot</groupId>\n  <artifactId>spring-boot-starter-data-mongodb</artifactId>\n</dependency>`,
+    gradleDependency: `implementation 'org.springframework.boot:spring-boot-starter-data-mongodb'`,
+  },
+}
+
 interface StrategyPanelProps {
   springBootVersion: string
   setSpringBootVersion: (value: string) => void
@@ -1699,6 +1753,8 @@ interface StrategyPanelProps {
   setOutputDirectory: (value: string) => void
   analyzedDependencies: DependencyInsight[]
   suggestedDependencies: SuggestedDependency[]
+  selectedTargetDatabase: TargetDatabase | null
+  setSelectedTargetDatabase: (database: TargetDatabase | null) => void
   selectedOptionalDependencies: string[]
   setSelectedOptionalDependencies: (deps: string[]) => void
 }
@@ -1708,6 +1764,24 @@ function StrategyPanel(props: StrategyPanelProps) {
   const [gradleFlavor, setGradleFlavor] = useState<"groovy" | "kotlin">("groovy")
   const [isPickingDir, setIsPickingDir] = useState(false)
   const [pickDirError, setPickDirError] = useState<string | null>(null)
+  const prevDbIdRef = useRef<string | null>(null)
+
+  // When user picks a DB, swap out the old driver dep and inject the new one automatically
+  useEffect(() => {
+    const prevId = prevDbIdRef.current
+    const newConfig = props.selectedTargetDatabase ? DATABASE_CONFIGS[props.selectedTargetDatabase] : null
+    const newId = newConfig?.dependencyId ?? null
+
+    let next = prevId
+      ? props.selectedOptionalDependencies.filter((d) => d !== prevId)
+      : [...props.selectedOptionalDependencies]
+    if (newId && !next.includes(newId)) {
+      next = [...next, newId]
+    }
+    props.setSelectedOptionalDependencies(next)
+    prevDbIdRef.current = newId
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.selectedTargetDatabase])
 
   function resolveSuggestedId(name: string): string | null {
     const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
@@ -1740,6 +1814,12 @@ function StrategyPanel(props: StrategyPanelProps) {
       })
       .filter((item): item is readonly [string, string] => item !== null),
   )
+  // Merge in DB driver labels so chips show the human name, not the artifact id
+  for (const cfg of Object.values(DATABASE_CONFIGS)) {
+    if (!labelById.has(cfg.dependencyId)) {
+      labelById.set(cfg.dependencyId, cfg.dependencyName)
+    }
+  }
 
   function addOptionalDependency(id: string) {
     if (optionalSet.has(id)) {
@@ -1989,6 +2069,68 @@ function StrategyPanel(props: StrategyPanelProps) {
               ))}
             </div>
           </div>
+
+          {/* ── Target Database ── */}
+          <div className="space-y-3">
+            <div>
+              <p className="text-sm font-semibold text-slate-900">Target Database</p>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Select the database your Spring Boot app will connect to. The correct JDBC driver dependency will be added automatically.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+              {(Object.entries(DATABASE_CONFIGS) as [TargetDatabase, DatabaseConfig][]).map(([key, cfg]) => {
+                const isSelected = props.selectedTargetDatabase === key
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => props.setSelectedTargetDatabase(isSelected ? null : key)}
+                    className={`group flex items-start gap-3 rounded-xl border p-3 text-left transition-all ${
+                      isSelected
+                        ? "border-cyan-400 bg-cyan-50 shadow-sm shadow-cyan-100"
+                        : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50"
+                    }`}
+                  >
+                    <span className="mt-0.5 text-xl leading-none">{cfg.icon}</span>
+                    <div className="min-w-0">
+                      <p className={`text-sm font-semibold leading-tight ${isSelected ? "text-cyan-900" : "text-slate-800"}`}>
+                        {cfg.label}
+                      </p>
+                      <p className="mt-0.5 text-xs text-slate-500 leading-snug">{cfg.description}</p>
+                    </div>
+                    {isSelected ? (
+                      <span className="ml-auto shrink-0 mt-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-cyan-500 text-white text-[10px] font-bold">✓</span>
+                    ) : null}
+                  </button>
+                )
+              })}
+            </div>
+
+            {props.selectedTargetDatabase ? (() => {
+              const cfg = DATABASE_CONFIGS[props.selectedTargetDatabase]
+              const snippet = props.buildTool === "mvn" ? cfg.mavenDependency : cfg.gradleDependency
+              return (
+                <div className="rounded-xl border border-cyan-200 bg-cyan-50/60 p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-cyan-700">
+                      {props.buildTool === "mvn" ? "pom.xml snippet" : "build.gradle snippet"}
+                    </p>
+                    <span className="rounded-full border border-cyan-300 bg-white px-2 py-0.5 text-[10px] font-semibold text-cyan-700 uppercase tracking-wide">
+                      auto-added ✓
+                    </span>
+                  </div>
+                  <pre className="overflow-x-auto rounded-lg border border-cyan-100 bg-white p-3 text-xs text-slate-800 leading-relaxed">
+                    {snippet}
+                  </pre>
+                  <p className="text-xs text-cyan-700">
+                    <span className="font-semibold">{cfg.dependencyName}</span> has been added to your dependency list.
+                    Switch between Maven / Gradle above to see the corresponding snippet.
+                  </p>
+                </div>
+              )
+            })() : null}
+          </div>
         </div>
 
         <div className="rounded-md border border-slate-200/80 bg-white p-4">
@@ -2001,6 +2143,33 @@ function StrategyPanel(props: StrategyPanelProps) {
               Add dependencies... <span className="ml-2 text-[11px] font-semibold">CTRL + B</span>
             </button>
           </div>
+
+          {/* ── Database Driver (shown as soon as a DB is selected) ── */}
+          {props.selectedTargetDatabase ? (() => {
+            const cfg = DATABASE_CONFIGS[props.selectedTargetDatabase]
+            return (
+              <div className="mt-4 space-y-2">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Database Driver</p>
+                <div className="flex items-center gap-3 rounded-lg border border-cyan-200 bg-cyan-50 px-3 py-2.5">
+                  <span className="text-lg leading-none">{cfg.icon}</span>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-cyan-900">{cfg.dependencyName}</p>
+                    <p className="text-xs text-cyan-700 mt-0.5">{cfg.description}</p>
+                    <p className="text-[10px] text-cyan-600 mt-1 font-mono">{cfg.dependencyId}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => props.setSelectedTargetDatabase(null)}
+                    className="shrink-0 rounded-full border border-cyan-300 bg-white px-2 py-0.5 text-xs font-semibold text-cyan-700 hover:bg-cyan-100 transition"
+                    title="Remove database driver"
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            )
+          })() : null}
+
           {props.analyzedDependencies.length > 0 ? (
             <div className="mt-4 space-y-3 text-sm text-slate-700">
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Required</p>
@@ -2051,24 +2220,28 @@ function StrategyPanel(props: StrategyPanelProps) {
               </p>
             )}
           </div>
-          {props.selectedOptionalDependencies.length > 0 ? (
-            <div className="mt-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Included (Optional)</p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {props.selectedOptionalDependencies.map((dep) => (
-                  <button
-                    key={dep}
-                    type="button"
-                    onClick={() => removeOptionalDependency(dep)}
-                    className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
-                  >
-                    {labelById.get(dep) ?? dep}
-                    <span className="text-slate-400">×</span>
-                  </button>
-                ))}
+          {(() => {
+            const activeDriveId = props.selectedTargetDatabase ? DATABASE_CONFIGS[props.selectedTargetDatabase].dependencyId : null
+            const nonDbOptional = props.selectedOptionalDependencies.filter((dep) => dep !== activeDriveId)
+            return nonDbOptional.length > 0 ? (
+              <div className="mt-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Included (Optional)</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {nonDbOptional.map((dep) => (
+                    <button
+                      key={dep}
+                      type="button"
+                      onClick={() => removeOptionalDependency(dep)}
+                      className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
+                    >
+                      {labelById.get(dep) ?? dep}
+                      <span className="text-slate-400">×</span>
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
-          ) : null}
+            ) : null
+          })()}
           <p className="mt-6 text-xs text-slate-400">
             {DEFAULT_SPRING_DEPENDENCIES.length} baseline dependencies remain available for generation.
           </p>
@@ -2522,6 +2695,8 @@ interface PanelBodyProps {
   setOutputDirectory: (value: string) => void
   analyzedDependencies: DependencyInsight[]
   suggestedDependencies: SuggestedDependency[]
+  selectedTargetDatabase: TargetDatabase | null
+  setSelectedTargetDatabase: (database: TargetDatabase | null) => void
   selectedOptionalDependencies: string[]
   setSelectedOptionalDependencies: (deps: string[]) => void
   gitRepoUrl: string
@@ -2629,6 +2804,8 @@ function PanelBody(props: PanelBodyProps) {
               setOutputDirectory={props.setOutputDirectory}
               analyzedDependencies={props.analyzedDependencies}
               suggestedDependencies={props.suggestedDependencies}
+              selectedTargetDatabase={props.selectedTargetDatabase}
+              setSelectedTargetDatabase={props.setSelectedTargetDatabase}
               selectedOptionalDependencies={props.selectedOptionalDependencies}
               setSelectedOptionalDependencies={props.setSelectedOptionalDependencies}
             />
@@ -2655,6 +2832,7 @@ function PanelBody(props: PanelBodyProps) {
             projectDescription={props.projectDescription}
             projectPackageName={props.projectPackageName}
             outputDirectory={props.outputDirectory}
+            targetDatabase={props.selectedTargetDatabase}
             optionalDependencies={props.selectedOptionalDependencies}
             onConversionStart={props.onConversionStart}
             onSnapshotChange={props.onSnapshotChange}
@@ -2731,6 +2909,7 @@ export function StepPanels({
   const [outputDirectory, setOutputDirectory] = useState("")
   const [analyzedDependencies, setAnalyzedDependencies] = useState<DependencyInsight[]>([])
   const [suggestedDependencies, setSuggestedDependencies] = useState<SuggestedDependency[]>([])
+  const [selectedTargetDatabase, setSelectedTargetDatabase] = useState<TargetDatabase | null>(null)
   const [selectedOptionalDependencies, setSelectedOptionalDependencies] = useState<string[]>([])
   const [conversionSnapshot, setConversionSnapshot] = useState<ConversionSnapshot | null>(null)
   const [backendLogs, setBackendLogs] = useState<string[]>([])
@@ -2881,6 +3060,8 @@ export function StepPanels({
         setOutputDirectory={setOutputDirectory}
         analyzedDependencies={analyzedDependencies}
         suggestedDependencies={suggestedDependencies}
+        selectedTargetDatabase={selectedTargetDatabase}
+        setSelectedTargetDatabase={setSelectedTargetDatabase}
         selectedOptionalDependencies={selectedOptionalDependencies}
         setSelectedOptionalDependencies={setSelectedOptionalDependencies}
         projectName={projectName}

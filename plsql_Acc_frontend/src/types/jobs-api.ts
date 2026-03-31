@@ -20,6 +20,7 @@ export interface OutputConfigOverrides {
   config_format?: "properties" | "yaml"
   target_directory?: string
   dependencies?: string[]
+  database_type?: "mysql" | "oracle" | "postgresql" | "sqlserver" | "mongodb"
 }
 
 export interface ConfigOverrides {

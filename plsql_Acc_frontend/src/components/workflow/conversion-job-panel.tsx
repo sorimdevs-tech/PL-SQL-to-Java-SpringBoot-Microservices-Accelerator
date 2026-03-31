@@ -51,6 +51,7 @@ interface ConversionJobPanelProps {
   projectDescription: string
   projectPackageName: string
   outputDirectory: string
+  targetDatabase?: "mysql" | "oracle" | "postgresql" | "sqlserver" | "mongodb" | null
   optionalDependencies: string[]
   onConversionStart: () => void
   onSnapshotChange: (snapshot: ConversionSnapshot | null) => void
@@ -336,6 +337,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           build_tool: props.buildTool === "mvn" ? "maven" : "gradle",
           packaging: props.packaging,
           config_format: props.springConfigFormat,
+          database_type: props.targetDatabase ?? undefined,
           target_directory: props.outputDirectory.trim() || undefined,
           dependencies: props.optionalDependencies.length ? props.optionalDependencies : undefined,
         },
