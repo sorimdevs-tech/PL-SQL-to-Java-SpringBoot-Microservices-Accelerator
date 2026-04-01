@@ -60,6 +60,7 @@ class GitHubOutputConfig(BaseModel):
 
     repo_url: str = Field(..., min_length=1)
     branch: Optional[str] = None
+    base_branch: Optional[str] = None
     target_path: Optional[str] = None
     access_token: Optional[str] = None
     username: Optional[str] = None
@@ -952,6 +953,7 @@ class JobManager:
                     source_dir=output_dir,
                     repo_url=job.github_output["repo_url"],
                     branch=job.github_output.get("branch"),
+                    base_branch=job.github_output.get("base_branch"),
                     target_subdirectory=job.github_output.get("target_path"),
                     access_token=job.github_output.get("access_token"),
                     username=job.github_output.get("username"),

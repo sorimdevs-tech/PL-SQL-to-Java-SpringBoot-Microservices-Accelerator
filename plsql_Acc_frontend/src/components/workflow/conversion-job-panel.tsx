@@ -20,6 +20,7 @@ import type { ConfigOverrides, ConversionJob, GeneratedFile, GitHubOutputConfig 
 
 type SourceMethod = "git" | "oracle" | "sqlfile"
 type OutputDestination = "local" | "github"
+type OutputBranchMode = "existing" | "new"
 
 export interface ConversionSnapshot {
   jobId: string
@@ -56,7 +57,10 @@ interface ConversionJobPanelProps {
   outputDestination: OutputDestination
   outputDirectory: string
   githubOutputRepoUrl: string
+  githubBranchMode: OutputBranchMode
   githubOutputBranch: string
+  githubBaseBranch: string
+  githubNewBranchName: string
   githubOutputPath: string
   githubOutputToken: string
   githubOutputUsername: string
@@ -104,6 +108,16 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
   const [conversionElapsedMs, setConversionElapsedMs] = useState(0)
 
   const isPolling = job?.status === "queued" || job?.status === "running"
+
+  function hasValidOracleCredentials() {
+    return (
+      props.dbHost.trim().length > 0 &&
+      props.dbPort.trim().length > 0 &&
+      props.dbServiceName.trim().length > 0 &&
+      props.dbUsername.trim().length > 0 &&
+      props.dbPassword.trim().length > 0
+    )
+  }
 
   function extractRepoName(repoUrl: string): string {
     const normalized = repoUrl.trim().replace(/\/+$/, "")
@@ -362,10 +376,16 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       const configPath = props.dbConfigPath || "config.json"
       const isGitHubOutput = props.outputDestination === "github"
       const parsedGitHubOutput = parseGitHubRepoInput(props.githubOutputRepoUrl)
+      const targetGithubBranch =
+        props.githubBranchMode === "new"
+          ? props.githubNewBranchName.trim()
+          : props.githubOutputBranch.trim() || parsedGitHubOutput.branch || ""
       const githubOutput: GitHubOutputConfig | undefined = isGitHubOutput
         ? {
             repo_url: parsedGitHubOutput.repoUrl.trim(),
-            branch: props.githubOutputBranch.trim() || parsedGitHubOutput.branch || undefined,
+            branch: targetGithubBranch || undefined,
+            base_branch:
+              props.githubBranchMode === "new" ? props.githubBaseBranch.trim() || props.githubOutputBranch.trim() || undefined : undefined,
             target_path: props.githubOutputPath.trim() || undefined,
             access_token: props.githubOutputToken.trim() || undefined,
             username: props.githubOutputUsername.trim() || undefined,
@@ -396,6 +416,14 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
         setError("Enter a GitHub repository URL for the output destination.")
         return
       }
+      if (isGitHubOutput && !githubOutput?.branch) {
+        setError(
+          props.githubBranchMode === "new"
+            ? "Enter a new branch name for the GitHub output destination."
+            : "Choose a GitHub branch for the output destination.",
+        )
+        return
+      }
 
       if (props.sourceMethod === "sqlfile") {
         if (!props.sourceFile) {
@@ -420,6 +448,10 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           githubOutput,
         )
       } else {
+        if (!hasValidOracleCredentials()) {
+          setError("Fill valid Oracle host, port, service name, username, and password before starting conversion.")
+          return
+        }
         const response = await startOracleConvert({
           host: props.dbHost.trim(),
           port: Number(props.dbPort),

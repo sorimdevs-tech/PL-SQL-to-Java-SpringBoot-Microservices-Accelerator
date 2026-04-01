@@ -66,6 +66,7 @@ type BuildTool = "mvn" | "gradle"
 type SpringConfigFormat = "properties" | "yaml"
 type PackagingType = "jar" | "war"
 type OutputDestination = "local" | "github"
+type OutputBranchMode = "existing" | "new"
 type BranchOption = { value: string; label: string }
 
 const DEFAULT_SPRING_DEPENDENCIES = [
@@ -1709,8 +1710,14 @@ interface StrategyPanelProps {
   isFetchingGithubBranches: boolean
   githubBranchFetchError: string | null
   onFetchGithubBranches: () => Promise<void>
+  githubBranchMode: OutputBranchMode
+  setGithubBranchMode: (value: OutputBranchMode) => void
   githubOutputBranch: string
   setGithubOutputBranch: (value: string) => void
+  githubBaseBranch: string
+  setGithubBaseBranch: (value: string) => void
+  githubNewBranchName: string
+  setGithubNewBranchName: (value: string) => void
   githubOutputPath: string
   setGithubOutputPath: (value: string) => void
   githubOutputToken: string
@@ -1735,6 +1742,7 @@ function StrategyPanel(props: StrategyPanelProps) {
     label: branch,
   }))
   const selectedBranchOption = branchOptions.find((option) => option.value === props.githubOutputBranch) ?? null
+  const selectedBaseBranchOption = branchOptions.find((option) => option.value === props.githubBaseBranch) ?? null
 
   const branchSelectStyles: StylesConfig<BranchOption, false> = {
     control: (base, state) => ({
@@ -2097,35 +2105,100 @@ function StrategyPanel(props: StrategyPanelProps) {
                         </Button>
                       </div>
                       <div className="grid gap-3 md:grid-cols-2">
-                        {props.availableGithubBranches.length > 0 ? (
-                          <div className="space-y-1.5">
-                            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                              Publish Branch
-                            </p>
-                            <Select<BranchOption, false>
-                              instanceId="github-output-branch"
-                              options={branchOptions}
-                              value={selectedBranchOption}
-                              onChange={(option: SingleValue<BranchOption>) =>
-                                props.setGithubOutputBranch(option?.value ?? "")
-                              }
-                              isSearchable={false}
-                              styles={branchSelectStyles}
-                              components={{
-                                SingleValue: BranchSingleValue,
-                                Option: BranchOptionRow,
-                              }}
-                              placeholder="Choose a branch"
-                            />
+                        <div className="space-y-3 md:col-span-2">
+                          <div className="flex flex-wrap items-center gap-6 text-sm text-slate-800">
+                            <label className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                name="github-branch-mode"
+                                checked={props.githubBranchMode === "existing"}
+                                onChange={() => props.setGithubBranchMode("existing")}
+                                className="h-4 w-4 accent-green-500"
+                              />
+                              Push to existing branch
+                            </label>
+                            <label className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                name="github-branch-mode"
+                                checked={props.githubBranchMode === "new"}
+                                onChange={() => props.setGithubBranchMode("new")}
+                                className="h-4 w-4 accent-green-500"
+                              />
+                              Create new branch
+                            </label>
                           </div>
-                        ) : (
-                          <input
-                            value={props.githubOutputBranch}
-                            onChange={(event) => props.setGithubOutputBranch(event.target.value)}
-                            placeholder="main"
-                            className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
-                          />
-                        )}
+                          <div className="grid gap-3 md:grid-cols-2">
+                            {props.githubBranchMode === "new" && props.availableGithubBranches.length > 0 ? (
+                              <>
+                                <div className="space-y-1.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                    Base Branch
+                                  </p>
+                                  <Select<BranchOption, false>
+                                    instanceId="github-base-branch"
+                                    options={branchOptions}
+                                    value={selectedBaseBranchOption}
+                                    onChange={(option: SingleValue<BranchOption>) =>
+                                      props.setGithubBaseBranch(option?.value ?? "")
+                                    }
+                                    isSearchable={false}
+                                    styles={branchSelectStyles}
+                                    components={{
+                                      SingleValue: BranchSingleValue,
+                                      Option: BranchOptionRow,
+                                    }}
+                                    placeholder="Choose a base branch"
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                    New Branch Name
+                                  </p>
+                                  <input
+                                    value={props.githubNewBranchName}
+                                    onChange={(event) => props.setGithubNewBranchName(event.target.value)}
+                                    placeholder="feature/generated-output"
+                                    className="h-12 w-full rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-900 outline-none transition focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/15"
+                                  />
+                                </div>
+                              </>
+                            ) : props.availableGithubBranches.length > 0 ? (
+                              <div className="space-y-1.5">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                  Publish Branch
+                                </p>
+                                <Select<BranchOption, false>
+                                  instanceId="github-output-branch"
+                                  options={branchOptions}
+                                  value={selectedBranchOption}
+                                  onChange={(option: SingleValue<BranchOption>) =>
+                                    props.setGithubOutputBranch(option?.value ?? "")
+                                  }
+                                  isSearchable={false}
+                                  styles={branchSelectStyles}
+                                  components={{
+                                    SingleValue: BranchSingleValue,
+                                    Option: BranchOptionRow,
+                                  }}
+                                  placeholder="Choose a branch"
+                                />
+                              </div>
+                            ) : (
+                              <div className="space-y-1.5">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                  Publish Branch
+                                </p>
+                                <input
+                                  value={props.githubOutputBranch}
+                                  onChange={(event) => props.setGithubOutputBranch(event.target.value)}
+                                  placeholder="main"
+                                  className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                                />
+                              </div>
+                            )}
+                          </div>
+                        </div>
                         <div className="space-y-1.5">
                           <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
                             Target Path
@@ -2168,8 +2241,8 @@ function StrategyPanel(props: StrategyPanelProps) {
                       ) : null}
                       {props.availableGithubBranches.length > 0 ? (
                         <p className="text-xs text-slate-500">
-                          Branches loaded from the repository. The generated output will be pushed to the selected
-                          branch.
+                          Branches loaded from the repository. You can publish directly to an existing branch or create
+                          a new branch from one of them.
                         </p>
                       ) : null}
                     </div>
@@ -2795,8 +2868,14 @@ interface PanelBodyProps {
   isFetchingGithubBranches: boolean
   githubBranchFetchError: string | null
   onFetchGithubBranches: () => Promise<void>
+  githubBranchMode: OutputBranchMode
+  setGithubBranchMode: (value: OutputBranchMode) => void
   githubOutputBranch: string
   setGithubOutputBranch: (value: string) => void
+  githubBaseBranch: string
+  setGithubBaseBranch: (value: string) => void
+  githubNewBranchName: string
+  setGithubNewBranchName: (value: string) => void
   githubOutputPath: string
   setGithubOutputPath: (value: string) => void
   githubOutputToken: string
@@ -2920,8 +2999,14 @@ function PanelBody(props: PanelBodyProps) {
               isFetchingGithubBranches={props.isFetchingGithubBranches}
               githubBranchFetchError={props.githubBranchFetchError}
               onFetchGithubBranches={props.onFetchGithubBranches}
+              githubBranchMode={props.githubBranchMode}
+              setGithubBranchMode={props.setGithubBranchMode}
               githubOutputBranch={props.githubOutputBranch}
               setGithubOutputBranch={props.setGithubOutputBranch}
+              githubBaseBranch={props.githubBaseBranch}
+              setGithubBaseBranch={props.setGithubBaseBranch}
+              githubNewBranchName={props.githubNewBranchName}
+              setGithubNewBranchName={props.setGithubNewBranchName}
               githubOutputPath={props.githubOutputPath}
               setGithubOutputPath={props.setGithubOutputPath}
               githubOutputToken={props.githubOutputToken}
@@ -2960,7 +3045,10 @@ function PanelBody(props: PanelBodyProps) {
             outputDestination={props.outputDestination}
             outputDirectory={props.outputDirectory}
             githubOutputRepoUrl={props.githubOutputRepoUrl}
+            githubBranchMode={props.githubBranchMode}
             githubOutputBranch={props.githubOutputBranch}
+            githubBaseBranch={props.githubBaseBranch}
+            githubNewBranchName={props.githubNewBranchName}
             githubOutputPath={props.githubOutputPath}
             githubOutputToken={props.githubOutputToken}
             githubOutputUsername={props.githubOutputUsername}
@@ -3044,7 +3132,10 @@ export function StepPanels({
   const [availableGithubBranches, setAvailableGithubBranches] = useState<string[]>([])
   const [isFetchingGithubBranches, setIsFetchingGithubBranches] = useState(false)
   const [githubBranchFetchError, setGithubBranchFetchError] = useState<string | null>(null)
+  const [githubBranchMode, setGithubBranchMode] = useState<OutputBranchMode>("existing")
   const [githubOutputBranch, setGithubOutputBranch] = useState("main")
+  const [githubBaseBranch, setGithubBaseBranch] = useState("main")
+  const [githubNewBranchName, setGithubNewBranchName] = useState("")
   const [githubOutputPath, setGithubOutputPath] = useState("")
   const [githubOutputToken, setGithubOutputToken] = useState("")
   const [githubOutputUsername, setGithubOutputUsername] = useState("x-access-token")
@@ -3087,6 +3178,8 @@ export function StepPanels({
   useEffect(() => {
     setAvailableGithubBranches([])
     setGithubBranchFetchError(null)
+    setGithubBranchMode("existing")
+    setGithubBaseBranch("main")
   }, [githubOutputRepoUrl])
 
   async function handleFetchGithubBranches() {
@@ -3118,6 +3211,7 @@ export function StepPanels({
             ? githubOutputBranch
             : response.default_branch ?? branches[0]
       setGithubOutputBranch(preferredBranch)
+      setGithubBaseBranch((currentBaseBranch) => (branches.includes(currentBaseBranch) ? currentBaseBranch : preferredBranch))
     } catch (error) {
       setAvailableGithubBranches([])
       setGithubBranchFetchError(
@@ -3253,8 +3347,14 @@ export function StepPanels({
         isFetchingGithubBranches={isFetchingGithubBranches}
         githubBranchFetchError={githubBranchFetchError}
         onFetchGithubBranches={handleFetchGithubBranches}
+        githubBranchMode={githubBranchMode}
+        setGithubBranchMode={setGithubBranchMode}
         githubOutputBranch={githubOutputBranch}
         setGithubOutputBranch={setGithubOutputBranch}
+        githubBaseBranch={githubBaseBranch}
+        setGithubBaseBranch={setGithubBaseBranch}
+        githubNewBranchName={githubNewBranchName}
+        setGithubNewBranchName={setGithubNewBranchName}
         githubOutputPath={githubOutputPath}
         setGithubOutputPath={setGithubOutputPath}
         githubOutputToken={githubOutputToken}

@@ -29,6 +29,7 @@ export interface ConfigOverrides {
 export interface GitHubOutputConfig {
   repo_url: string
   branch?: string
+  base_branch?: string
   target_path?: string
   access_token?: string
   username?: string
