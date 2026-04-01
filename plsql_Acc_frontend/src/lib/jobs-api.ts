@@ -5,6 +5,8 @@ import type {
   FileContentResponse,
   FilesResponse,
   GeneratedFile,
+  GitHubRepoBranchesResponse,
+  GitHubOutputConfig,
 } from "@/types/jobs-api"
 
 const API_BASE_URL = "http://127.0.0.1:8000"
@@ -38,6 +40,7 @@ export async function createDatabaseJob(
   payload: DatabaseJobRequest,
   configOverrides?: ConfigOverrides,
   outputDirectory?: string,
+  githubOutput?: GitHubOutputConfig,
 ): Promise<ConversionJob> {
   const connectionString = buildConnectionString(payload)
 
@@ -49,6 +52,7 @@ export async function createDatabaseJob(
       config_path: payload.configPath ?? "config.json",
       config_overrides: configOverrides,
       output_directory: outputDirectory,
+      github_output: githubOutput,
     }),
   })
 
@@ -60,6 +64,7 @@ export async function createFileJob(
   configPath = "config.json",
   configOverrides?: ConfigOverrides,
   outputDirectory?: string,
+  githubOutput?: GitHubOutputConfig,
 ): Promise<ConversionJob> {
   const formData = new FormData()
   formData.append("source_file", file)
@@ -69,6 +74,9 @@ export async function createFileJob(
   }
   if (outputDirectory) {
     formData.append("output_directory", outputDirectory)
+  }
+  if (githubOutput) {
+    formData.append("github_output", JSON.stringify(githubOutput))
   }
 
   const response = await fetch(toApiUrl("/api/jobs/file"), {
@@ -84,6 +92,7 @@ export async function createGitJob(
   configPath = "config.json",
   configOverrides?: ConfigOverrides,
   outputDirectory?: string,
+  githubOutput?: GitHubOutputConfig,
 ): Promise<ConversionJob> {
   const response = await fetch(toApiUrl("/api/jobs/git"), {
     method: "POST",
@@ -93,6 +102,7 @@ export async function createGitJob(
       config_path: configPath,
       config_overrides: configOverrides,
       output_directory: outputDirectory,
+      github_output: githubOutput,
     }),
   })
 
@@ -148,6 +158,96 @@ export function getJobDownloadUrl(jobId: string): string {
 export async function getBackendHealth(): Promise<{ status: string }> {
   const response = await fetch(toApiUrl("/health"))
   return parseResponse<{ status: string }>(response)
+}
+
+function parseGitHubRepository(repoUrl: string): { owner: string; repo: string } | null {
+  try {
+    const parsed = new URL(repoUrl)
+    if (parsed.hostname.toLowerCase() !== "github.com") {
+      return null
+    }
+
+    const segments = parsed.pathname.split("/").filter(Boolean)
+    if (segments.length < 2) {
+      return null
+    }
+
+    return {
+      owner: segments[0],
+      repo: segments[1].replace(/\.git$/i, ""),
+    }
+  } catch {
+    return null
+  }
+}
+
+async function getGitHubRepoBranchesFromGitHub(
+  repoUrl: string,
+  accessToken?: string,
+): Promise<GitHubRepoBranchesResponse> {
+  const repoInfo = parseGitHubRepository(repoUrl)
+  if (!repoInfo) {
+    throw new Error("Fetch Repo fallback only supports github.com repository URLs.")
+  }
+
+  const headers: HeadersInit = {
+    Accept: "application/vnd.github+json",
+  }
+  if (accessToken?.trim()) {
+    headers.Authorization = `Bearer ${accessToken.trim()}`
+  }
+
+  const repoResponse = await fetch(`https://api.github.com/repos/${repoInfo.owner}/${repoInfo.repo}`, {
+    headers,
+  })
+  if (!repoResponse.ok) {
+    const message = await repoResponse.text()
+    throw new Error(message || `GitHub repo request failed with status ${repoResponse.status}`)
+  }
+
+  const repoData = (await repoResponse.json()) as { default_branch?: string }
+
+  const branchesResponse = await fetch(
+    `https://api.github.com/repos/${repoInfo.owner}/${repoInfo.repo}/branches?per_page=100`,
+    { headers },
+  )
+  if (!branchesResponse.ok) {
+    const message = await branchesResponse.text()
+    throw new Error(message || `GitHub branches request failed with status ${branchesResponse.status}`)
+  }
+
+  const branchesData = (await branchesResponse.json()) as Array<{ name?: string }>
+  const branches = branchesData.map((branch) => branch.name).filter((name): name is string => Boolean(name))
+  const defaultBranch = repoData.default_branch
+  const orderedBranches = [...branches]
+  if (defaultBranch && orderedBranches.includes(defaultBranch)) {
+    orderedBranches.splice(orderedBranches.indexOf(defaultBranch), 1)
+    orderedBranches.unshift(defaultBranch)
+  }
+
+  return {
+    repo_url: repoUrl,
+    default_branch: defaultBranch,
+    branches: orderedBranches,
+    count: orderedBranches.length,
+  }
+}
+
+export async function getGitHubRepoBranches(
+  repoUrl: string,
+  accessToken?: string,
+): Promise<GitHubRepoBranchesResponse> {
+  const response = await fetch(toApiUrl("/api/github/branches"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repo_url: repoUrl }),
+  })
+
+  if (response.status === 404) {
+    return getGitHubRepoBranchesFromGitHub(repoUrl, accessToken)
+  }
+
+  return parseResponse<GitHubRepoBranchesResponse>(response)
 }
 
 export async function pickOutputDirectory(): Promise<string | null> {

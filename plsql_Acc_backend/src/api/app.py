@@ -27,6 +27,7 @@ from main import PLSQLModernizationPipeline
 from src.converter.llm_engine import LLMConversionEngine
 from src.parser.discovery_analyzer import analyze_sql_source, build_discovery_model
 from src.utils.config import load_config
+from src.utils.file_utils import GitRepoPublisher
 from src.parser.sql_table_discovery import SQLDiscoveryParseError, extract_create_table_names
 
 
@@ -45,12 +46,25 @@ class JobRecord:
     config_path: str
     config_overrides: Optional[Dict[str, Any]] = None
     output_directory: Optional[str] = None
+    github_output: Optional[Dict[str, Any]] = None
     status: str = "queued"
     created_at: str = field(default_factory=_utc_now)
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     error: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
+
+
+class GitHubOutputConfig(BaseModel):
+    """Optional Git output destination for generated files."""
+
+    repo_url: str = Field(..., min_length=1)
+    branch: Optional[str] = None
+    base_branch: Optional[str] = None
+    target_path: Optional[str] = None
+    access_token: Optional[str] = None
+    username: Optional[str] = None
+    commit_message: Optional[str] = None
 
 
 class GitConversionRequest(BaseModel):
@@ -60,6 +74,7 @@ class GitConversionRequest(BaseModel):
     config_path: str = "config.json"
     config_overrides: Optional[Dict[str, Any]] = None
     output_directory: Optional[str] = None
+    github_output: Optional[GitHubOutputConfig] = None
 
 
 class DatabaseConversionRequest(BaseModel):
@@ -69,6 +84,7 @@ class DatabaseConversionRequest(BaseModel):
     config_path: str = "config.json"
     config_overrides: Optional[Dict[str, Any]] = None
     output_directory: Optional[str] = None
+    github_output: Optional[GitHubOutputConfig] = None
 
 
 class FilePathConversionRequest(BaseModel):
@@ -78,6 +94,7 @@ class FilePathConversionRequest(BaseModel):
     config_path: str = "config.json"
     config_overrides: Optional[Dict[str, Any]] = None
     output_directory: Optional[str] = None
+    github_output: Optional[GitHubOutputConfig] = None
 
 
 class OracleConnectionRequest(BaseModel):
@@ -105,6 +122,7 @@ class OracleConvertRequest(OracleConnectionRequest):
     config_path: str = "config.json"
     config_overrides: Optional[Dict[str, Any]] = None
     output_directory: Optional[str] = None
+    github_output: Optional[GitHubOutputConfig] = None
 
 
 class GitTableDiscoveryRequest(BaseModel):
@@ -121,6 +139,12 @@ class GitRepoTreeRequest(BaseModel):
     repo_url: str = Field(..., min_length=1)
     branch: Optional[str] = None
     path: Optional[str] = None
+
+
+class GitRepoBranchesRequest(BaseModel):
+    """Request body for listing git branches for a repository."""
+
+    repo_url: str = Field(..., min_length=1)
 
 
 class DiscoveryAnalyzeRequest(BaseModel):
@@ -198,6 +222,47 @@ def _parse_config_overrides(raw_value: Optional[str]) -> Optional[Dict[str, Any]
     if not isinstance(parsed, dict):
         raise ValueError("config_overrides must be a JSON object")
     return parsed
+
+
+def _parse_github_output(raw_value: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parse GitHub output config from a JSON form field."""
+    if not raw_value:
+        return None
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("github_output must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("github_output must be a JSON object")
+    github_output = GitHubOutputConfig.model_validate(parsed)
+    return github_output.model_dump(exclude_none=True)
+
+
+def _normalize_github_output(github_output: Optional[Any]) -> Optional[Dict[str, Any]]:
+    """Validate and normalize a Git output config from request payloads."""
+    if not github_output:
+        return None
+    if isinstance(github_output, GitHubOutputConfig):
+        normalized = github_output.model_dump(exclude_none=True)
+    elif isinstance(github_output, dict):
+        normalized = GitHubOutputConfig.model_validate(github_output).model_dump(exclude_none=True)
+    else:
+        normalized = GitHubOutputConfig.model_validate(github_output).model_dump(exclude_none=True)
+
+    repo_url = normalized.get("repo_url", "")
+    if not _is_valid_repo_url(repo_url):
+        raise ValueError("github_output.repo_url must be a valid HTTPS/SSH git URL.")
+    return normalized
+
+
+def _sanitize_github_output(github_output: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Remove secrets from serialized job payloads."""
+    if not github_output:
+        return None
+    sanitized = dict(github_output)
+    if sanitized.get("access_token"):
+        sanitized["access_token"] = "***"
+    return sanitized
 
 
 def _normalize_filter_prefix(path_filter: str) -> str:
@@ -326,6 +391,55 @@ def _list_git_tree(request: GitRepoTreeRequest) -> Dict[str, Any]:
             "entries": entries,
             "count": len(entries),
         }
+
+
+def _list_git_branches(request: GitRepoBranchesRequest) -> Dict[str, Any]:
+    """Return the remote branches for a repository plus its default branch."""
+    if not _is_valid_repo_url(request.repo_url):
+        raise ValueError("Invalid repo_url. Use an HTTPS or SSH git URL.")
+
+    try:
+        import git
+    except ImportError as exc:
+        raise RuntimeError("GitPython is required for git branches endpoint") from exc
+
+    try:
+        git_cmd = git.Git()
+        head_output = git_cmd.ls_remote("--symref", request.repo_url, "HEAD")
+        heads_output = git_cmd.ls_remote("--heads", request.repo_url)
+    except git.exc.GitCommandError as exc:
+        error_text = str(exc).lower()
+        if any(token in error_text for token in ("not found", "repository", "could not read", "authentication")):
+            raise FileNotFoundError(f"Repository not found or not accessible: {request.repo_url}") from exc
+        raise RuntimeError(f"Failed to inspect repository branches: {exc}") from exc
+
+    default_branch: Optional[str] = None
+    for line in head_output.splitlines():
+        line = line.strip()
+        if line.startswith("ref: refs/heads/") and "\tHEAD" in line:
+            default_branch = line[len("ref: refs/heads/") :].split("\t", 1)[0].strip()
+            break
+
+    branches: List[str] = []
+    for line in heads_output.splitlines():
+        line = line.strip()
+        if "\trefs/heads/" not in line:
+            continue
+        branch_name = line.split("\trefs/heads/", 1)[1].strip()
+        if branch_name:
+            branches.append(branch_name)
+
+    unique_branches = sorted(set(branches), key=lambda value: value.lower())
+    if default_branch and default_branch in unique_branches:
+        unique_branches.remove(default_branch)
+        unique_branches.insert(0, default_branch)
+
+    return {
+        "repo_url": request.repo_url,
+        "default_branch": default_branch,
+        "branches": unique_branches,
+        "count": len(unique_branches),
+    }
 
 
 def _build_oracle_connection_string(request: OracleConnectionRequest) -> str:
@@ -763,6 +877,7 @@ class JobManager:
         config_path: str,
         config_overrides: Optional[Dict[str, Any]] = None,
         output_directory: Optional[str] = None,
+        github_output: Optional[Dict[str, Any]] = None,
     ) -> JobRecord:
         """Register a new job before execution."""
         job_id = uuid4().hex
@@ -773,6 +888,7 @@ class JobManager:
             config_path=config_path,
             config_overrides=config_overrides,
             output_directory=output_directory,
+            github_output=github_output,
         )
         self.jobs[job_id] = job
         return job
@@ -831,11 +947,26 @@ class JobManager:
             )
             with contextlib.redirect_stdout(log_file), contextlib.redirect_stderr(log_file):
                 result = await pipeline.run_pipeline(source_path, source_type)
+            if job.github_output:
+                publisher = GitRepoPublisher(self.root_dir)
+                publish_result = await publisher.publish_directory(
+                    source_dir=output_dir,
+                    repo_url=job.github_output["repo_url"],
+                    branch=job.github_output.get("branch"),
+                    base_branch=job.github_output.get("base_branch"),
+                    target_subdirectory=job.github_output.get("target_path"),
+                    access_token=job.github_output.get("access_token"),
+                    username=job.github_output.get("username"),
+                    commit_message=job.github_output.get("commit_message"),
+                )
+                result["github_publish"] = publish_result
             root_logger.info("Job %s completed.", job.job_id)
             job.status = "completed"
             job.result = result
             job.completed_at = _utc_now()
         except Exception as exc:
+            if "result" in locals() and isinstance(result, dict):
+                job.result = result
             job.status = "failed"
             job.error = str(exc)
             job.completed_at = _utc_now()
@@ -881,6 +1012,7 @@ class JobManager:
         if job.source_type == "database":
             payload["source_value"] = _mask_connection_string(job.source_value)
         payload["output_directory"] = str(self.get_output_dir(job.job_id))
+        payload["github_output"] = _sanitize_github_output(job.github_output)
         payload["download_url"] = (
             f"/api/jobs/{job.job_id}/download" if job.status == "completed" and job.result else None
         )
@@ -1331,6 +1463,19 @@ async def list_git_tree(request: GitRepoTreeRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Internal server error: {exc}") from exc
 
 
+@app.post("/api/github/branches")
+async def list_github_branches(request: GitRepoBranchesRequest) -> Dict[str, Any]:
+    """List remote branches for a Git repository."""
+    try:
+        return await asyncio.to_thread(_list_git_branches, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {exc}") from exc
+
+
 @app.post("/api/discovery/dependency-suggestions")
 async def dependency_suggestions(request: DependencySuggestionRequest) -> Dict[str, Any]:
     """Return optional dependency suggestions from the LLM."""
@@ -1365,13 +1510,22 @@ async def create_file_job(
     config_path: str = Form("config.json"),
     config_overrides: Optional[str] = Form(None),
     output_directory: Optional[str] = Form(None),
+    github_output: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
     """Create a job from an uploaded local SQL/PLSQL file."""
     try:
         overrides = _parse_config_overrides(config_overrides)
+        normalized_github_output = _parse_github_output(github_output)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    job = job_manager.create_job("file", source_file.filename, config_path, overrides, output_directory)
+    job = job_manager.create_job(
+        "file",
+        source_file.filename,
+        config_path,
+        overrides,
+        output_directory,
+        normalized_github_output,
+    )
     input_dir = job_manager.get_job_dir(job.job_id) / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
     saved_path = input_dir / (source_file.filename or "uploaded.sql")
@@ -1383,12 +1537,17 @@ async def create_file_job(
 @app.post("/api/jobs/file-path")
 async def create_file_path_job(request: FilePathConversionRequest) -> Dict[str, Any]:
     """Create a job from a server-local file or directory path."""
+    try:
+        github_output = _normalize_github_output(request.github_output)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     job = job_manager.create_job(
         "file",
         request.source_path,
         request.config_path,
         request.config_overrides,
         request.output_directory,
+        github_output,
     )
     job_manager.start_job(job, request.source_path)
     return job_manager.serialize_job(job)
@@ -1397,12 +1556,17 @@ async def create_file_path_job(request: FilePathConversionRequest) -> Dict[str, 
 @app.post("/api/jobs/git")
 async def create_git_job(request: GitConversionRequest) -> Dict[str, Any]:
     """Create a job from a git repository URL."""
+    try:
+        github_output = _normalize_github_output(request.github_output)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     job = job_manager.create_job(
         "git",
         request.repo_url,
         request.config_path,
         request.config_overrides,
         request.output_directory,
+        github_output,
     )
     job_manager.start_job(job, request.repo_url)
     return job_manager.serialize_job(job)
@@ -1411,12 +1575,17 @@ async def create_git_job(request: GitConversionRequest) -> Dict[str, Any]:
 @app.post("/api/jobs/database")
 async def create_database_job(request: DatabaseConversionRequest) -> Dict[str, Any]:
     """Create a job from an Oracle connection string."""
+    try:
+        github_output = _normalize_github_output(request.github_output)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     job = job_manager.create_job(
         "database",
         request.connection_string,
         request.config_path,
         request.config_overrides,
         request.output_directory,
+        github_output,
     )
     job_manager.start_job(job, request.connection_string)
     return job_manager.serialize_job(job)
@@ -1426,12 +1595,17 @@ async def create_database_job(request: DatabaseConversionRequest) -> Dict[str, A
 async def create_oracle_conversion_job(request: OracleConvertRequest) -> Dict[str, Any]:
     """Create a conversion job from structured Oracle connection details."""
     connection_string = _build_oracle_connection_string(request)
+    try:
+        github_output = _normalize_github_output(request.github_output)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     job = job_manager.create_job(
         "database",
         connection_string,
         request.config_path,
         request.config_overrides,
         request.output_directory,
+        github_output,
     )
     job_manager.start_job(job, connection_string)
     return job_manager.serialize_job(job)

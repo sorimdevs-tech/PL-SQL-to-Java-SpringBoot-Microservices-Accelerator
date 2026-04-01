@@ -11,9 +11,10 @@ import shutil
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, AsyncGenerator
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlunparse
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 # Import platform utilities
 from .logger import get_logger
@@ -512,3 +513,175 @@ class FileExtractor:
                     tables.add(table_name.upper())
         
         return list(tables)
+
+
+class GitRepoPublisher:
+    """Publishes generated output into a Git repository."""
+
+    def __init__(self, workspace_root: Optional[Path] = None):
+        self.workspace_root = Path(workspace_root or Path.cwd())
+
+    async def publish_directory(
+        self,
+        source_dir: str | Path,
+        repo_url: str,
+        branch: Optional[str] = None,
+        base_branch: Optional[str] = None,
+        target_subdirectory: Optional[str] = None,
+        access_token: Optional[str] = None,
+        username: Optional[str] = None,
+        commit_message: Optional[str] = None,
+    ) -> Dict[str, str | bool]:
+        """
+        Clone a target repository, copy generated files into it, commit, and push.
+
+        Args:
+            source_dir: Generated local output directory.
+            repo_url: Target Git repository URL or path.
+            branch: Branch to publish to. Defaults to the repository's active/default branch.
+            base_branch: Existing branch used as the starting point when creating a new branch.
+            target_subdirectory: Optional relative subdirectory inside the repo.
+            access_token: Optional PAT for HTTPS repositories.
+            username: Optional username for token auth. Defaults to x-access-token.
+            commit_message: Optional commit message.
+        """
+        source_path = Path(source_dir)
+        if not source_path.exists() or not source_path.is_dir():
+            raise FileNotFoundError(f"Generated output directory not found: {source_path}")
+
+        try:
+            import git
+            from git import Actor
+        except ImportError as exc:
+            raise ImportError(
+                "GitPython is required for Git repository publishing. Install with: pip install GitPython"
+            ) from exc
+
+        temp_root = self.workspace_root / ".tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        temp_dir = temp_root / f"publish_{uuid.uuid4().hex}"
+        auth_repo_url = self._build_authenticated_repo_url(repo_url, access_token, username)
+
+        try:
+            logger.info("Cloning output target repository: %s", repo_url)
+            repo = git.Repo.clone_from(auth_repo_url, str(temp_dir))
+            active_branch = self._checkout_branch(repo, branch, base_branch)
+            destination_root = temp_dir / self._normalize_target_subdirectory(target_subdirectory)
+            destination_root.mkdir(parents=True, exist_ok=True)
+
+            self._copy_directory_contents(source_path, destination_root)
+
+            repo.git.add(A=True)
+            if not repo.is_dirty(untracked_files=True):
+                logger.info("No changes detected while publishing output to %s", repo_url)
+                return {
+                    "published": False,
+                    "repo_url": repo_url,
+                    "branch": active_branch,
+                    "target_path": self._display_target_path(target_subdirectory),
+                    "message": "No changes to publish.",
+                }
+
+            author_name = os.getenv("GIT_AUTHOR_NAME", "PLSQL Accelerator")
+            author_email = os.getenv("GIT_AUTHOR_EMAIL", "plsql-accelerator@example.com")
+            actor = Actor(author_name, author_email)
+            message = commit_message or f"Add generated output from PL/SQL Accelerator ({datetime.utcnow().date().isoformat()})"
+            commit = repo.index.commit(message, author=actor, committer=actor)
+            repo.remotes.origin.push(f"HEAD:{active_branch}")
+
+            logger.info("Published generated output to %s on branch %s", repo_url, active_branch)
+            return {
+                "published": True,
+                "repo_url": repo_url,
+                "branch": active_branch,
+                "target_path": self._display_target_path(target_subdirectory),
+                "commit_message": message,
+                "commit_hash": commit.hexsha,
+            }
+        except Exception as exc:
+            logger.error("Failed to publish generated output to %s: %s", repo_url, exc)
+            raise
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _checkout_branch(self, repo, branch: Optional[str], base_branch: Optional[str] = None) -> str:
+        """Check out the requested branch, creating it from the chosen base branch if necessary."""
+        if not branch:
+            try:
+                return repo.active_branch.name
+            except TypeError:
+                return "HEAD"
+
+        remote_branch_names = {ref.remote_head for ref in repo.remotes.origin.refs}
+        local_branch_names = {head.name for head in repo.heads}
+
+        if branch in local_branch_names:
+            repo.git.checkout(branch)
+        elif branch in remote_branch_names:
+            repo.git.checkout("-b", branch, f"origin/{branch}")
+        else:
+            normalized_base_branch = (base_branch or "").strip()
+            if normalized_base_branch and normalized_base_branch != branch:
+                if normalized_base_branch in local_branch_names:
+                    repo.git.checkout(normalized_base_branch)
+                elif normalized_base_branch in remote_branch_names:
+                    repo.git.checkout("-b", normalized_base_branch, f"origin/{normalized_base_branch}")
+                else:
+                    raise ValueError(f"Base branch not found in target repository: {normalized_base_branch}")
+            repo.git.checkout("-b", branch)
+        return branch
+
+    def _normalize_target_subdirectory(self, target_subdirectory: Optional[str]) -> Path:
+        """Return a safe relative target directory inside the repo."""
+        if not target_subdirectory:
+            return Path(".")
+
+        normalized = target_subdirectory.replace("\\", "/").strip().strip("/")
+        if not normalized:
+            return Path(".")
+
+        candidate = Path(normalized)
+        if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+            raise ValueError("github_output.target_path must stay inside the target repository")
+        return candidate
+
+    def _display_target_path(self, target_subdirectory: Optional[str]) -> str:
+        normalized = self._normalize_target_subdirectory(target_subdirectory)
+        return "." if normalized == Path(".") else normalized.as_posix()
+
+    def _copy_directory_contents(self, source_dir: Path, destination_dir: Path) -> None:
+        """Copy all generated files into the requested repository location."""
+        for item in source_dir.iterdir():
+            destination = destination_dir / item.name
+            if item.is_dir():
+                if destination.exists() and destination.is_file():
+                    destination.unlink()
+                shutil.copytree(item, destination, dirs_exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists() and destination.is_dir():
+                    shutil.rmtree(destination)
+                shutil.copy2(item, destination)
+
+    def _build_authenticated_repo_url(
+        self,
+        repo_url: str,
+        access_token: Optional[str] = None,
+        username: Optional[str] = None,
+    ) -> str:
+        """Inject token credentials for HTTPS remotes when provided."""
+        if not access_token:
+            return repo_url
+
+        parsed = urlparse(repo_url)
+        if parsed.scheme not in {"http", "https"}:
+            logger.warning("Ignoring access token because repo URL is not HTTP(S): %s", repo_url)
+            return repo_url
+
+        credential_user = quote(username or "x-access-token", safe="")
+        credential_token = quote(access_token, safe="")
+        hostname = parsed.hostname or ""
+        if parsed.port:
+            hostname = f"{hostname}:{parsed.port}"
+        netloc = f"{credential_user}:{credential_token}@{hostname}"
+        return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))

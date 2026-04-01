@@ -4,6 +4,7 @@ import { Download, FileText, LoaderCircle, Play } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { parseGitHubRepoInput } from "@/lib/github-url"
 import {
   createFileJob,
   createGitJob,
@@ -15,14 +16,17 @@ import {
   getJobStatus,
 } from "@/lib/jobs-api"
 import { startOracleConvert } from "@/lib/oracle-api"
-import type { ConfigOverrides, ConversionJob, GeneratedFile } from "@/types/jobs-api"
+import type { ConfigOverrides, ConversionJob, GeneratedFile, GitHubOutputConfig } from "@/types/jobs-api"
 
 type SourceMethod = "git" | "oracle" | "sqlfile"
+type OutputDestination = "local" | "github"
+type OutputBranchMode = "existing" | "new"
 
 export interface ConversionSnapshot {
   jobId: string
   status: string
   outputDirectory: string
+  outputDisplayName: string
   generatedFiles: string[]
   backendSummary?: string
   backendSummaryData?: Record<string, unknown>
@@ -50,7 +54,17 @@ interface ConversionJobPanelProps {
   projectDisplayName: string
   projectDescription: string
   projectPackageName: string
+  outputDestination: OutputDestination
   outputDirectory: string
+  githubOutputRepoUrl: string
+  githubBranchMode: OutputBranchMode
+  githubOutputBranch: string
+  githubBaseBranch: string
+  githubNewBranchName: string
+  githubOutputPath: string
+  githubOutputToken: string
+  githubOutputUsername: string
+  githubCommitMessage: string
   targetDatabase?: "mysql" | "oracle" | "postgresql" | "sqlserver" | "mongodb" | null
   optionalDependencies: string[]
   onConversionStart: () => void
@@ -96,6 +110,34 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
 
   const isPolling = job?.status === "queued" || job?.status === "running"
 
+  function hasValidOracleCredentials() {
+    return (
+      props.dbHost.trim().length > 0 &&
+      props.dbPort.trim().length > 0 &&
+      props.dbServiceName.trim().length > 0 &&
+      props.dbUsername.trim().length > 0 &&
+      props.dbPassword.trim().length > 0
+    )
+  }
+
+  function extractRepoName(repoUrl: string): string {
+    const normalized = repoUrl.trim().replace(/\/+$/, "")
+    if (!normalized) {
+      return "Repository not available"
+    }
+    const lastSegment = normalized.split("/").pop() ?? normalized
+    return lastSegment.replace(/\.git$/i, "") || "Repository not available"
+  }
+
+  function extractFolderName(outputPath: string): string {
+    const normalized = outputPath.trim().replace(/[\\/]+$/, "")
+    if (!normalized) {
+      return "Output directory not available"
+    }
+    const parts = normalized.split(/[\\/]/).filter(Boolean)
+    return parts[parts.length - 1] ?? normalized
+  }
+
   useEffect(() => {
     if (!job?.job_id) {
       onSnapshotChange(null)
@@ -113,11 +155,19 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)
         ? (rawSummary as Record<string, unknown>)
         : undefined
+    const outputDirectory =
+      job.result?.github_publish?.repo_url ??
+      job.result?.output_directory ??
+      job.output_directory ??
+      "Output directory not available yet"
+    const outputDisplayName = job.result?.github_publish?.repo_url
+      ? extractRepoName(job.result.github_publish.repo_url)
+      : extractFolderName(outputDirectory)
     onSnapshotChange({
       jobId: job.job_id,
       status: job.status,
-      outputDirectory:
-        job.result?.output_directory ?? job.output_directory ?? "Output directory not available yet",
+      outputDirectory,
+      outputDisplayName,
       generatedFiles: generatedFiles.map((file) => file.path),
       backendSummary,
       backendSummaryData,
@@ -325,6 +375,24 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       setIsStarting(true)
       let createdJob: ConversionJob | null = null
       const configPath = props.dbConfigPath || "config.json"
+      const isGitHubOutput = props.outputDestination === "github"
+      const parsedGitHubOutput = parseGitHubRepoInput(props.githubOutputRepoUrl)
+      const targetGithubBranch =
+        props.githubBranchMode === "new"
+          ? props.githubNewBranchName.trim()
+          : props.githubOutputBranch.trim() || parsedGitHubOutput.branch || ""
+      const githubOutput: GitHubOutputConfig | undefined = isGitHubOutput
+        ? {
+            repo_url: parsedGitHubOutput.repoUrl.trim(),
+            branch: targetGithubBranch || undefined,
+            base_branch:
+              props.githubBranchMode === "new" ? props.githubBaseBranch.trim() || props.githubOutputBranch.trim() || undefined : undefined,
+            target_path: props.githubOutputPath.trim() || undefined,
+            access_token: props.githubOutputToken.trim() || undefined,
+            username: props.githubOutputUsername.trim() || undefined,
+            commit_message: props.githubCommitMessage.trim() || undefined,
+          }
+        : undefined
       const configOverrides: ConfigOverrides = {
         output: {
           project_name: props.projectDisplayName.trim() || props.projectArtifact.trim() || props.projectName,
@@ -338,18 +406,33 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           packaging: props.packaging,
           config_format: props.springConfigFormat,
           database_type: props.targetDatabase ?? undefined,
-          target_directory: props.outputDirectory.trim() || undefined,
+          target_directory:
+            props.outputDestination === "local" ? props.outputDirectory.trim() || undefined : undefined,
           dependencies: props.optionalDependencies.length ? props.optionalDependencies : undefined,
         },
       }
-      const outputDirectory = props.outputDirectory.trim() || undefined
+      const outputDirectory =
+        props.outputDestination === "local" ? props.outputDirectory.trim() || undefined : undefined
+
+      if (isGitHubOutput && !githubOutput?.repo_url) {
+        setError("Enter a GitHub repository URL for the output destination.")
+        return
+      }
+      if (isGitHubOutput && !githubOutput?.branch) {
+        setError(
+          props.githubBranchMode === "new"
+            ? "Enter a new branch name for the GitHub output destination."
+            : "Choose a GitHub branch for the output destination.",
+        )
+        return
+      }
 
       if (props.sourceMethod === "sqlfile") {
         if (!props.sourceFile) {
           setError("Select a local SQL file before starting conversion.")
           return
         }
-        createdJob = await createFileJob(props.sourceFile, configPath, configOverrides, outputDirectory)
+        createdJob = await createFileJob(props.sourceFile, configPath, configOverrides, outputDirectory, githubOutput)
       } else if (props.sourceMethod === "git") {
         if (!props.gitRepoUrl.trim()) {
           setError("Enter a valid Git repository URL.")
@@ -359,8 +442,18 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           setError("Backend health check failed. Ensure API server is running before starting Git conversion.")
           return
         }
-        createdJob = await createGitJob(props.gitRepoUrl.trim(), configPath, configOverrides, outputDirectory)
+        createdJob = await createGitJob(
+          props.gitRepoUrl.trim(),
+          configPath,
+          configOverrides,
+          outputDirectory,
+          githubOutput,
+        )
       } else {
+        if (!hasValidOracleCredentials()) {
+          setError("Fill valid Oracle host, port, service name, username, and password before starting conversion.")
+          return
+        }
         const response = await startOracleConvert({
           host: props.dbHost.trim(),
           port: Number(props.dbPort),
@@ -370,6 +463,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           config_path: configPath,
           config_overrides: configOverrides,
           output_directory: outputDirectory,
+          github_output: githubOutput,
         })
 
         const maybeJob = response as Partial<ConversionJob>
@@ -509,6 +603,12 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
               <Badge variant={statusVariant(job.status)}>{job.status}</Badge>
             </div>
             <p className="mt-1 text-xs text-slate-200">Source: {job.source_type}</p>
+            {job.result?.github_publish ? (
+              <p className="mt-1 text-xs text-emerald-200">
+                Published to {job.result.github_publish.repo_url} [{job.result.github_publish.branch}] at{" "}
+                {job.result.github_publish.target_path}
+              </p>
+            ) : null}
             {job.error ? <p className="mt-2 text-xs font-medium text-rose-200">{job.error}</p> : null}
           </div>
         ) : null}

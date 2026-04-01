@@ -10,6 +10,13 @@ import {
   LoaderCircle,
   RefreshCcw,
 } from "lucide-react"
+import Select, {
+  components,
+  type OptionProps,
+  type SingleValue,
+  type SingleValueProps,
+  type StylesConfig,
+} from "react-select"
 
 import { ConversionJobPanel, type ConversionSnapshot } from "@/components/workflow/conversion-job-panel"
 import { OracleDiscovery } from "@/components/workflow/oracle-discovery"
@@ -17,7 +24,8 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { strategyOptions, workflowSteps } from "@/data/converter-workflow"
-import { getJobDownloadUrl } from "@/lib/jobs-api"
+import { parseGitHubRepoInput } from "@/lib/github-url"
+import { getGitHubRepoBranches, getJobDownloadUrl } from "@/lib/jobs-api"
 import { testOracleConnection } from "@/lib/oracle-api"
 import {
   analyzeGitSqlSource,
@@ -57,6 +65,9 @@ type SourceMethod = "git" | "oracle" | "sqlfile"
 type BuildTool = "mvn" | "gradle"
 type SpringConfigFormat = "properties" | "yaml"
 type PackagingType = "jar" | "war"
+type OutputDestination = "local" | "github"
+type OutputBranchMode = "existing" | "new"
+type BranchOption = { value: string; label: string }
 
 const DEFAULT_SPRING_DEPENDENCIES = [
   { id: "web", name: "Spring Web", description: "Build REST APIs with Spring MVC." },
@@ -147,11 +158,10 @@ function ConnectPanel(props: ConnectPanelProps) {
         <div className="grid gap-2 sm:grid-cols-3">
           <button
             onClick={() => props.setSourceMethod("git")}
-            className={`rounded-xl border p-3 text-left transition-all ${
-              props.sourceMethod === "git"
+            className={`rounded-xl border p-3 text-left transition-all ${props.sourceMethod === "git"
                 ? "border-cyan-300 bg-cyan-50"
                 : "border-slate-200 bg-white hover:border-slate-300"
-            }`}
+              }`}
           >
             <p className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
               <GitBranch className="h-4 w-4" />
@@ -162,11 +172,10 @@ function ConnectPanel(props: ConnectPanelProps) {
 
           <button
             onClick={() => props.setSourceMethod("oracle")}
-            className={`rounded-xl border p-3 text-left transition-all ${
-              props.sourceMethod === "oracle"
+            className={`rounded-xl border p-3 text-left transition-all ${props.sourceMethod === "oracle"
                 ? "border-cyan-300 bg-cyan-50"
                 : "border-slate-200 bg-white hover:border-slate-300"
-            }`}
+              }`}
           >
             <p className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
               <Database className="h-4 w-4" />
@@ -177,11 +186,10 @@ function ConnectPanel(props: ConnectPanelProps) {
 
           <button
             onClick={() => props.setSourceMethod("sqlfile")}
-            className={`rounded-xl border p-3 text-left transition-all ${
-              props.sourceMethod === "sqlfile"
+            className={`rounded-xl border p-3 text-left transition-all ${props.sourceMethod === "sqlfile"
                 ? "border-cyan-300 bg-cyan-50"
                 : "border-slate-200 bg-white hover:border-slate-300"
-            }`}
+              }`}
           >
             <p className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
               <FileCode2 className="h-4 w-4" />
@@ -331,9 +339,8 @@ function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
               <button
                 key={table.name}
                 onClick={() => props.onSelectTable(table.name)}
-                className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left text-sm transition ${
-                  props.selectedTable === table.name ? "bg-cyan-50 text-cyan-900" : "text-slate-700 hover:bg-slate-50"
-                }`}
+                className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left text-sm transition ${props.selectedTable === table.name ? "bg-cyan-50 text-cyan-900" : "text-slate-700 hover:bg-slate-50"
+                  }`}
               >
                 <span className="flex-1 truncate">{table.name}</span>
                 <span className="w-8 shrink-0 text-right text-xs text-slate-400">{table.columns.length}</span>
@@ -1428,9 +1435,8 @@ function SqlSourceDiscovery(props: {
               <button
                 type="button"
                 onClick={() => setGitStep(1)}
-                className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition ${
-                  gitStep === 1 ? "border-cyan-400 bg-cyan-50 text-cyan-700" : "border-slate-200 text-slate-600"
-                }`}
+                className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition ${gitStep === 1 ? "border-cyan-400 bg-cyan-50 text-cyan-700" : "border-slate-200 text-slate-600"
+                  }`}
                 aria-label="Project structure"
               >
                 <ChevronLeft className="h-4 w-4" />
@@ -1438,9 +1444,8 @@ function SqlSourceDiscovery(props: {
               <button
                 type="button"
                 onClick={() => setGitStep(2)}
-                className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition ${
-                  gitStep === 2 ? "border-cyan-400 bg-cyan-50 text-cyan-700" : "border-slate-200 text-slate-600"
-                }`}
+                className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition ${gitStep === 2 ? "border-cyan-400 bg-cyan-50 text-cyan-700" : "border-slate-200 text-slate-600"
+                  }`}
                 aria-label="Schema explorer"
               >
                 <ChevronRight className="h-4 w-4" />
@@ -1639,8 +1644,8 @@ function DiscoveryPanel(props: DiscoveryPanelProps) {
     )
   }
 
-    return (
-      <OracleDiscovery
+  return (
+    <OracleDiscovery
       host={props.dbHost}
       port={props.dbPort}
       serviceName={props.dbServiceName}
@@ -1749,8 +1754,32 @@ interface StrategyPanelProps {
   setProjectDescription: (value: string) => void
   projectPackageName: string
   setProjectPackageName: (value: string) => void
+  outputDestination: OutputDestination
+  setOutputDestination: (value: OutputDestination) => void
   outputDirectory: string
   setOutputDirectory: (value: string) => void
+  githubOutputRepoUrl: string
+  setGithubOutputRepoUrl: (value: string) => void
+  availableGithubBranches: string[]
+  isFetchingGithubBranches: boolean
+  githubBranchFetchError: string | null
+  onFetchGithubBranches: () => Promise<void>
+  githubBranchMode: OutputBranchMode
+  setGithubBranchMode: (value: OutputBranchMode) => void
+  githubOutputBranch: string
+  setGithubOutputBranch: (value: string) => void
+  githubBaseBranch: string
+  setGithubBaseBranch: (value: string) => void
+  githubNewBranchName: string
+  setGithubNewBranchName: (value: string) => void
+  githubOutputPath: string
+  setGithubOutputPath: (value: string) => void
+  githubOutputToken: string
+  setGithubOutputToken: (value: string) => void
+  githubOutputUsername: string
+  setGithubOutputUsername: (value: string) => void
+  githubCommitMessage: string
+  setGithubCommitMessage: (value: string) => void
   analyzedDependencies: DependencyInsight[]
   suggestedDependencies: SuggestedDependency[]
   selectedTargetDatabase: TargetDatabase | null
@@ -1764,6 +1793,123 @@ function StrategyPanel(props: StrategyPanelProps) {
   const [gradleFlavor, setGradleFlavor] = useState<"groovy" | "kotlin">("groovy")
   const [isPickingDir, setIsPickingDir] = useState(false)
   const [pickDirError, setPickDirError] = useState<string | null>(null)
+  const branchOptions: BranchOption[] = props.availableGithubBranches.map((branch) => ({
+    value: branch,
+    label: branch,
+  }))
+  const selectedBranchOption = branchOptions.find((option) => option.value === props.githubOutputBranch) ?? null
+  const selectedBaseBranchOption = branchOptions.find((option) => option.value === props.githubBaseBranch) ?? null
+
+  const branchSelectStyles: StylesConfig<BranchOption, false> = {
+    control: (base, state) => ({
+      ...base,
+      minHeight: 46,
+      borderRadius: 16,
+      borderColor: state.isFocused ? "#94a3b8" : "#cbd5e1",
+      boxShadow: state.isFocused ? "0 0 0 4px rgba(148, 163, 184, 0.14)" : "none",
+      background: "#ffffff",
+      transition: "all 160ms ease",
+      "&:hover": {
+        borderColor: "#94a3b8",
+      },
+    }),
+    valueContainer: (base) => ({
+      ...base,
+      padding: "4px 6px 4px 8px",
+      gap: 6,
+    }),
+    placeholder: (base) => ({
+      ...base,
+      color: "#64748b",
+      fontWeight: 500,
+      fontSize: "0.9rem",
+    }),
+    singleValue: (base) => ({
+      ...base,
+      color: "#0f172a",
+      fontWeight: 600,
+      fontSize: "0.9rem",
+    }),
+    input: (base) => ({
+      ...base,
+      color: "#0f172a",
+      fontSize: "0.9rem",
+    }),
+    indicatorSeparator: () => ({
+      display: "none",
+    }),
+    dropdownIndicator: (base, state) => ({
+      ...base,
+      color: state.isFocused ? "#334155" : "#64748b",
+      padding: 8,
+      transition: "transform 160ms ease, color 160ms ease",
+      transform: state.selectProps.menuIsOpen ? "rotate(180deg)" : "rotate(0deg)",
+      "&:hover": {
+        color: "#334155",
+      },
+    }),
+    menu: (base) => ({
+      ...base,
+      marginTop: 6,
+      borderRadius: 16,
+      overflow: "hidden",
+      border: "1px solid rgba(203, 213, 225, 0.9)",
+      boxShadow: "0 18px 40px -26px rgba(15, 23, 42, 0.3)",
+      backgroundColor: "rgba(255,255,255,0.98)",
+      backdropFilter: "blur(10px)",
+    }),
+    menuList: (base) => ({
+      ...base,
+      padding: 6,
+    }),
+    option: (base, state) => ({
+      ...base,
+      borderRadius: 10,
+      marginBottom: 2,
+      padding: "10px 12px",
+      backgroundColor: state.isSelected ? "#e2e8f0" : state.isFocused ? "#f8fafc" : "transparent",
+      color: "#0f172a",
+      fontSize: "0.9rem",
+      fontWeight: state.isSelected ? 600 : 500,
+      cursor: "pointer",
+    }),
+  }
+
+  function BranchSingleValue(option: SingleValueProps<BranchOption, false>) {
+    return (
+      <components.SingleValue {...option}>
+        <div className="inline-flex items-center gap-2">
+          <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-slate-100 text-slate-600">
+            <GitBranch className="h-3 w-3" />
+          </span>
+          <span>{option.data.label}</span>
+        </div>
+      </components.SingleValue>
+    )
+  }
+
+  function BranchOptionRow(option: OptionProps<BranchOption, false>) {
+    return (
+      <components.Option {...option}>
+        <div className="flex items-center justify-between gap-3">
+          <span className="inline-flex items-center gap-2">
+            <span
+              className={`inline-flex h-7 w-7 items-center justify-center rounded-full ${option.isSelected ? "bg-slate-200 text-slate-700" : "bg-slate-100 text-slate-500"
+                }`}
+            >
+              <GitBranch className="h-3 w-3" />
+            </span>
+            <span>{option.data.label}</span>
+          </span>
+          {option.isSelected ? (
+            <span className="rounded-full border border-slate-300 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-slate-600">
+              Active
+            </span>
+          ) : null}
+        </div>
+      </components.Option>
+    )
+  }
   const prevDbIdRef = useRef<string | null>(null)
 
   // When user picks a DB, swap out the old driver dep and inject the new one automatically
@@ -1976,22 +2122,211 @@ function StrategyPanel(props: StrategyPanelProps) {
                 </div>
               ))}
               <div className="grid items-center gap-3 md:grid-cols-[140px_1fr]">
-                <p className="text-sm text-slate-700">Output directory</p>
-                <div className="flex items-center gap-3">
-                  <input
-                    value={props.outputDirectory}
-                    onChange={(event) => props.setOutputDirectory(event.target.value)}
-                    placeholder="C:\\projects\\output\\converted-app"
-                    className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
-                  />
-                  <button
-                    type="button"
-                    onClick={handlePickDirectory}
-                    disabled={isPickingDir}
-                    className="inline-flex h-9 items-center justify-center rounded-full border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {isPickingDir ? "Picking..." : "Choose"}
-                  </button>
+                <p className="text-sm text-slate-700">Output destination</p>
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-6 text-sm text-slate-800">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="output-destination"
+                        checked={props.outputDestination === "local"}
+                        onChange={() => props.setOutputDestination("local")}
+                        className="h-4 w-4 accent-green-500"
+                      />
+                      Local directory
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="output-destination"
+                        checked={props.outputDestination === "github"}
+                        onChange={() => props.setOutputDestination("github")}
+                        className="h-4 w-4 accent-green-500"
+                      />
+                      GitHub repository
+                    </label>
+                  </div>
+
+                  {props.outputDestination === "local" ? (
+                    <div className="flex items-center gap-3">
+                      <input
+                        value={props.outputDirectory}
+                        onChange={(event) => props.setOutputDirectory(event.target.value)}
+                        placeholder="C:\\projects\\output\\converted-app"
+                        className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={handlePickDirectory}
+                        disabled={isPickingDir}
+                        className="inline-flex h-9 items-center justify-center rounded-full border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isPickingDir ? "Picking..." : "Choose"}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50/70 p-3">
+                      <div className="flex flex-col gap-3 md:flex-row">
+                        <input
+                          value={props.githubOutputRepoUrl}
+                          onChange={(event) => props.setGithubOutputRepoUrl(event.target.value)}
+                          placeholder="https://github.com/org/converted-output.git"
+                          className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                        />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => void props.onFetchGithubBranches()}
+                          disabled={props.isFetchingGithubBranches || !props.githubOutputRepoUrl.trim()}
+                          className="md:min-w-[120px]"
+                        >
+                          {props.isFetchingGithubBranches ? <LoaderCircle className="h-4 w-4 animate-spin" /> : null}
+                          Fetch Repo
+                        </Button>
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <div className="space-y-3 md:col-span-2">
+                          <div className="flex flex-wrap items-center gap-6 text-sm text-slate-800">
+                            <label className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                name="github-branch-mode"
+                                checked={props.githubBranchMode === "existing"}
+                                onChange={() => props.setGithubBranchMode("existing")}
+                                className="h-4 w-4 accent-green-500"
+                              />
+                              Push to existing branch
+                            </label>
+                            <label className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                name="github-branch-mode"
+                                checked={props.githubBranchMode === "new"}
+                                onChange={() => props.setGithubBranchMode("new")}
+                                className="h-4 w-4 accent-green-500"
+                              />
+                              Create new branch
+                            </label>
+                          </div>
+                          <div className="grid gap-3 md:grid-cols-2">
+                            {props.githubBranchMode === "new" && props.availableGithubBranches.length > 0 ? (
+                              <>
+                                <div className="space-y-1.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                    Base Branch
+                                  </p>
+                                  <Select<BranchOption, false>
+                                    instanceId="github-base-branch"
+                                    options={branchOptions}
+                                    value={selectedBaseBranchOption}
+                                    onChange={(option: SingleValue<BranchOption>) =>
+                                      props.setGithubBaseBranch(option?.value ?? "")
+                                    }
+                                    isSearchable={false}
+                                    styles={branchSelectStyles}
+                                    components={{
+                                      SingleValue: BranchSingleValue,
+                                      Option: BranchOptionRow,
+                                    }}
+                                    placeholder="Choose a base branch"
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                    New Branch Name
+                                  </p>
+                                  <input
+                                    value={props.githubNewBranchName}
+                                    onChange={(event) => props.setGithubNewBranchName(event.target.value)}
+                                    placeholder="feature/generated-output"
+                                    className="h-12 w-full rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-900 outline-none transition focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/15"
+                                  />
+                                </div>
+                              </>
+                            ) : props.availableGithubBranches.length > 0 ? (
+                              <div className="space-y-1.5">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                  Publish Branch
+                                </p>
+                                <Select<BranchOption, false>
+                                  instanceId="github-output-branch"
+                                  options={branchOptions}
+                                  value={selectedBranchOption}
+                                  onChange={(option: SingleValue<BranchOption>) =>
+                                    props.setGithubOutputBranch(option?.value ?? "")
+                                  }
+                                  isSearchable={false}
+                                  styles={branchSelectStyles}
+                                  components={{
+                                    SingleValue: BranchSingleValue,
+                                    Option: BranchOptionRow,
+                                  }}
+                                  placeholder="Choose a branch"
+                                />
+                              </div>
+                            ) : (
+                              <div className="space-y-1.5">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                  Publish Branch
+                                </p>
+                                <input
+                                  value={props.githubOutputBranch}
+                                  onChange={(event) => props.setGithubOutputBranch(event.target.value)}
+                                  placeholder="main"
+                                  className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                                />
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        <div className="space-y-1.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                            Target Path
+                          </p>
+                          <input
+                            value={props.githubOutputPath}
+                            onChange={(event) => props.setGithubOutputPath(event.target.value)}
+                            placeholder="generated/my-app"
+                            className="h-12 w-full rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-900 outline-none transition focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/15"
+                          />
+                        </div>
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <input
+                          value={props.githubOutputUsername}
+                          onChange={(event) => props.setGithubOutputUsername(event.target.value)}
+                          placeholder="x-access-token"
+                          className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                        />
+                        <input
+                          type="password"
+                          value={props.githubOutputToken}
+                          onChange={(event) => props.setGithubOutputToken(event.target.value)}
+                          placeholder="GitHub personal access token"
+                          className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                        />
+                      </div>
+                      <input
+                        value={props.githubCommitMessage}
+                        onChange={(event) => props.setGithubCommitMessage(event.target.value)}
+                        placeholder="Put your custom commit message here"
+                        className="h-9 w-full border-b border-slate-400 bg-transparent text-sm text-slate-900 outline-none focus:border-green-500"
+                      />
+                      <p className="text-xs text-slate-500">
+                        Use an HTTPS repo URL with a GitHub token, or an SSH repo URL if this machine already has push
+                        access configured.
+                      </p>
+                      {props.githubBranchFetchError ? (
+                        <p className="text-xs text-rose-600">{props.githubBranchFetchError}</p>
+                      ) : null}
+                      {props.availableGithubBranches.length > 0 ? (
+                        <p className="text-xs text-slate-500">
+                          Branches loaded from the repository. You can publish directly to an existing branch or create
+                          a new branch from one of them.
+                        </p>
+                      ) : null}
+                    </div>
+                  )}
                 </div>
                 {pickDirError ? <p className="text-xs text-rose-600">{pickDirError}</p> : null}
               </div>
@@ -2200,13 +2535,12 @@ function StrategyPanel(props: StrategyPanelProps) {
                         type="button"
                         onClick={() => resolvedId && addOptionalDependency(resolvedId)}
                         disabled={!resolvedId || isAdded}
-                        className={`rounded px-3 py-1 text-xs font-semibold ${
-                          isAdded
+                        className={`rounded px-3 py-1 text-xs font-semibold ${isAdded
                             ? "bg-slate-100 text-slate-500"
                             : resolvedId
                               ? "bg-cyan-600 text-white"
                               : "bg-slate-200 text-slate-400"
-                        }`}
+                          }`}
                       >
                         {isAdded ? "Added" : resolvedId ? "Add" : "Unavailable"}
                       </button>
@@ -2273,6 +2607,15 @@ interface SummaryPanelProps {
 }
 
 function SummaryPanel(props: SummaryPanelProps) {
+  function extractRepoName(repoUrl: string): string {
+    const normalized = repoUrl.trim().replace(/\/+$/, "")
+    if (!normalized) {
+      return "Repository not available"
+    }
+    const lastSegment = normalized.split("/").pop() ?? normalized
+    return lastSegment.replace(/\.git$/i, "") || "Repository not available"
+  }
+
   function formatDuration(ms: number | null | undefined): string {
     if (!Number.isFinite(ms) || ms === null || ms === undefined) {
       return "Not available"
@@ -2317,6 +2660,11 @@ function SummaryPanel(props: SummaryPanelProps) {
       : props.sourceMethod === "sqlfile"
         ? props.sourceFileName || "Not selected"
         : `${props.dbHost}:${props.dbPort}/${props.dbServiceName}`
+  const rawOutputLocation = props.conversionSnapshot?.outputDirectory ?? ""
+  const outputDisplayName = props.conversionSnapshot?.outputDisplayName ?? "not available"
+  const isGitOutput = rawOutputLocation.startsWith("http://") || rawOutputLocation.startsWith("https://")
+  const outputTitle = isGitOutput ? "Output Repository" : "Output Directory"
+  const outputSummaryName = isGitOutput ? extractRepoName(rawOutputLocation) : outputDisplayName
   const normalizedProcedures = props.selectedProcedures.map((name) => name.toLowerCase())
   const dominantDomains = []
   if (normalizedProcedures.some((name) => name.includes("validate") || name.includes("check"))) {
@@ -2337,47 +2685,38 @@ function SummaryPanel(props: SummaryPanelProps) {
   const defaultDependencyNames = DEFAULT_SPRING_DEPENDENCIES.map((dependency) => dependency.name)
   const backendSummary = props.conversionSnapshot?.backendSummaryData as
     | {
-        plsql_files?: number
-        procedures?: number
-        functions?: number
-        triggers?: number
-        packages?: number
-        tables_detected?: number
-        java_files_generated?: number
-        entities_generated?: number
-        repositories_generated?: number
-        services_generated?: number
-        controllers_generated?: number
-        unit_tests_generated?: number
-        integration_tests_generated?: number
-        validation_results?: number
-        validation_passed?: boolean
-      }
+      plsql_files?: number
+      procedures?: number
+      functions?: number
+      triggers?: number
+      packages?: number
+      tables_detected?: number
+      java_files_generated?: number
+      entities_generated?: number
+      repositories_generated?: number
+      services_generated?: number
+      controllers_generated?: number
+      unit_tests_generated?: number
+      integration_tests_generated?: number
+      validation_results?: number
+      validation_passed?: boolean
+    }
     | undefined
   const resolvedSummary = backendSummary
-    ? `This conversion used ${backendSummary.plsql_files ?? 0} PL/SQL file(s) from ${sourceLabel} and produced ${
-        backendSummary.java_files_generated ?? 0
-      } Java source file(s). The parsed scope included ${backendSummary.procedures ?? 0} procedures, ${
-        backendSummary.functions ?? 0
-      } functions, ${backendSummary.triggers ?? 0} triggers, and ${backendSummary.packages ?? 0} packages, with ${
-        backendSummary.tables_detected ?? 0
-      } table(s) detected.
+    ? `This conversion used ${backendSummary.plsql_files ?? 0} PL/SQL file(s) from ${sourceLabel} and produced ${backendSummary.java_files_generated ?? 0
+    } Java source file(s). The parsed scope included ${backendSummary.procedures ?? 0} procedures, ${backendSummary.functions ?? 0
+    } functions, ${backendSummary.triggers ?? 0} triggers, and ${backendSummary.packages ?? 0} packages, with ${backendSummary.tables_detected ?? 0
+    } table(s) detected.
 
-Generated outputs include ${backendSummary.entities_generated ?? 0} entities, ${
-        backendSummary.repositories_generated ?? 0
-      } repositories, ${backendSummary.services_generated ?? 0} services, and ${
-        backendSummary.controllers_generated ?? 0
-      } controllers. Tests generated: ${backendSummary.unit_tests_generated ?? 0} unit and ${
-        backendSummary.integration_tests_generated ?? 0
-      } integration tests. Validation ${
-        backendSummary.validation_passed ? "passed" : "did not pass"
-      } with ${backendSummary.validation_results ?? 0} result(s).
+Generated outputs include ${backendSummary.entities_generated ?? 0} entities, ${backendSummary.repositories_generated ?? 0
+    } repositories, ${backendSummary.services_generated ?? 0} services, and ${backendSummary.controllers_generated ?? 0
+    } controllers. Tests generated: ${backendSummary.unit_tests_generated ?? 0} unit and ${backendSummary.integration_tests_generated ?? 0
+    } integration tests. Validation ${backendSummary.validation_passed ? "passed" : "did not pass"
+    } with ${backendSummary.validation_results ?? 0} result(s).
 
-Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configuration in ${
-        props.springConfigFormat === "properties" ? "application.properties" : "application.yml"
-      }, baseline dependencies: ${defaultDependencyNames.join(", ")}. Output directory: ${
-        props.conversionSnapshot?.outputDirectory ?? "not available"
-      }.`
+Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configuration in ${props.springConfigFormat === "properties" ? "application.properties" : "application.yml"
+    }, baseline dependencies: ${defaultDependencyNames.join(", ")}. ${outputTitle}: ${outputSummaryName
+    }.`
     : "Run a conversion to generate a real summary from the backend."
 
   useEffect(() => {
@@ -2446,135 +2785,136 @@ Target runtime is Java ${props.javaVersion} using ${props.buildTool}, configurat
       </Card>
 
       <div className="grid gap-4 lg:grid-cols-2">
-      <Card>
-        <CardHeader>
-          <CardTitle>Project Summary</CardTitle>
-          <CardDescription>How this conversion project is configured</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Project Name</p>
-            <p className="text-sm font-semibold text-slate-900">{props.projectName}</p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Project Source</p>
-            <p className="text-sm font-semibold text-slate-900">{sourceLabel}</p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Conversion Time</p>
-            <p className="text-sm font-semibold text-slate-900">
-              {formatDuration(props.conversionSnapshot?.conversionDurationMs)}
-            </p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Business Logic Strategy</p>
-            <p className="text-sm font-semibold text-slate-900">{props.selectedStrategy}</p>
-            <p className="mt-1 text-xs text-slate-600">
-              {props.selectedProcedures.length} stored procedures selected across {props.selectedSchemas.length} schema(s).
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Project Summary</CardTitle>
+            <CardDescription>How this conversion project is configured</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Project Name</p>
+              <p className="text-sm font-semibold text-slate-900">{props.projectName}</p>
+            </div>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Project Source</p>
+              <p className="text-sm font-semibold text-slate-900">{sourceLabel}</p>
+            </div>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Conversion Time</p>
+              <p className="text-sm font-semibold text-slate-900">
+                {formatDuration(props.conversionSnapshot?.conversionDurationMs)}
+              </p>
+            </div>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Business Logic Strategy</p>
+              <p className="text-sm font-semibold text-slate-900">{props.selectedStrategy}</p>
+              <p className="mt-1 text-xs text-slate-600">
+                {props.selectedProcedures.length} stored procedures selected across {props.selectedSchemas.length} schema(s).
+              </p>
+            </div>
+          </CardContent>
+        </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>{sourceDetailsTitle}</CardTitle>
-          <CardDescription>{sourceDetailsDescription}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {isOracleSource ? (
-            <>
-              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-                <p className="text-xs uppercase tracking-wide text-slate-500">DB Connection</p>
-                <p className="text-sm font-semibold text-slate-800">
-                  {props.dbHost}:{props.dbPort}/{props.dbServiceName}
-                </p>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Databases in Scope</p>
-                <p className="text-sm font-semibold text-slate-800">
-                  {props.selectedDatabases.length > 0 ? props.selectedDatabases.join(", ") : "No database selected"}
-                </p>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Schemas in Scope</p>
-                <p className="text-sm font-semibold text-slate-800">
-                  {props.selectedSchemas.length > 0 ? props.selectedSchemas.join(", ") : "No schema selected"}
-                </p>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Objects in Scope</p>
-                <p className="text-sm font-semibold text-slate-800">
-                  {props.selectedObjects.length > 0 ? `${props.selectedObjects.length} selected` : "No objects selected"}
-                </p>
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Source Type</p>
-                <p className="text-sm font-semibold text-slate-800">{sourceTypeLabel}</p>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Source Location</p>
-                <p className="text-sm font-semibold text-slate-800">{sourceLocationLabel}</p>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Objects in Scope</p>
-                <p className="text-sm font-semibold text-slate-800">
-                  {props.selectedObjects.length > 0 ? `${props.selectedObjects.length} selected` : "No objects selected"}
-                </p>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Procedures in Scope</p>
-                <p className="text-sm font-semibold text-slate-800">
-                  {props.selectedProcedures.length > 0
-                    ? `${props.selectedProcedures.length} selected`
-                    : "No procedures selected"}
-                </p>
-              </div>
-            </>
-          )}
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Java Version</p>
-            <p className="text-sm font-semibold text-slate-800">{props.javaVersion}</p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Build Tool</p>
-            <p className="text-sm font-semibold text-slate-800">{props.buildTool}</p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Spring Config</p>
-            <p className="text-sm font-semibold text-slate-800">
-              {props.springConfigFormat === "properties" ? "application.properties" : "application.yml"}
-            </p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Dependencies</p>
-            <p className="text-sm font-semibold break-words text-slate-800">
-              {defaultDependencyNames.join(", ")}
-            </p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Output Directory</p>
-            <p className="text-sm font-semibold break-words text-slate-800">
-              {props.conversionSnapshot?.outputDirectory ?? "Run conversion to get output path"}
-            </p>
-          </div>
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Generated File Paths</p>
-            {props.conversionSnapshot?.generatedFiles?.length ? (
-              <ul className="mt-1 space-y-1 text-xs text-slate-700">
-                {props.conversionSnapshot.generatedFiles.slice(0, 8).map((path) => (
-                  <li key={path}>{path}</li>
-                ))}
-              </ul>
+        <Card>
+          <CardHeader>
+            <CardTitle>{sourceDetailsTitle}</CardTitle>
+            <CardDescription>{sourceDetailsDescription}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {isOracleSource ? (
+              <>
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">DB Connection</p>
+                  <p className="text-sm font-semibold text-slate-800">
+                    {props.dbHost}:{props.dbPort}/{props.dbServiceName}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Databases in Scope</p>
+                  <p className="text-sm font-semibold text-slate-800">
+                    {props.selectedDatabases.length > 0 ? props.selectedDatabases.join(", ") : "No database selected"}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Schemas in Scope</p>
+                  <p className="text-sm font-semibold text-slate-800">
+                    {props.selectedSchemas.length > 0 ? props.selectedSchemas.join(", ") : "No schema selected"}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Objects in Scope</p>
+                  <p className="text-sm font-semibold text-slate-800">
+                    {props.selectedObjects.length > 0 ? `${props.selectedObjects.length} selected` : "No objects selected"}
+                  </p>
+                </div>
+              </>
             ) : (
-              <p className="text-sm font-semibold text-slate-800">No generated files yet</p>
+              <>
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Source Type</p>
+                  <p className="text-sm font-semibold text-slate-800">{sourceTypeLabel}</p>
+                </div>
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Source Location</p>
+                  <p className="text-sm font-semibold text-slate-800">{sourceLocationLabel}</p>
+                </div>
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Objects in Scope</p>
+                  <p className="text-sm font-semibold text-slate-800">
+                    {props.selectedObjects.length > 0 ? `${props.selectedObjects.length} selected` : "No objects selected"}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Procedures in Scope</p>
+                  <p className="text-sm font-semibold text-slate-800">
+                    {props.selectedProcedures.length > 0
+                      ? `${props.selectedProcedures.length} selected`
+                      : "No procedures selected"}
+                  </p>
+                </div>
+              </>
             )}
-          </div>
-        </CardContent>
-      </Card>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Java Version</p>
+              <p className="text-sm font-semibold text-slate-800">{props.javaVersion}</p>
+            </div>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Build Tool</p>
+              <p className="text-sm font-semibold text-slate-800">{props.buildTool}</p>
+            </div>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Spring Config</p>
+              <p className="text-sm font-semibold text-slate-800">
+                {props.springConfigFormat === "properties" ? "application.properties" : "application.yml"}
+              </p>
+            </div>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Dependencies</p>
+              <p className="text-sm font-semibold break-words text-slate-800">
+                {defaultDependencyNames.join(", ")}
+              </p>
+            </div>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">{outputTitle}</p>
+              <p className="text-sm font-semibold break-words text-slate-800">
+                {outputSummaryName === "not available" ? "Run conversion to get output path" : outputSummaryName}
+              </p>
+              {rawOutputLocation ? <p className="mt-1 break-words text-xs text-slate-500">{rawOutputLocation}</p> : null}
+            </div>
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Generated File Paths</p>
+              {props.conversionSnapshot?.generatedFiles?.length ? (
+                <ul className="mt-1 space-y-1 text-xs text-slate-700">
+                  {props.conversionSnapshot.generatedFiles.slice(0, 8).map((path) => (
+                    <li key={path}>{path}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm font-semibold text-slate-800">No generated files yet</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
       </div>
 
       <Card>
@@ -2693,6 +3033,30 @@ interface PanelBodyProps {
   setProjectPackageName: (value: string) => void
   outputDirectory: string
   setOutputDirectory: (value: string) => void
+  outputDestination: OutputDestination
+  setOutputDestination: (value: OutputDestination) => void
+  githubOutputRepoUrl: string
+  setGithubOutputRepoUrl: (value: string) => void
+  availableGithubBranches: string[]
+  isFetchingGithubBranches: boolean
+  githubBranchFetchError: string | null
+  onFetchGithubBranches: () => Promise<void>
+  githubBranchMode: OutputBranchMode
+  setGithubBranchMode: (value: OutputBranchMode) => void
+  githubOutputBranch: string
+  setGithubOutputBranch: (value: string) => void
+  githubBaseBranch: string
+  setGithubBaseBranch: (value: string) => void
+  githubNewBranchName: string
+  setGithubNewBranchName: (value: string) => void
+  githubOutputPath: string
+  setGithubOutputPath: (value: string) => void
+  githubOutputToken: string
+  setGithubOutputToken: (value: string) => void
+  githubOutputUsername: string
+  setGithubOutputUsername: (value: string) => void
+  githubCommitMessage: string
+  setGithubCommitMessage: (value: string) => void
   analyzedDependencies: DependencyInsight[]
   suggestedDependencies: SuggestedDependency[]
   selectedTargetDatabase: TargetDatabase | null
@@ -2800,8 +3164,32 @@ function PanelBody(props: PanelBodyProps) {
               setProjectDescription={props.setProjectDescription}
               projectPackageName={props.projectPackageName}
               setProjectPackageName={props.setProjectPackageName}
+              outputDestination={props.outputDestination}
+              setOutputDestination={props.setOutputDestination}
               outputDirectory={props.outputDirectory}
               setOutputDirectory={props.setOutputDirectory}
+              githubOutputRepoUrl={props.githubOutputRepoUrl}
+              setGithubOutputRepoUrl={props.setGithubOutputRepoUrl}
+              availableGithubBranches={props.availableGithubBranches}
+              isFetchingGithubBranches={props.isFetchingGithubBranches}
+              githubBranchFetchError={props.githubBranchFetchError}
+              onFetchGithubBranches={props.onFetchGithubBranches}
+              githubBranchMode={props.githubBranchMode}
+              setGithubBranchMode={props.setGithubBranchMode}
+              githubOutputBranch={props.githubOutputBranch}
+              setGithubOutputBranch={props.setGithubOutputBranch}
+              githubBaseBranch={props.githubBaseBranch}
+              setGithubBaseBranch={props.setGithubBaseBranch}
+              githubNewBranchName={props.githubNewBranchName}
+              setGithubNewBranchName={props.setGithubNewBranchName}
+              githubOutputPath={props.githubOutputPath}
+              setGithubOutputPath={props.setGithubOutputPath}
+              githubOutputToken={props.githubOutputToken}
+              setGithubOutputToken={props.setGithubOutputToken}
+              githubOutputUsername={props.githubOutputUsername}
+              setGithubOutputUsername={props.setGithubOutputUsername}
+              githubCommitMessage={props.githubCommitMessage}
+              setGithubCommitMessage={props.setGithubCommitMessage}
               analyzedDependencies={props.analyzedDependencies}
               suggestedDependencies={props.suggestedDependencies}
               selectedTargetDatabase={props.selectedTargetDatabase}
@@ -2831,7 +3219,17 @@ function PanelBody(props: PanelBodyProps) {
             projectDisplayName={props.projectDisplayName}
             projectDescription={props.projectDescription}
             projectPackageName={props.projectPackageName}
+            outputDestination={props.outputDestination}
             outputDirectory={props.outputDirectory}
+            githubOutputRepoUrl={props.githubOutputRepoUrl}
+            githubBranchMode={props.githubBranchMode}
+            githubOutputBranch={props.githubOutputBranch}
+            githubBaseBranch={props.githubBaseBranch}
+            githubNewBranchName={props.githubNewBranchName}
+            githubOutputPath={props.githubOutputPath}
+            githubOutputToken={props.githubOutputToken}
+            githubOutputUsername={props.githubOutputUsername}
+            githubCommitMessage={props.githubCommitMessage}
             targetDatabase={props.selectedTargetDatabase}
             optionalDependencies={props.selectedOptionalDependencies}
             onConversionStart={props.onConversionStart}
@@ -2906,7 +3304,20 @@ export function StepPanels({
   const [projectDisplayName, setProjectDisplayName] = useState("demo")
   const [projectDescription, setProjectDescription] = useState("Demo project for Spring Boot")
   const [projectPackageName, setProjectPackageName] = useState("com.example.demo")
+  const [outputDestination, setOutputDestination] = useState<OutputDestination>("local")
   const [outputDirectory, setOutputDirectory] = useState("")
+  const [githubOutputRepoUrl, setGithubOutputRepoUrl] = useState("")
+  const [availableGithubBranches, setAvailableGithubBranches] = useState<string[]>([])
+  const [isFetchingGithubBranches, setIsFetchingGithubBranches] = useState(false)
+  const [githubBranchFetchError, setGithubBranchFetchError] = useState<string | null>(null)
+  const [githubBranchMode, setGithubBranchMode] = useState<OutputBranchMode>("existing")
+  const [githubOutputBranch, setGithubOutputBranch] = useState("main")
+  const [githubBaseBranch, setGithubBaseBranch] = useState("main")
+  const [githubNewBranchName, setGithubNewBranchName] = useState("")
+  const [githubOutputPath, setGithubOutputPath] = useState("")
+  const [githubOutputToken, setGithubOutputToken] = useState("")
+  const [githubOutputUsername, setGithubOutputUsername] = useState("x-access-token")
+  const [githubCommitMessage, setGithubCommitMessage] = useState("")
   const [analyzedDependencies, setAnalyzedDependencies] = useState<DependencyInsight[]>([])
   const [suggestedDependencies, setSuggestedDependencies] = useState<SuggestedDependency[]>([])
   const [selectedTargetDatabase, setSelectedTargetDatabase] = useState<TargetDatabase | null>(null)
@@ -2941,6 +3352,55 @@ export function StepPanels({
 
   function hasValue(value: string): boolean {
     return value.trim().length > 0
+  }
+
+  useEffect(() => {
+    setAvailableGithubBranches([])
+    setGithubBranchFetchError(null)
+    setGithubBranchMode("existing")
+    setGithubBaseBranch("main")
+  }, [githubOutputRepoUrl])
+
+  async function handleFetchGithubBranches() {
+    const parsedRepoInput = parseGitHubRepoInput(githubOutputRepoUrl)
+    const repoUrl = parsedRepoInput.repoUrl.trim()
+    if (!repoUrl) {
+      setGithubBranchFetchError("Enter a GitHub repository URL first.")
+      setAvailableGithubBranches([])
+      return
+    }
+
+    try {
+      setIsFetchingGithubBranches(true)
+      setGithubBranchFetchError(null)
+      setGithubOutputRepoUrl(repoUrl)
+      const response = await getGitHubRepoBranches(repoUrl, githubOutputToken)
+      const branches = response.branches ?? []
+      setAvailableGithubBranches(branches)
+
+      if (branches.length === 0) {
+        setGithubBranchFetchError("No branches were found for this repository.")
+        return
+      }
+
+      const preferredBranch =
+        parsedRepoInput.branch && branches.includes(parsedRepoInput.branch)
+          ? parsedRepoInput.branch
+          : branches.includes(githubOutputBranch)
+            ? githubOutputBranch
+            : response.default_branch ?? branches[0]
+      setGithubOutputBranch(preferredBranch)
+      setGithubBaseBranch((currentBaseBranch) => (branches.includes(currentBaseBranch) ? currentBaseBranch : preferredBranch))
+    } catch (error) {
+      setAvailableGithubBranches([])
+      setGithubBranchFetchError(
+        error instanceof Error
+          ? error.message
+          : "Failed to fetch repository branches. Use the main repository URL, not the /tree/... page.",
+      )
+    } finally {
+      setIsFetchingGithubBranches(false)
+    }
   }
 
   const isStep1Ready =
@@ -3056,8 +3516,32 @@ export function StepPanels({
         setProjectDescription={setProjectDescription}
         projectPackageName={projectPackageName}
         setProjectPackageName={setProjectPackageName}
+        outputDestination={outputDestination}
+        setOutputDestination={setOutputDestination}
         outputDirectory={outputDirectory}
         setOutputDirectory={setOutputDirectory}
+        githubOutputRepoUrl={githubOutputRepoUrl}
+        setGithubOutputRepoUrl={setGithubOutputRepoUrl}
+        availableGithubBranches={availableGithubBranches}
+        isFetchingGithubBranches={isFetchingGithubBranches}
+        githubBranchFetchError={githubBranchFetchError}
+        onFetchGithubBranches={handleFetchGithubBranches}
+        githubBranchMode={githubBranchMode}
+        setGithubBranchMode={setGithubBranchMode}
+        githubOutputBranch={githubOutputBranch}
+        setGithubOutputBranch={setGithubOutputBranch}
+        githubBaseBranch={githubBaseBranch}
+        setGithubBaseBranch={setGithubBaseBranch}
+        githubNewBranchName={githubNewBranchName}
+        setGithubNewBranchName={setGithubNewBranchName}
+        githubOutputPath={githubOutputPath}
+        setGithubOutputPath={setGithubOutputPath}
+        githubOutputToken={githubOutputToken}
+        setGithubOutputToken={setGithubOutputToken}
+        githubOutputUsername={githubOutputUsername}
+        setGithubOutputUsername={setGithubOutputUsername}
+        githubCommitMessage={githubCommitMessage}
+        setGithubCommitMessage={setGithubCommitMessage}
         analyzedDependencies={analyzedDependencies}
         suggestedDependencies={suggestedDependencies}
         selectedTargetDatabase={selectedTargetDatabase}
@@ -3080,15 +3564,15 @@ export function StepPanels({
           <Button variant="outline" onClick={onPrevious} disabled={activeStep === 1}>
             Previous
           </Button>
-        <Button
-          onClick={onNext}
-          disabled={
-            activeStep === workflowSteps.length ||
-            (activeStep === 2 && isDiscoveryLoading) ||
-            (activeStep === 3 && conversionSnapshot?.status !== "completed") ||
-            !isStepReady(activeStep)
-          }
-        >
+          <Button
+            onClick={onNext}
+            disabled={
+              activeStep === workflowSteps.length ||
+              (activeStep === 2 && isDiscoveryLoading) ||
+              (activeStep === 3 && conversionSnapshot?.status !== "completed") ||
+              !isStepReady(activeStep)
+            }
+          >
             {activeStep === 2 && isDiscoveryLoading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : null}
             Next step
           </Button>
