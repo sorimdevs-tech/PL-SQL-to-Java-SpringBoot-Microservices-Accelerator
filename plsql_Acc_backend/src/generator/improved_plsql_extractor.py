@@ -25,6 +25,7 @@ class ExtractedLogic:
     selects: List[Dict[str, Any]] = field(default_factory=list)                  # SELECT statements
     returns: List[str] = field(default_factory=list)                             # RETURN statements
     has_commit: bool = False                                                     # Has COMMIT
+    has_autonomous_transaction: bool = False                                     # Has pragma autonomous_transaction
     exceptions_raised: List[Dict[str, str]] = field(default_factory=list)        # RAISE_APPLICATION_ERROR calls
     function_calls: List[Dict[str, Any]] = field(default_factory=list)           # Function/procedure calls
     logging_calls: List[Dict[str, Any]] = field(default_factory=list)            # appl_log_pkg.log calls
@@ -35,6 +36,34 @@ class ExtractedLogic:
 
 class ImprovedPLSQLExtractor:
     """Extract business logic from PL/SQL procedure bodies"""
+    
+    @staticmethod
+    def _split_respecting_parens(text: str, delimiter: str = ',') -> List[str]:
+        """
+        Split text by delimiter while respecting nested parentheses.
+        E.g., 'substr(a, 1, 2), b, func(x, y)' splits to ['substr(a, 1, 2)', ' b', ' func(x, y)']
+        """
+        parts = []
+        current = []
+        paren_depth = 0
+        
+        for char in text:
+            if char == '(':
+                paren_depth += 1
+                current.append(char)
+            elif char == ')':
+                paren_depth -= 1
+                current.append(char)
+            elif char == delimiter and paren_depth == 0:
+                parts.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(char)
+        
+        if current:
+            parts.append(''.join(current).strip())
+        
+        return parts
     
     @staticmethod
     def extract_all_logic(proc_body: str) -> ExtractedLogic:
@@ -79,6 +108,9 @@ class ImprovedPLSQLExtractor:
         # Check for transactions
         logic.has_commit = 'COMMIT' in body.upper()
         
+        # Check for autonomous transaction pragma
+        logic.has_autonomous_transaction = 'PRAGMA AUTONOMOUS_TRANSACTION' in body.upper()
+        
         # Extract exception handling
         ImprovedPLSQLExtractor._extract_exceptions(body, logic)
         
@@ -97,16 +129,18 @@ class ImprovedPLSQLExtractor:
         """
         # Try to find PROCEDURE or FUNCTION keyword with its signature
         # Match: PROCEDURE/FUNCTION name (params) [RETURN type] where type can include %rowtype
-        proc_pattern = r'(?:PROCEDURE|FUNCTION)\s+\w+\s*\(\s*([^)]*)\s*\)\s*(?:RETURN\s+([^AS\n]+?))?\s*(?:AS|IS)'
+        # Use (.+?) for return type to match any non-whitespace including %rowtype
+        proc_pattern = r'(?:PROCEDURE|FUNCTION)\s+\w+\s*\(\s*([^)]*)\s*\)\s*(?:RETURN\s+(.+?))?(?:\s*(?:AS|IS))'
         match = re.search(proc_pattern, body, re.IGNORECASE | re.DOTALL)
         
         if match:
             params_str = match.group(1)
             return_type = match.group(2)
             
-            # Store return type if present
+            # Store return type if present, normalizing whitespace around %
             if return_type:
-                return_type = return_type.strip()
+                # Remove spaces around % for %rowtype and normalize
+                return_type = return_type.strip().replace(' % ', '%').replace('% ', '%').replace(' %', '%')
                 logic.return_type = return_type.upper()
             
             # Extract individual parameters
@@ -163,7 +197,8 @@ class ImprovedPLSQLExtractor:
         for match in re.finditer(pattern, body, re.IGNORECASE | re.DOTALL):
             condition = match.group(1).strip()
             error_code = match.group(2)
-            message = match.group(3) if match.group(3) else f"[{match.group(4)}]"  # Use variable name in brackets if no string
+            # Use the actual variable name (without brackets) for parameter references
+            message = match.group(3) if match.group(3) else match.group(4)  # Bare variable name
             
             logic.validations.append({
                 'condition': condition,
@@ -213,19 +248,44 @@ class ImprovedPLSQLExtractor:
         - INSERT INTO table (columns) VALUES (values);
         - INSERT INTO table (columns) VALUES (values) RETURNING column INTO variable;
         - INSERT INTO table VALUES record;
-        """
-        # Pattern 1: INSERT INTO ... VALUES ... [RETURNING ... INTO ...]
-        pattern = r"INSERT\s+INTO\s+(\w+)\s*(?:\((.*?)\))?\s*VALUES\s*\((.*?)\)(?:\s+RETURNING\s+(\w+)\s+INTO\s+(\w+))?"
         
-        for match in re.finditer(pattern, body, re.IGNORECASE | re.DOTALL):
+        Smarter extraction that respects nested parentheses in function calls.
+        """
+        # Find all INSERT statements
+        insert_pattern = r'INSERT\s+INTO\s+(\w+)\s*(?:\(([^)]+)\))?\s+VALUES\s*\('
+        
+        for match in re.finditer(insert_pattern, body, re.IGNORECASE | re.DOTALL):
             table = match.group(1).strip()
             columns_str = match.group(2)
-            values_str = match.group(3)
-            returning_column = match.group(4)  # The column being returned (e.g., 'customer_id')
-            returning_into = match.group(5)    # The variable receiving it (e.g., 'l_returnvalue')
             
+            # Find the VALUES clause and extract all content respecting parens
+            values_start = match.end() - 1  # Position of opening paren in VALUES(
+            paren_depth = 1  # We're already inside one paren
+            values_end = values_start + 1
+            
+            # Find matching closing paren
+            for i in range(values_start + 1, len(body)):
+                if body[i] == '(':
+                    paren_depth += 1
+                elif body[i] == ')':
+                    paren_depth -= 1
+                    if paren_depth == 0:
+                        values_end = i
+                        break
+            
+            # Extract values content and everything after for RETURNING clause
+            values_content = body[values_start + 1:values_end].strip()
+            rest_of_statement = body[values_end + 1:values_end + 200]  # Grab enough to find RETURNING
+            
+            # Parse columns
             columns = [c.strip() for c in columns_str.split(',')] if columns_str else []
-            values = [v.strip() for v in values_str.split(',')]
+            
+            # Parse values using paren-respecting split
+            values = ImprovedPLSQLExtractor._split_respecting_parens(values_content, ',')
+            
+            # Look for RETURNING clause
+            returning_pattern = r'RETURNING\s+(\w+)\s+INTO\s+(\w+)'
+            returning_match = re.search(returning_pattern, rest_of_statement, re.IGNORECASE)
             
             insert_info = {
                 'table': table,
@@ -233,10 +293,9 @@ class ImprovedPLSQLExtractor:
                 'values': values
             }
             
-            # Capture RETURNING info for return type inference
-            if returning_column and returning_into:
-                insert_info['returning_column'] = returning_column.strip()
-                insert_info['returning_into'] = returning_into.strip()
+            if returning_match:
+                insert_info['returning_column'] = returning_match.group(1).strip()
+                insert_info['returning_into'] = returning_match.group(2).strip()
             
             logic.inserts.append(insert_info)
         
@@ -273,8 +332,11 @@ class ImprovedPLSQLExtractor:
             table = match.group(1).strip()
             assignments_str = match.group(2)
             
+            # Split assignments respecting nested parens
+            assignment_parts = ImprovedPLSQLExtractor._split_respecting_parens(assignments_str, ',')
+            
             assignments = {}
-            for assign in assignments_str.split(','):
+            for assign in assignment_parts:
                 if '=' in assign:
                     col, val = assign.split('=', 1)
                     assignments[col.strip()] = val.strip()
@@ -515,6 +577,7 @@ def extract_full_procedure_body(source: str, proc_name: str) -> Optional[str]:
     """
     Extract the complete procedure body from source code.
     Handles nested BEGIN/END blocks properly.
+    Includes the procedure signature (PROCEDURE name(...) AS/IS) in the returned body.
     """
     # Find procedure start
     pattern = rf'(?:CREATE\s+OR\s+REPLACE\s+)?PROCEDURE\s+{re.escape(proc_name)}\s*\(.*?\)\s*(?:IS|AS)'
@@ -522,6 +585,9 @@ def extract_full_procedure_body(source: str, proc_name: str) -> Optional[str]:
     
     if not start_match:
         return None
+    
+    # Get the procedure signature (from start of PROCEDURE keyword to IS/AS)
+    proc_signature = start_match.group()
     
     start_pos = start_match.end()
     source_from_begin = source[start_pos:]
@@ -549,8 +615,10 @@ def extract_full_procedure_body(source: str, proc_name: str) -> Optional[str]:
             elif re.match(r'\bEND\b', source_from_begin[i:], re.IGNORECASE):
                 end_count += 1
                 if end_count >= begin_count:
-                    # Found matching END
-                    body = source_from_begin[:i].strip()
-                    return body
+                    # Found matching END - construct full body with signature
+                    body_content = source_from_begin[:i].strip()
+                    # Return: PROCEDURE_SIGNATURE + BODY_CONTENT
+                    full_body = f"{proc_signature} {body_content}".strip()
+                    return full_body
     
     return None

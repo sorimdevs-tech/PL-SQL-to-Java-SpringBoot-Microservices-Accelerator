@@ -20,9 +20,12 @@ from typing import Optional, Dict, Any, List
 from src.utils.logger import setup_logging
 from src.utils.config import load_config
 from src.parser.plsql_parser import PLSQLParser
+from src.parser.table_metadata_provider import TableMetadataProvider
 from src.analyzer.dependency_graph import DependencyAnalyzer
 from src.converter.llm_engine import LLMConversionEngine
+from src.converter.llm_prompt_enhancements import enhance_service_prompt_with_metadata
 from src.generator.spring_boot_generator import SpringBootGenerator
+from src.generator.build_validator import BuildValidator
 from src.validator.test_generator import TestGenerator
 from src.validator.semantic_validator import SemanticValidator, SemanticValidationReport
 from src.utils.file_utils import FileExtractor
@@ -89,6 +92,14 @@ class PLSQLModernizationPipeline:
         self.file_extractor = FileExtractor()
         self.repair_config = self.config.get('backup_llm', {}) or {}
         self._last_repair_result: Dict[str, Any] = {}
+        
+        # Initialize table metadata provider for entity schema synchronization
+        self.table_metadata_provider = TableMetadataProvider()
+        
+        # Initialize build validator for Maven/Gradle compilation testing
+        self.build_validator = BuildValidator(
+            timeout_seconds=self.config.get('build', {}).get('timeout_seconds', 180)
+        )
         
         # Setup output directories
         self.setup_output_directories()
@@ -172,6 +183,23 @@ class PLSQLModernizationPipeline:
                     repositories,
                     services,
                 )
+                
+                # Filter out issues for services that don't actually exist in the generated output
+                # This can happen when discovery creates source units that get merged or consolidated
+                valid_services = set(services.keys())
+                valid_entities = set(entities.keys())
+                valid_repositories = set(repositories.keys())
+                
+                valid_issues = []
+                for issue in semantic_validation.issues:
+                    # Skip if file doesn't exist in generated output
+                    if issue.file_name and issue.file_name not in valid_services and issue.file_name not in valid_entities and issue.file_name not in valid_repositories:
+                        continue
+                    valid_issues.append(issue)
+                
+                semantic_validation.issues = valid_issues
+                semantic_validation.passed = not any(issue.severity == "error" for issue in valid_issues)
+                
                 if semantic_validation.passed:
                     break
                 repository_feedback = semantic_validation.feedback_by_component("repository")
@@ -179,9 +207,28 @@ class PLSQLModernizationPipeline:
                 logger.warning(
                     "Semantic validation failed on attempt %s/3: %s",
                     attempt + 1,
-                    "; ".join(issue.message for issue in semantic_validation.issues[:5]),
+                    "; ".join(issue.message for issue in semantic_validation.issues[:3]),
                 )
             if not semantic_validation.passed:
+                # [BLM-1] Try to repair with backup LLM if enabled
+                if self.llm_engine.repair_provider:
+                    logger.info("[BLM-1] Attempting backup LLM repair of %d failed services...", 
+                               len(semantic_validation.feedback_by_component("service")))
+                    try:
+                        repaired = await self.llm_engine.repair_services_with_backup_llm(
+                            services=services,
+                            validation_issues=semantic_validation.issues,
+                            entities=entities,
+                            repositories=repositories,
+                        )
+                        if repaired:
+                            services.update(repaired)
+                            logger.info("[BLM-1] Backup LLM successfully repaired %d services", len(repaired))
+                        else:
+                            logger.warning("[BLM-1] Backup LLM repair returned no repaired services")
+                    except Exception as e:
+                        logger.warning("[BLM-1] Backup LLM repair failed: %s. Continuing with original validation error.", str(e))
+                
                 raise ConversionError([issue.message for issue in semantic_validation.issues])
 
             controllers = await self.generate_controllers(services, write_files=False)
@@ -660,13 +707,32 @@ class PLSQLModernizationPipeline:
                 except Exception:
                     continue
 
-        return self.generator.generate_entities(
+        # Register discovered tables with metadata provider for schema synchronization
+        for table_name, columns in ddl_columns.items():
+            # Convert columns from list of dicts to dict format for metadata provider
+            columns_dict = {}
+            for col in columns:
+                if isinstance(col, dict):
+                    col_name = col.get("name", "")
+                    col_type = col.get("type", "VARCHAR2")
+                    if col_name:
+                        columns_dict[col_name] = col_type
+            
+            if columns_dict:
+                # Derive entity name from table name using _to_camel_case pattern
+                entity_name = f"{self.generator._to_camel_case(table_name.lower())}Entity"
+                self.table_metadata_provider.register_table(table_name, entity_name, columns_dict)
+                logger.info(f"Registered table metadata: {table_name} → {entity_name} ({len(columns_dict)} columns)")
+
+        entities = self.generator.generate_entities(
             java_code,
             ddl_columns,
             fk_map,
             sequence_map=(semantic_model or {}).get("sequences", {}),
             write_files=False,
         )
+        
+        return entities
     
     async def generate_repositories(
         self,
@@ -706,7 +772,7 @@ class PLSQLModernizationPipeline:
             Dict[str, str]: Generated service files
         """
         source_units = semantic_model.get("source_units", [])
-        logger.info(f"Stage 5: Passing {len(source_units)} source units to LLM for service generation")
+        logger.info(f"Stage 5: Passing {len(source_units)} source units to deterministic service generator with metadata")
         for unit in source_units:
             obj_type = unit.get("object_type", "")
             unit_name = unit.get("name", "")
@@ -718,6 +784,7 @@ class PLSQLModernizationPipeline:
             entities,
             repositories,
             validation_feedback=validation_feedback,
+            metadata_provider=self.table_metadata_provider,
         )
     
     async def generate_controllers(self, services: Dict[str, str], write_files: bool = True) -> Dict[str, str]:

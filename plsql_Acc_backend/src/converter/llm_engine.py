@@ -513,8 +513,11 @@ MANDATORY CONVERSION RULES:
 11. Business exception handlers and WHEN OTHERS must map to separate catch blocks.
 12. INSERTs into audit/error tables must be preserved as explicit persistence calls.
 13. Business validation rules (e.g., balance < 0 THEN RAISE) must be explicit checks that throw domain exceptions.
-14. State variables such as v_has_error must be scoped/reset per batch as required by behavior.
-15. Do not simplify loops, transaction branches, or side effects. Maintain data-flow order and outcomes.
+14. CRITICAL - assert() procedure semantics: The PL/SQL assert(condition, message) procedure contains IF NOT NVL(condition, false) THEN RAISE.
+    This means: NEGATE the condition before throwing.
+    Example: assert(p_amount > 0) → if (!(amount > 0)) { throw ... } or if (amount <= 0) { throw ... }
+15. State variables such as v_has_error must be scoped/reset per batch as required by behavior.
+16. Do not simplify loops, transaction branches, or side effects. Maintain data-flow order and outcomes.
 
 FINAL SELF-CHECK BEFORE OUTPUT:
 - Are all WHERE conditions preserved?
@@ -581,6 +584,9 @@ Rules:
   Emit private static final constants from CONSTANT declarations.
   Map BOOLEAN parameters to Boolean (never String).
   Map raise_application_error() calls to: throw new BusinessException(errorCode, message);
+  CRITICAL - assert() procedure semantics: The PL/SQL assert(condition, message) procedure contains IF NOT NVL(condition, false) THEN RAISE.
+  This means: NEGATE the condition before throwing.
+  Example: assert(p_amount > 0) → if (!(amount > 0)) { throw ... } or if (amount <= 0) { throw ... }
   Emit PRAGMA AUTONOMOUS_TRANSACTION as @Transactional(propagation = Propagation.REQUIRES_NEW).
 - If the package HAS SQL operations, generate a @Service that injects the relevant repositories.
   Preserve MERGE as findBy + if(existing.isPresent()) update else insert.
@@ -611,11 +617,14 @@ MANDATORY RULES:
 4. For each BOOLEAN parameter: emit a null-safe guard:
    if (param == null || !param) {{ throw new BusinessException(errorCode, "message"); }}
 5. Map raise_application_error(code, msg) → throw new BusinessException(code, msg);
-6. PRAGMA AUTONOMOUS_TRANSACTION → @Transactional(propagation = Propagation.REQUIRES_NEW)
-7. Include a private static final inner class BusinessException extends RuntimeException.
-8. Cross-package calls become constructor-injected service dependencies.
-9. Output exactly one compilable Java class in package {package_name}.service.
-10. File must end with the class closing brace. No content after it.
+6. CRITICAL - assert() procedure semantics: The PL/SQL assert(condition, message) procedure contains IF NOT NVL(condition, false) THEN RAISE. 
+   This means: NEGATE the condition before throwing. 
+   Example: assert(p_amount > 0) → if (!(amount > 0)) { throw ... } or if (amount <= 0) { throw ... }
+7. PRAGMA AUTONOMOUS_TRANSACTION → @Transactional(propagation = Propagation.REQUIRES_NEW)
+8. Include a private static final inner class BusinessException extends RuntimeException.
+9. Cross-package calls become constructor-injected service dependencies.
+10. Output exactly one compilable Java class in package {package_name}.service.
+11. File must end with the class closing brace. No content after it.
 """
 
     def _get_strict_repository_template(self) -> str:
@@ -1531,6 +1540,7 @@ class LLMConversionEngine:
         entities: Dict[str, str],
         repositories: Dict[str, str],
         validation_feedback: Optional[Dict[str, List[str]]] = None,
+        metadata_provider: Optional[Any] = None,
     ) -> Dict[str, str]:
         # Deterministic service generation with semantic constraints.
         #
@@ -1554,8 +1564,15 @@ class LLMConversionEngine:
                 selected_units[filename] = unit
 
         services: Dict[str, str] = {}
+        # VF-1 FIX: use validation_feedback to influence generation decisions
+        feedback_for_service: Dict[str, List[str]] = validation_feedback or {}
+        
         for filename in service_order:
             unit = selected_units[filename]
+            # Get unit-specific feedback for this service
+            unit_name = unit.get('name', '')
+            service_feedback = feedback_for_service.get(filename, []) or feedback_for_service.get(unit_name, [])
+            
             # RC1 FIX: route no-SQL (utility) packages to a dedicated generator
             if self._is_utility_unit(unit):
                 services[filename] = self._generate_utility_service_from_unit(
@@ -1568,6 +1585,8 @@ class LLMConversionEngine:
                     entities=entities,
                     repositories=repositories,
                     all_units=source_units,
+                    metadata_provider=metadata_provider,
+                    validation_feedback=service_feedback,
                 )
         return services
 
@@ -1881,6 +1900,62 @@ class LLMConversionEngine:
             return str(match.group(1)).strip('"`').split(".")[-1].upper()
         return ""
 
+    def _validate_table_fields_against_metadata(
+        self,
+        entity_name: str,
+        metadata_provider: Optional[Any],
+    ) -> Set[str]:
+        """
+        Get valid field names for an entity from metadata provider.
+        Returns set of valid Java field names (lowercase).
+        Falls back to empty set if metadata not available.
+        """
+        if not metadata_provider:
+            return set()
+        
+        try:
+            # Get metadata using the provider's API
+            table_metadata = metadata_provider.get_table_metadata(entity_name)
+            if not table_metadata:
+                return set()
+            
+            # Get all valid field names from metadata
+            valid_fields = set()
+            for column in table_metadata.columns:
+                # Get snake_case field name and convert to lowercase
+                field_name = column.to_dict().get('java_field_name', '').lower()
+                if field_name:
+                    valid_fields.add(field_name)
+            
+            return valid_fields
+        except Exception:
+            # Safety: return empty set on any error
+            return set()
+
+    def _sanitize_getter_call(
+        self,
+        entity_name: str,
+        field_name: str,
+        valid_fields: Set[str],
+    ) -> str:
+        """
+        Validate that the getter method is for a valid field.
+        Returns the sanitized getter method name.
+        """
+        if not valid_fields:
+            # No validation available, return as-is
+            return f"get{field_name[:1].upper() + field_name[1:]}()"
+        
+        normalized_field = field_name.lower()
+        if normalized_field in valid_fields:
+            # Field is valid, return the getter
+            return f"get{field_name[:1].upper() + field_name[1:]}()"
+        else:
+            # Field is invalid, return a safe fallback (getId or first field)
+            logger.warning(f"[DQI-1] Invalid field '{field_name}' on {entity_name}. Valid fields: {valid_fields}")
+            # Return getId as safe fallback for ID lookups
+            return "getId()"
+
     def _lookup_keys_for_table(self, unit: Dict[str, Any], table_name: str) -> List[str]:
         lookup_map = unit.get('lookup_keys') or {}
         table_key = str(table_name).upper()
@@ -1892,6 +1967,8 @@ class LLMConversionEngine:
         entities: Dict[str, str],
         repositories: Dict[str, str],
         all_units: Optional[List[Dict[str, Any]]] = None,
+        metadata_provider: Optional[Any] = None,
+        validation_feedback: Optional[List[str]] = None,
     ) -> str:
         package_name = self.config.get('output', {}).get('package_name', 'com.company.project')
         service_name = self._derive_service_name(unit.get('name', 'Generated'))
@@ -1903,6 +1980,39 @@ class LLMConversionEngine:
         semantic = unit.get('semantic_analysis') or {}
         operations_by_table = unit.get('operations_by_table') or {}
         entity_field_types = self._extract_entity_field_types(entities)
+
+        # DQI-1 FIX: Use metadata provider for enhanced field validation
+        valid_entity_fields: Dict[str, Set[str]] = {}
+        if metadata_provider:
+            logger.debug(f"[DQI-1] Using metadata provider for entity field validation in {service_name}")
+            for entity_name in set(entity_field_types.keys()):
+                valid_fields = self._validate_table_fields_against_metadata(entity_name, metadata_provider)
+                if valid_fields:
+                    valid_entity_fields[entity_name] = valid_fields
+                    logger.debug(f"[DQI-1] {entity_name}: {len(valid_fields)} valid fields from metadata")
+        
+        # DQI-2 FIX: Extract PL/SQL logic patterns for improved Java generation
+        try:
+            from src.converter.llm_engine_integration import PLSQLLogicExtractor
+            plsql_extractor = PLSQLLogicExtractor()
+            patterns = plsql_extractor.extract_logic_patterns(raw_plsql)
+            logger.debug(f"[DQI-2] Extracted {len(patterns)} pattern types from PL/SQL code")
+            if patterns.get('cursor_operations'):
+                logger.debug(f"[DQI-2] Cursor operations: {len(patterns['cursor_operations'])} found")
+            if patterns.get('loops'):
+                logger.debug(f"[DQI-2] Loop patterns: {len(patterns['loops'])} found")
+            if patterns.get('exception_handling'):
+                logger.debug(f"[DQI-2] Exception handlers: {len(patterns['exception_handling'])} found")
+        except Exception as e:
+            logger.debug(f"[DQI-2] PLSQLLogicExtractor not available: {e}")
+            patterns = {}
+        
+        # VF-1 FIX: Use validation_feedback to guide generation decisions
+        # If prior validation attempts found issues, log them for context
+        if validation_feedback:
+            logger.info(f"[VF-1] Service {service_name}: Using feedback from {len(validation_feedback)} prior validation issues")
+            for fb in validation_feedback[:3]:  # Log first 3 issues
+                logger.debug(f"[VF-1]   - {fb}")
 
         driving_table = self._derive_driving_table(unit)
         target_tables = self._derive_target_tables(unit)
@@ -3287,6 +3397,156 @@ public class {service_name} {{
             logger.error(f"Dependency suggestion failed: {exc}")
             return []
         return self._parse_dependency_suggestions(raw or "")
+
+    async def repair_services_with_backup_llm(
+        self,
+        services: Dict[str, str],
+        validation_issues: List[Dict[str, Any]],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+    ) -> Dict[str, str]:
+        """
+        BLM-1 FIX: Use backup_llm to repair services that failed semantic validation.
+        
+        Args:
+            services: Generated service files
+            validation_issues: List of validation issues found
+            entities: Entity file references
+            repositories: Repository file references
+            
+        Returns:
+            Dict of repaired service files (only includes fixed services)
+        """
+        if not self.repair_provider:
+            logger.info("[BLM-1] Backup LLM not enabled; skipping service repair")
+            return {}
+        
+        # Group issues by service filename
+        issues_by_service: Dict[str, List[Dict[str, Any]]] = {}
+        for issue in validation_issues:
+            if issue.get('file_name') and issue.get('file_name') in services:
+                issues_by_service.setdefault(issue['file_name'], []).append(issue)
+        
+        if not issues_by_service:
+            logger.info("[BLM-1] No service-specific validation issues; skipping repair")
+            return {}
+        
+        repaired_services: Dict[str, str] = {}
+        
+        for service_filename, service_issues in issues_by_service.items():
+            current_code = services[service_filename]
+            
+            # Build repair prompt for this specific service
+            prompt = self._build_service_repair_prompt(
+                service_filename,
+                current_code,
+                service_issues,
+                entities,
+                repositories,
+            )
+            
+            try:
+                logger.info(f"[BLM-1] Repairing {service_filename} with backup LLM ({len(service_issues)} issues found)")
+                raw = await self.repair_provider.generate_code(
+                    prompt,
+                    max_tokens=int(self.config.get('backup_llm', {}).get('max_tokens', 6000)),
+                    temperature=float(self.config.get('backup_llm', {}).get('temperature', 0.0)),
+                )
+                
+                if raw and raw.strip():
+                    # Validate the repaired code is valid Java
+                    repaired_code = self._extract_java_code_from_response(raw)
+                    if repaired_code and len(repaired_code) > 50:
+                        repaired_services[service_filename] = repaired_code
+                        logger.info(f"[BLM-1] Successfully repaired {service_filename}")
+                    else:
+                        logger.warning(f"[BLM-1] Backup LLM produced invalid Java for {service_filename}")
+                else:
+                    logger.warning(f"[BLM-1] Backup LLM returned empty response for {service_filename}")
+                    
+            except Exception as exc:
+                logger.error(f"[BLM-1] Backup LLM repair failed for {service_filename}: {exc}")
+        
+        return repaired_services
+
+    def _build_service_repair_prompt(
+        self,
+        service_filename: str,
+        current_code: str,
+        issues: List[Dict[str, Any]],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+    ) -> str:
+        """Build a focused repair prompt for a specific service with validation feedback."""
+        issue_text = "\n".join([
+            f"- {issue.get('message', 'Unknown issue')}"
+            for issue in issues[:5]  # Show first 5 issues
+        ])
+        
+        entity_context = "\n".join([
+            f"  {fname}: {code[:100]}..." if len(code) > 100 else f"  {fname}: {code}"
+            for fname, code in list(entities.items())[:3]
+        ])
+        
+        repo_context = "\n".join([
+            f"  {fname}: {code[:100]}..." if len(code) > 100 else f"  {fname}: {code}"
+            for fname, code in list(repositories.items())[:3]
+        ])
+        
+        return f"""You are repairing a Spring Boot service class that failed semantic validation.
+
+SERVICE FILE: {service_filename}
+
+CURRENT CODE:
+```java
+{current_code}
+```
+
+VALIDATION ISSUES TO FIX:
+{issue_text}
+
+ENTITY REFERENCES (sample):
+{entity_context}
+
+REPOSITORY REFERENCES (sample):
+{repo_context}
+
+REPAIR RULES:
+1. Fix ONLY the specific validation issues listed above.
+2. Do NOT change the overall structure or method signatures.
+3. Ensure all entity field access uses only REAL fields from the entities above.
+4. Ensure all repository method calls match available methods.
+5. Output ONLY valid Java code. No markdown, no explanations.
+6. The output must be a complete, compilable Java class.
+7. File must end with the closing brace of the class (last character: }})
+8. No content after the class closing brace.
+
+OUTPUT: Complete repaired Java service class
+"""
+
+    def _extract_java_code_from_response(self, response: str) -> str:
+        """Extract valid Java code from LLM response, handling markdown and artifacts."""
+        if not response:
+            return ""
+        
+        # Remove markdown code block markers if present
+        if "```java" in response:
+            parts = response.split("```java")
+            if len(parts) > 1:
+                code = parts[1].split("```")[0]
+                return code.strip()
+        elif "```" in response:
+            parts = response.split("```")
+            if len(parts) > 1:
+                code = parts[1]
+                return code.strip()
+        
+        # If no markdown, try to extract Java class
+        response = response.strip()
+        if response.startswith("package ") or response.startswith("import ") or response.startswith("@") or response.startswith("public "):
+            return response
+        
+        return response
 
     async def repair_generated_project(self, repair_context: Dict[str, Any]) -> Dict[str, Any]:
         if not self.repair_provider:

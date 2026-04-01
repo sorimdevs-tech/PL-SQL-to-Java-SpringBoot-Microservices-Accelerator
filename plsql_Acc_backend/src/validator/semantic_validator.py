@@ -301,6 +301,8 @@ class SemanticValidator:
             service_filename = self._derive_service_filename(unit)
             service_code = services.get(service_filename, "")
             if not service_code:
+                # Skip validation for source units that don't have a corresponding service file
+                # This can happen for utility functions or procedures that are merged into other services
                 continue
 
             repo_vars = self._extract_repository_variables(service_code)
@@ -334,12 +336,22 @@ class SemanticValidator:
                             )
                         )
 
+            # TEMPORARILY DISABLED: Re-enabled entity field validation found real issues.
+            # The LLM is generating code like row.getVideoid() for fields that don't exist
+            # in BookEntity. With the improved LLM prompts and enhanced table metadata now
+            # available, future iterations can fix the LLM to not generate these calls.
+            # 
+            # RE-ENABLED (December 21): Metadata integration now provides entity field information
+            # Services receive table metadata and validate field access. This validation catches
+            # invalid field references before they reach clients.
+            
             setter_pattern = re.compile(r"\b(\w+)\.set([A-Z]\w*)\s*\(")
             getter_pattern = re.compile(r"\b(\w+)\.get([A-Z]\w*)\s*\(")
             for match in setter_pattern.finditer(service_code):
                 var_name, setter_suffix = match.groups()
                 entity_name = entity_vars.get(var_name)
                 if not entity_name:
+                    # Skip if the variable is not a declared entity (could be a transient object)
                     continue
                 if setter_suffix not in entity_contracts.get(entity_name, {}).get("setters", set()):
                     issues.append(
@@ -349,12 +361,13 @@ class SemanticValidator:
                             code="invalid_entity_setter",
                             message=f"{service_filename} calls {var_name}.set{setter_suffix}() but {entity_name} does not define it",
                             file_name=service_filename,
-                        )
+                       )
                     )
             for match in getter_pattern.finditer(service_code):
                 var_name, getter_suffix = match.groups()
                 entity_name = entity_vars.get(var_name)
                 if not entity_name:
+                    # Skip if the variable is not a declared entity (could be a transient object)
                     continue
                 if getter_suffix not in entity_contracts.get(entity_name, {}).get("getters", set()):
                     issues.append(
@@ -379,6 +392,8 @@ class SemanticValidator:
             service_filename = self._derive_service_filename(unit)
             service_code = services.get(service_filename, "")
             if not service_code:
+                # Skip validation for source units that don't have a corresponding service file
+                # This can happen for utility functions or procedures that are merged into other services
                 continue
             object_name = unit.get("name", "")
             raw_plsql = unit.get("raw_plsql", "")

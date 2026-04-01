@@ -426,8 +426,11 @@ class SpringBootGenerator:
         "spring-boot-starter-validation",
         "springdoc-openapi-starter-webmvc-ui",
         "ojdbc8",
+        "ojdbc11",
         "mysql-connector-j",
         "postgresql",
+        "mssql-jdbc",
+        "spring-boot-starter-data-mongodb",
         "spring-boot-starter-test",
         "testcontainers",
         "junit-jupiter",
@@ -657,6 +660,10 @@ class SpringBootGenerator:
             "mysql": "mysql-connector-j",
             "postgres": "postgresql",
             "postgresql": "postgresql",
+            "sqlserver": "mssql-jdbc",
+            "mssql": "mssql-jdbc",
+            "mongodb": "spring-boot-starter-data-mongodb",
+            "mongo": "spring-boot-starter-data-mongodb",
             "oracle": "ojdbc8",
         }
         dep_id = alias_map.get(dep_id, dep_id)
@@ -687,6 +694,10 @@ class SpringBootGenerator:
             ),
             "postgresql": BuildDependency(
                 group="org.postgresql", artifact="postgresql",
+                scope="runtime", gradle_configuration="runtimeOnly",
+            ),
+            "mssql-jdbc": BuildDependency(
+                group="com.microsoft.sqlserver", artifact="mssql-jdbc",
                 scope="runtime", gradle_configuration="runtimeOnly",
             ),
         }
@@ -762,6 +773,16 @@ class SpringBootGenerator:
                 group="org.postgresql", artifact="postgresql",
                 scope="runtime", gradle_configuration="runtimeOnly",
             )
+        if db_type in ("sqlserver", "mssql", "microsoft sql server"):
+            return BuildDependency(
+                group="com.microsoft.sqlserver", artifact="mssql-jdbc",
+                scope="runtime", gradle_configuration="runtimeOnly",
+            )
+        if db_type in ("mongodb", "mongo"):
+            return BuildDependency(
+                group="org.springframework.boot", artifact="spring-boot-starter-data-mongodb",
+                gradle_configuration="implementation",
+            )
         return None
 
     def _dedupe_dependencies(self, deps: List[BuildDependency]) -> List[BuildDependency]:
@@ -802,9 +823,9 @@ class SpringBootGenerator:
 
     def _build_dependency_list(self, config: Dict[str, Any]) -> List[BuildDependency]:
         deps: List[BuildDependency] = []
+        db_type = self._get_database_type(config)
         deps.extend([
             BuildDependency("org.springframework.boot", "spring-boot-starter-web", gradle_configuration="implementation"),
-            BuildDependency("org.springframework.boot", "spring-boot-starter-data-jpa", gradle_configuration="implementation"),
             BuildDependency("org.springframework.boot", "spring-boot-starter-validation", gradle_configuration="implementation"),
             BuildDependency("org.springdoc", "springdoc-openapi-starter-webmvc-ui", version="2.5.0", gradle_configuration="implementation"),
             BuildDependency("org.springframework.boot", "spring-boot-starter-test", scope="test", gradle_configuration="testImplementation"),
@@ -814,6 +835,10 @@ class SpringBootGenerator:
             BuildDependency("com.h2database", "h2", scope="test", gradle_configuration="testRuntimeOnly"),
             BuildDependency("org.springframework.boot", "spring-boot-devtools", scope="runtime", optional=True, gradle_configuration="developmentOnly"),
         ])
+        if db_type not in ("mongodb", "mongo"):
+            deps.append(
+                BuildDependency("org.springframework.boot", "spring-boot-starter-data-jpa", gradle_configuration="implementation")
+            )
 
         db_dep = self._select_database_dependency(config)
         if db_dep:
@@ -845,6 +870,8 @@ class SpringBootGenerator:
                 ("com.oracle.database.jdbc", "ojdbc11"),
                 ("com.mysql", "mysql-connector-j"),
                 ("org.postgresql", "postgresql"),
+                ("com.microsoft.sqlserver", "mssql-jdbc"),
+                ("org.springframework.boot", "spring-boot-starter-data-mongodb"),
             }
             deps = [
                 dep for dep in deps
@@ -858,7 +885,9 @@ class SpringBootGenerator:
             return "testing"
         if dep.artifact in ("spring-boot-devtools",):
             return "devtools"
-        if dep.group in ("com.oracle.database.jdbc", "com.mysql", "org.postgresql"):
+        if dep.group in ("com.oracle.database.jdbc", "com.mysql", "org.postgresql", "com.microsoft.sqlserver"):
+            return "database"
+        if dep.key() == ("org.springframework.boot", "spring-boot-starter-data-mongodb"):
             return "database"
         return "core"
 
@@ -1209,6 +1238,33 @@ tasks.named('test') {{
         logger.info("Application configuration files generated")
 
     def _generate_application_yml(self) -> str:
+        db_config = self._get_application_database_config()
+        if db_config["kind"] == "mongodb":
+            return f"""# Spring Boot Application Configuration
+spring:
+  application:
+    name: {self.project_name}
+
+  # MongoDB Configuration
+  data:
+    mongodb:
+      uri: {db_config["uri"]}
+      database: your_database
+
+server:
+  port: 8080
+
+# Logging Configuration
+logging:
+  level:
+    {self.package_name}: DEBUG
+
+# Custom Application Properties
+app:
+  version: 1.0.0
+  description: {self.description}
+  build-time: {self._get_current_time()}
+"""
         # SBG-2: server: is a top-level key, NOT nested under spring:
         return f"""# Spring Boot Application Configuration
 spring:
@@ -1217,10 +1273,10 @@ spring:
 
   # Database Configuration
   datasource:
-    url: jdbc:oracle:thin:@localhost:1521:xe
+    url: {db_config["url"]}
     username: your_username
     password: your_password
-    driver-class-name: oracle.jdbc.OracleDriver
+    driver-class-name: {db_config["driver"]}
 
   # JPA Configuration
   jpa:
@@ -1229,7 +1285,7 @@ spring:
     show-sql: true
     properties:
       hibernate:
-        dialect: org.hibernate.dialect.OracleDialect
+        dialect: {db_config["dialect"]}
         format_sql: true
 
 # SBG-2 FIX: server is top-level, not under spring:
@@ -1251,20 +1307,40 @@ app:
 """
 
     def _generate_application_properties(self) -> str:
+        db_config = self._get_application_database_config()
+        if db_config["kind"] == "mongodb":
+            return f"""# Spring Boot Application Configuration
+spring.application.name={self.project_name}
+
+# MongoDB Configuration
+spring.data.mongodb.uri={db_config["uri"]}
+spring.data.mongodb.database=your_database
+
+# SBG-1 FIX: correct key (was spring.server.port)
+server.port=8080
+
+# Logging Configuration
+logging.level.{self.package_name}=DEBUG
+
+# Custom Application Properties
+app.version=1.0.0
+app.description={self.description}
+app.build-time={self._get_current_time()}
+"""
         # SBG-1: correct key is server.port, not spring.server.port
         return f"""# Spring Boot Application Configuration
 spring.application.name={self.project_name}
 
 # Database Configuration
-spring.datasource.url=jdbc:oracle:thin:@localhost:1521:xe
+spring.datasource.url={db_config["url"]}
 spring.datasource.username=your_username
 spring.datasource.password=your_password
-spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.datasource.driver-class-name={db_config["driver"]}
 
 # JPA Configuration
 spring.jpa.hibernate.ddl-auto=update
 spring.jpa.show-sql=true
-spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.OracleDialect
+spring.jpa.properties.hibernate.dialect={db_config["dialect"]}
 spring.jpa.properties.hibernate.format_sql=true
 
 # SBG-1 FIX: correct key (was spring.server.port)
@@ -1280,6 +1356,41 @@ app.version=1.0.0
 app.description={self.description}
 app.build-time={self._get_current_time()}
 """
+
+    def _get_application_database_config(self) -> Dict[str, str]:
+        db_type = self._get_database_type(self.config)
+        if db_type == "mysql":
+            return {
+                "kind": "relational",
+                "url": "jdbc:mysql://localhost:3306/your_database",
+                "driver": "com.mysql.cj.jdbc.Driver",
+                "dialect": "org.hibernate.dialect.MySQLDialect",
+            }
+        if db_type in ("postgresql", "postgres"):
+            return {
+                "kind": "relational",
+                "url": "jdbc:postgresql://localhost:5432/your_database",
+                "driver": "org.postgresql.Driver",
+                "dialect": "org.hibernate.dialect.PostgreSQLDialect",
+            }
+        if db_type in ("sqlserver", "mssql", "microsoft sql server"):
+            return {
+                "kind": "relational",
+                "url": "jdbc:sqlserver://localhost:1433;databaseName=your_database;encrypt=true;trustServerCertificate=true",
+                "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+                "dialect": "org.hibernate.dialect.SQLServerDialect",
+            }
+        if db_type in ("mongodb", "mongo"):
+            return {
+                "kind": "mongodb",
+                "uri": "mongodb://localhost:27017/your_database",
+            }
+        return {
+            "kind": "relational",
+            "url": "jdbc:oracle:thin:@localhost:1521:xe",
+            "driver": "oracle.jdbc.OracleDriver",
+            "dialect": "org.hibernate.dialect.OracleDialect",
+        }
 
     def _normalize_build_tool(self, value: str) -> str:
         if not value:
@@ -2656,93 +2767,97 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 
     def _inject_method_body(self, service_code: str, generated_method: str) -> str:
         """
-        Replace the first public method in service code with the generated method body only.
-        Preserves the existing method signature and replaces only the body.
+        Replace the first public METHOD (not class) in service code with the complete generated method.
+        CRITICAL: Must skip class declaration and only replace methods.
         
         Args:
             service_code: The existing Java service class code
-            generated_method: The newly generated method (may have different signature)
+            generated_method: The newly generated complete method (full signature + body)
             
         Returns:
-            Updated service_code with the method body replaced
+            Updated service_code with the method completely replaced
         """
-        # Extract just the body from the generated method
+        # Find the complete generated method (from 'public' to closing brace)
         gen_lines = generated_method.split('\n')
-        body_start = -1
-        body_end = -1
+        method_start = -1
+        method_end = -1
         brace_count = 0
         
         for idx, line in enumerate(gen_lines):
-            if body_start == -1 and '{' in line:
-                body_start = idx
+            if method_start == -1 and 'public' in line and '{' in line:
+                method_start = idx
                 brace_count = line.count('{') - line.count('}')
-            elif body_start != -1:
+            elif method_start != -1:
                 brace_count += line.count('{') - line.count('}')
-                if brace_count == 0:
-                    body_end = idx
+                if brace_count == 0 and '}' in line:
+                    method_end = idx
                     break
         
-        if body_start == -1 or body_end == -1:
-            logger.warning("Could not extract method body from generated method")
+        if method_start == -1 or method_end == -1:
+            logger.warning("Could not extract complete method from generated code")
             return service_code
         
-        # Extract just the body content (between braces, excluding the braces themselves)
-        body_content = []
-        for idx in range(body_start + 1, body_end):
-            body_content.append(gen_lines[idx])
+        # Extract complete method including signature and body
+        generated_complete_method = '\n'.join(gen_lines[method_start:method_end + 1])
         
-        # Join and strip
-        method_body = '\n'.join(body_content).strip()
-        
-        # Now find and replace the first public method in service_code
+        # Now find and replace the first public METHOD (not class!) in service_code
         sc_lines = service_code.split('\n')
         output_lines = []
         i = 0
         method_found = False
+        inside_class_body = False  # Track if we're past the class declaration
+        class_brace_depth = 0
         
         while i < len(sc_lines):
             line = sc_lines[i]
             
-            # Look for first public method declaration
-            if not method_found and re.match(r'\s*public\s+\w+\s+\w+\s*\(', line):
+            # Track brace depth to know when we're inside the class body
+            if 'public class' in line:
+                inside_class_body = True
+                class_brace_depth = line.count('{') - line.count('}')
+            elif inside_class_body:
+                class_brace_depth += line.count('{') - line.count('}')
+            
+            # Look for first public METHOD inside the class (not the class itself)
+            if (not method_found and inside_class_body and class_brace_depth > 0 and 
+                'public' in line and ('void' in line or 'Long' in line or 'String' in line or 
+                                     'Boolean' in line or 'Integer' in line or 'BigDecimal' in line or
+                                     'List' in line or 'Optional' in line)):
                 method_found = True
-                logger.debug("Found public method, replacing body...")
+                logger.debug("Found public method, replacing completely with generated method...")
                 
-                # Add the method signature as-is
-                output_lines.append(line)
+                # Replace with the complete generated method
+                output_lines.append(generated_complete_method)
                 
-                # Collect and skip the old method body
-                inside_method = False
+                # Skip the old method - find where it ends (method-level closing brace)
                 brace_count = 0
                 j = i
+                found_opening_brace = False
                 
                 while j < len(sc_lines):
                     current_line = sc_lines[j]
                     
                     # Track braces
-                    if '{' in current_line:
-                        inside_method = True
-                    
                     brace_count += current_line.count('{')
                     brace_count -= current_line.count('}')
                     
-                    if j > i:  # Skip the first line (method signature)
-                        # Check if this closes the method
-                        if inside_method and brace_count == 0:
-                            # We've found the closing brace of the method
-                            # Insert the new body before the closing brace
-                            for body_line in method_body.split('\n'):
-                                output_lines.append('        ' + body_line if body_line.strip() else '')
-                            output_lines.append('    }')
-                            i = j + 1
-                            break
+                    if '{' in current_line:
+                        found_opening_brace = True
+                    
+                    # Check if this is the closing brace of the method
+                    if found_opening_brace and brace_count == 0:
+                        # We've skipped the old method completely
+                        i = j
+                        break
                     
                     j += 1
             else:
                 output_lines.append(line)
-                i += 1
+            
+            i += 1
         
-        return '\n'.join(output_lines)
+        result = '\n'.join(output_lines)
+        return result
 
     def _normalize_service_code(self, filename: str, code: str) -> str:
         """
@@ -3038,12 +3153,26 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             import_lines.append('import java.util.stream.Stream;')
         imports = '\n'.join(dict.fromkeys(import_lines))
 
-        return f"""package {self.package_name}.service;
+        # Apply comprehensive fixes for all 9 mismatch categories
+        # This ensures:
+        # 1. No PL/SQL syntax in Java
+        # 2. Return types are correct
+        # 3. Validation logic is sound
+        # 4. Repository methods exist
+        # 5. Constants are defined
+        # 6. Entity fields are valid
+        # 7. Exception handling is correct
+        # 8. Method signatures are clean
+        from .comprehensive_code_fixer import ComprehensiveServiceFixer
+        fixer = ComprehensiveServiceFixer()
+        final_code = f"""package {self.package_name}.service;
 
 {imports}
 
 {body}
 """
+        fixed_code, _ = fixer.fix_service_code(final_code, {}, {'entity_name': entity_names})
+        return fixed_code
 
     def _resolve_repo_method_names(self, repo_name: str) -> dict:
         """
