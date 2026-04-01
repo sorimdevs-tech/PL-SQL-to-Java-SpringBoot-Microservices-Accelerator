@@ -526,6 +526,7 @@ class GitRepoPublisher:
         source_dir: str | Path,
         repo_url: str,
         branch: Optional[str] = None,
+        base_branch: Optional[str] = None,
         target_subdirectory: Optional[str] = None,
         access_token: Optional[str] = None,
         username: Optional[str] = None,
@@ -538,6 +539,7 @@ class GitRepoPublisher:
             source_dir: Generated local output directory.
             repo_url: Target Git repository URL or path.
             branch: Branch to publish to. Defaults to the repository's active/default branch.
+            base_branch: Existing branch used as the starting point when creating a new branch.
             target_subdirectory: Optional relative subdirectory inside the repo.
             access_token: Optional PAT for HTTPS repositories.
             username: Optional username for token auth. Defaults to x-access-token.
@@ -563,7 +565,7 @@ class GitRepoPublisher:
         try:
             logger.info("Cloning output target repository: %s", repo_url)
             repo = git.Repo.clone_from(auth_repo_url, str(temp_dir))
-            active_branch = self._checkout_branch(repo, branch)
+            active_branch = self._checkout_branch(repo, branch, base_branch)
             destination_root = temp_dir / self._normalize_target_subdirectory(target_subdirectory)
             destination_root.mkdir(parents=True, exist_ok=True)
 
@@ -602,8 +604,8 @@ class GitRepoPublisher:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _checkout_branch(self, repo, branch: Optional[str]) -> str:
-        """Check out the requested branch, creating it from HEAD if necessary."""
+    def _checkout_branch(self, repo, branch: Optional[str], base_branch: Optional[str] = None) -> str:
+        """Check out the requested branch, creating it from the chosen base branch if necessary."""
         if not branch:
             try:
                 return repo.active_branch.name
@@ -618,6 +620,14 @@ class GitRepoPublisher:
         elif branch in remote_branch_names:
             repo.git.checkout("-b", branch, f"origin/{branch}")
         else:
+            normalized_base_branch = (base_branch or "").strip()
+            if normalized_base_branch and normalized_base_branch != branch:
+                if normalized_base_branch in local_branch_names:
+                    repo.git.checkout(normalized_base_branch)
+                elif normalized_base_branch in remote_branch_names:
+                    repo.git.checkout("-b", normalized_base_branch, f"origin/{normalized_base_branch}")
+                else:
+                    raise ValueError(f"Base branch not found in target repository: {normalized_base_branch}")
             repo.git.checkout("-b", branch)
         return branch
 
