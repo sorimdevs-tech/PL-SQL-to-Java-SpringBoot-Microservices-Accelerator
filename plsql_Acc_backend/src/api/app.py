@@ -1150,6 +1150,50 @@ async def analyze_discovery_source(request: DiscoveryAnalyzeRequest) -> Dict[str
             "tableDetails": {"tables": [], "relationships": []},
             "conversionPreview": {"entities": [], "repositories": [], "services": [], "controllers": [], "dtos": []},
         }
+        
+        # DEBUG: Log FK data in response
+        import sys
+        print(f"\n[STRICT RULES ENFORCEMENT CHECK]", file=sys.stderr)
+        schema = discovery_model.get("schema", {})
+        tables = schema.get("tables", [])
+        external_tables = schema.get("external_tables", [])
+        
+        print(f"  Schema Status: {schema.get('status')}", file=sys.stderr)
+        print(f"  DDL Tables: {len(tables)}", file=sys.stderr)
+        print(f"  External Tables (DML-only): {len(external_tables)}", file=sys.stderr)
+        
+        # RULE 1-3: Schema exists only if CREATE TABLE present
+        if schema.get("status") == "NOT_FOUND":
+            print(f"  ✓ RULE 1-3: No CREATE TABLE found → schema.status={schema.get('status')}, external_tables={len(external_tables)}", file=sys.stderr)
+        elif schema.get("status") == "DEFINED":
+            print(f"  ✓ RULE 1-2: CREATE TABLE found → tables populated {len(tables)} tables", file=sys.stderr)
+        
+        # RULE 4-5: External tables from DML with usage tracking
+        if external_tables:
+            print(f"  ✓ RULE 4-5: External tables with usage tracking:", file=sys.stderr)
+            for ext_table in external_tables:
+                usage = ext_table.get("usage", [])
+                print(f"     • {ext_table.get('name')}: operations={usage}", file=sys.stderr)
+        
+        # RULE 6-7: No mixing of DDL and DML tables
+        ddl_names = {t.get("name") for t in tables}
+        ext_names = {t.get("name") for t in external_tables}
+        intersection = ddl_names & ext_names
+        if intersection:
+            print(f"  ✗ RULE 6-7 VIOLATION: Tables in both DDL and external_tables: {intersection}", file=sys.stderr)
+        else:
+            print(f"  ✓ RULE 6-7: No mixing of DDL and external tables (intersection={len(intersection)})", file=sys.stderr)
+        
+        # FK extraction
+        print(f"  [FK EXTRACTION]", file=sys.stderr)
+        fk_count = 0
+        for table in tables:
+            fks = table.get("foreign_keys", [])
+            fk_count += len(fks)
+            if fks:
+                print(f"  ✓ {table.get('name')}: {len(fks)} FKs", file=sys.stderr)
+        print(f"  Total FKs in response: {fk_count}", file=sys.stderr)
+        
         return {
             **primary,
             "objects": analyses,

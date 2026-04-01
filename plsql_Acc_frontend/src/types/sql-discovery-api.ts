@@ -234,6 +234,8 @@ export interface SqlSequenceMapping {
 
 export interface SqlDiscoverySchema {
   tables: SqlSchemaTable[]
+  referenced_tables?: SqlSchemaTable[]
+  has_explicit_table_ddl?: boolean
   relationships: SqlSchemaRelationship[]
   sequences: SqlSequenceDefinition[]
   sequence_mapping: SqlSequenceMapping[]

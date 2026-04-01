@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react"
+import { useEffect, useRef, useState, useMemo, type ReactNode } from "react"
 import {
   ChevronLeft,
   ChevronRight,
@@ -27,6 +27,7 @@ import {
   uploadSqlDiscoveryFile,
 } from "@/lib/sql-discovery-api"
 import { pickOutputDirectory } from "@/lib/jobs-api"
+import { dedupePackages, dedupePackagesWithKeys } from "@/utils/package-deduplication"
 import type { OracleConnectionPayload } from "@/types/oracle-api"
 import type {
   SqlBulkOperation,
@@ -313,7 +314,27 @@ interface GlobalSchemaPanelProps {
 
 function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
   const globalTables = props.schema.tables ?? []
+  const referencedTables = props.schema.referenced_tables ?? []
+  const hasExplicitTableDDL = props.schema.has_explicit_table_ddl ?? globalTables.length > 0
   const selectedSchemaTable = globalTables.find((table) => table.name === props.selectedTable) ?? null
+  const inferredOnlyTables = referencedTables.filter(
+    (table) => !globalTables.some((explicitTable) => explicitTable.name === table.name),
+  )
+
+  // DEBUG: Log when component receives FK data
+  useEffect(() => {
+    console.log("GlobalSchemaPanel - Tables with FK data:")
+    globalTables.forEach((table) => {
+      console.log(`  ${table.name}: ${table.foreign_keys?.length ?? 0} FKs`)
+      if (table.foreign_keys && table.foreign_keys.length > 0) {
+        console.log(`    FKs:`, table.foreign_keys)
+      }
+    })
+    if (selectedSchemaTable) {
+      console.log(`Selected table: ${selectedSchemaTable.name}`)
+      console.log(`  FKs:`, selectedSchemaTable.foreign_keys ?? [])
+    }
+  }, [globalTables, selectedSchemaTable])
 
   return (
     <Card>
@@ -325,125 +346,165 @@ function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-4 lg:grid-cols-[220px_1fr_260px]">
-        <div className="rounded-xl border border-slate-200 bg-white p-3">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Tables ({globalTables.length})</p>
-          <div className="mt-2 space-y-1">
-            {globalTables.map((table) => (
-              <button
-                key={table.name}
-                onClick={() => props.onSelectTable(table.name)}
-                className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left text-sm transition ${
-                  props.selectedTable === table.name ? "bg-cyan-50 text-cyan-900" : "text-slate-700 hover:bg-slate-50"
-                }`}
-              >
-                <span className="flex-1 truncate">{table.name}</span>
-                <span className="w-8 shrink-0 text-right text-xs text-slate-400">{table.columns.length}</span>
-              </button>
-            ))}
+        <div className="space-y-3">
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-500">DDL Tables ({globalTables.length})</p>
+            <div className="mt-2 space-y-1">
+              {globalTables.map((table) => (
+                <button
+                  key={table.name}
+                  onClick={() => props.onSelectTable(table.name)}
+                  className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left text-sm transition ${
+                    props.selectedTable === table.name ? "bg-cyan-50 text-cyan-900" : "text-slate-700 hover:bg-slate-50"
+                  }`}
+                >
+                  <span className="flex-1 truncate">{table.name}</span>
+                  <span className="w-8 shrink-0 text-right text-xs text-slate-400">{table.columns.length}</span>
+                </button>
+              ))}
+              {globalTables.length === 0 ? (
+                <p className="text-sm text-slate-500">No CREATE TABLE definitions found.</p>
+              ) : null}
+            </div>
           </div>
+          {inferredOnlyTables.length > 0 ? (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+              <p className="text-xs uppercase tracking-wide text-amber-700">
+                Referenced Tables ({inferredOnlyTables.length})
+              </p>
+              <p className="mt-1 text-xs text-amber-700">
+                Inferred from SQL usage only. These are not confirmed schema DDL definitions.
+              </p>
+              <div className="mt-2 space-y-1">
+                {inferredOnlyTables.map((table) => (
+                  <p key={`inferred-${table.name}`} className="truncate text-sm text-amber-900">
+                    {table.name}
+                  </p>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {!hasExplicitTableDDL && inferredOnlyTables.length === 0 ? (
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+              <p className="text-sm text-slate-600">
+                No schema DDL or table references detected in this source.
+              </p>
+            </div>
+          ) : null}
         </div>
 
         <div className="space-y-3">
+          {!hasExplicitTableDDL ? (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              Schema explorer requires CREATE TABLE DDL to provide reliable columns, PK/FK, and relationships.
+            </div>
+          ) : null}
           <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-white">
             <div className="absolute inset-0 bg-grid-pattern opacity-30" />
             <div className="relative h-full min-h-[320px] overflow-auto p-6">
-              {(() => {
-                const relationships: SqlSchemaRelationship[] = props.schema.relationships ?? []
-                const cardWidth = 220
-                const cardHeight = 152
-                const gapX = 80
-                const gapY = 90
-                const columns = 2
-                const rows = Math.ceil(globalTables.length / columns)
-                const width = columns * cardWidth + (columns - 1) * gapX + 40
-                const height = rows * cardHeight + (rows - 1) * gapY + 40
-                const positions = new Map<string, { x: number; y: number }>()
+              {globalTables.length === 0 ? (
+                <p className="text-sm text-slate-500">
+                  No explicit schema graph available for this source.
+                </p>
+              ) : (
+                (() => {
+                  const relationships: SqlSchemaRelationship[] = props.schema.relationships ?? []
+                  const cardWidth = 220
+                  const cardHeight = 152
+                  const gapX = 80
+                  const gapY = 90
+                  const columns = 2
+                  const rows = Math.ceil(globalTables.length / columns)
+                  const width = columns * cardWidth + (columns - 1) * gapX + 40
+                  const height = rows * cardHeight + (rows - 1) * gapY + 40
+                  const positions = new Map<string, { x: number; y: number }>()
 
-                globalTables.forEach((table, index) => {
-                  const col = index % columns
-                  const row = Math.floor(index / columns)
-                  positions.set(table.name, {
-                    x: 20 + col * (cardWidth + gapX),
-                    y: 20 + row * (cardHeight + gapY),
+                  globalTables.forEach((table, index) => {
+                    const col = index % columns
+                    const row = Math.floor(index / columns)
+                    positions.set(table.name, {
+                      x: 20 + col * (cardWidth + gapX),
+                      y: 20 + row * (cardHeight + gapY),
+                    })
                   })
-                })
 
-                return (
-                  <div className="relative" style={{ width, height }}>
-                    <svg className="absolute inset-0 h-full w-full">
-                      <defs>
-                        <marker
-                          id="arrow"
-                          viewBox="0 0 10 10"
-                          refX="9"
-                          refY="5"
-                          markerWidth="6"
-                          markerHeight="6"
-                          orient="auto-start-reverse"
-                        >
-                          <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8" />
-                        </marker>
-                      </defs>
-                      {relationships.map((rel, idx) => {
-                        const from = positions.get(rel.source_table)
-                        const to = positions.get(rel.target_table)
-                        if (!from || !to) {
+                  return (
+                    <div className="relative" style={{ width, height }}>
+                      <svg className="absolute inset-0 h-full w-full">
+                        <defs>
+                          <marker
+                            id="arrow"
+                            viewBox="0 0 10 10"
+                            refX="9"
+                            refY="5"
+                            markerWidth="6"
+                            markerHeight="6"
+                            orient="auto-start-reverse"
+                          >
+                            <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8" />
+                          </marker>
+                        </defs>
+                        {relationships.map((rel, idx) => {
+                          const from = positions.get(rel.source_table)
+                          const to = positions.get(rel.target_table)
+                          if (!from || !to) {
+                            return null
+                          }
+                          const startX = from.x + cardWidth
+                          const startY = from.y + cardHeight / 2
+                          const endX = to.x
+                          const endY = to.y + cardHeight / 2
+                          const midX = (startX + endX) / 2
+                          return (
+                            <path
+                              key={`${rel.source_table}-${rel.target_table}-${idx}`}
+                              d={`M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`}
+                              stroke="#94a3b8"
+                              strokeWidth="1.5"
+                              fill="none"
+                              markerEnd="url(#arrow)"
+                            />
+                          )
+                        })}
+                      </svg>
+
+                      {globalTables.map((table) => {
+                        const pos = positions.get(table.name)
+                        if (!pos) {
                           return null
                         }
-                        const startX = from.x + cardWidth
-                        const startY = from.y + cardHeight / 2
-                        const endX = to.x
-                        const endY = to.y + cardHeight / 2
-                        const midX = (startX + endX) / 2
                         return (
-                          <path
-                            key={`${rel.source_table}-${rel.target_table}-${idx}`}
-                            d={`M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`}
-                            stroke="#94a3b8"
-                            strokeWidth="1.5"
-                            fill="none"
-                            markerEnd="url(#arrow)"
-                          />
+                          <div
+                            key={table.name}
+                            className="absolute overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
+                            style={{ width: cardWidth, height: cardHeight, left: pos.x, top: pos.y }}
+                          >
+                            <div className="rounded-t-xl border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
+                              {table.name}
+                            </div>
+                            <div className="flex h-[108px] flex-col overflow-auto px-3 py-2 text-xs text-slate-600">
+                              {table.columns.length > 0 ? (
+                                <ul className="space-y-1">
+                                  {table.columns.slice(0, 5).map((col) => (
+                                    <li key={`${table.name}-${col.name}`}>
+                                      {col.name} <span className="text-slate-400">({col.type})</span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <p className="text-slate-400">No columns detected</p>
+                              )}
+                              {table.columns.length > 5 ? (
+                                <p className="mt-1 text-[11px] text-slate-400">+{table.columns.length - 5} more</p>
+                              ) : null}
+                            </div>
+                          </div>
                         )
                       })}
-                    </svg>
-
-                    {globalTables.map((table) => {
-                      const pos = positions.get(table.name)
-                      if (!pos) {
-                        return null
-                      }
-                      return (
-                        <div
-                          key={table.name}
-                          className="absolute overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
-                          style={{ width: cardWidth, height: cardHeight, left: pos.x, top: pos.y }}
-                        >
-                          <div className="rounded-t-xl border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
-                            {table.name}
-                          </div>
-                          <div className="flex h-[108px] flex-col overflow-auto px-3 py-2 text-xs text-slate-600">
-                            {table.columns.length > 0 ? (
-                              <ul className="space-y-1">
-                                {table.columns.slice(0, 5).map((col) => (
-                                  <li key={`${table.name}-${col.name}`}>
-                                    {col.name} <span className="text-slate-400">({col.type})</span>
-                                  </li>
-                                ))}
-                              </ul>
-                            ) : (
-                              <p className="text-slate-400">No columns detected</p>
-                            )}
-                            {table.columns.length > 5 ? (
-                              <p className="mt-1 text-[11px] text-slate-400">+{table.columns.length - 5} more</p>
-                            ) : null}
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )
-              })()}
+                    </div>
+                  )
+                })()
+              )}
             </div>
           </div>
 
@@ -485,6 +546,9 @@ function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
                 ))}
                 {props.selectedTable && (selectedSchemaTable?.columns.length ?? 0) === 0 ? (
                   <p className="text-sm text-slate-400">No columns detected</p>
+                ) : null}
+                {!props.selectedTable && globalTables.length === 0 ? (
+                  <p className="text-sm text-slate-400">No DDL table selected.</p>
                 ) : null}
               </div>
             </div>
@@ -1197,6 +1261,15 @@ function SqlSourceDiscovery(props: {
           return
         }
 
+        // DEBUG: Log FK data from API response
+        console.log("=== FK DEBUG LOG ===")
+        console.log("API Response discovery.schema.tables:")
+        const discoveryTables = analyzed?.discovery?.schema?.tables ?? []
+        discoveryTables.forEach((table: any) => {
+          console.log(`  ${table.name}: ${table.foreign_keys?.length ?? 0} FKs`, table.foreign_keys ?? [])
+        })
+        console.log("=== END DEBUG LOG ===")
+
         props.setAnalyzedDependencies(deriveDependencies(analyzed))
         try {
           const suggestionResponse = await getDependencySuggestions({
@@ -1547,14 +1620,26 @@ function SqlSourceDiscovery(props: {
                     value={selectedObjectKey ?? ""}
                     onChange={(event) => setSelectedObjectKey(event.target.value)}
                   >
-                    {(analysis?.objects ?? []).map((item) => {
-                      const key = `${item.objectType}::${item.procedureName}`
-                      return (
-                        <option key={key} value={key}>
-                          {item.procedureName} ({item.objectType})
-                        </option>
-                      )
-                    })}
+                    {(() => {
+                      // Deduplicate objects (handles packages with .pks and .pkb variants)
+                      const uniqueObjectsMap = new Map<string, any>()
+                      ;(analysis?.objects ?? []).forEach((obj) => {
+                        const key = `${obj.objectType}::${obj.procedureName}`
+                        if (!uniqueObjectsMap.has(key)) {
+                          uniqueObjectsMap.set(key, obj)
+                        }
+                      })
+                      const deduplicatedObjects = Array.from(uniqueObjectsMap.values())
+                      
+                      return deduplicatedObjects.map((item) => {
+                        const key = `${item.objectType}::${item.procedureName}`
+                        return (
+                          <option key={key} value={key}>
+                            {item.procedureName} ({item.objectType})
+                          </option>
+                        )
+                      })
+                    })()}
                   </select>
                 </div>
               </CardContent>
@@ -1576,7 +1661,18 @@ function SqlSourceDiscovery(props: {
               <CardTitle>Objects</CardTitle>
             </CardHeader>
             <CardContent>
-              {(analysis?.objects ?? []).length > 0 ? (
+              {(() => {
+                // Deduplicate objects (handles packages with .pks and .pkb variants)
+                const uniqueObjectsMap = new Map<string, any>()
+                ;(analysis?.objects ?? []).forEach((obj) => {
+                  const key = `${obj.objectType}::${obj.procedureName}`
+                  if (!uniqueObjectsMap.has(key)) {
+                    uniqueObjectsMap.set(key, obj)
+                  }
+                })
+                const deduplicatedObjects = Array.from(uniqueObjectsMap.values())
+                
+                return deduplicatedObjects.length > 0 ? (
                 <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
                   <table className="w-full text-sm">
                     <thead className="bg-slate-50 text-slate-600">
@@ -1586,7 +1682,7 @@ function SqlSourceDiscovery(props: {
                       </tr>
                     </thead>
                     <tbody>
-                      {(analysis?.objects ?? []).map((item) => (
+                      {deduplicatedObjects.map((item) => (
                         <tr key={`${item.objectType}-${item.procedureName}`} className="border-t border-slate-100">
                           <td className="px-3 py-2 font-medium text-slate-800">{item.procedureName}</td>
                           <td className="px-3 py-2 text-slate-700">{item.objectType}</td>
@@ -1597,7 +1693,8 @@ function SqlSourceDiscovery(props: {
                 </div>
               ) : (
                 <p className="text-sm text-slate-500">No objects detected</p>
-              )}
+              )
+              })()}
             </CardContent>
           </Card>
         </>

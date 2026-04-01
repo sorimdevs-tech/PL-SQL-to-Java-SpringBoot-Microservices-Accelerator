@@ -343,8 +343,30 @@ class PLSQLModernizationPipeline:
         sequence_names: set[str] = set()
         sequence_mapping_keys: set[tuple[str, str]] = set()
 
+        # DEBUG: Log FK extraction for each file
+        import sys
+        total_fks = 0
+        
         for filename, content in (plsql_files or {}).items():
+            print(f"\n[CONVERSION SEMANTICS] Processing file: {filename} ({len(content)} bytes)", file=sys.stderr)
             model = build_discovery_model(content)
+            
+            file_tables = model.get("schema", {}).get("tables", [])
+            print(f"  Tables: {len(file_tables)}", file=sys.stderr)
+            
+            # DEBUG: Count FKs in this file
+            file_fks = sum(len(t.get("foreign_keys", [])) for t in file_tables)
+            print(f"  FKs in file: {file_fks}", file=sys.stderr)
+            total_fks += file_fks
+            
+            if file_fks > 0:
+                for table in file_tables:
+                    fks = table.get("foreign_keys", [])
+                    if fks:
+                        print(f"    {table.get('name')}: {len(fks)} FKs", file=sys.stderr)
+                        for fk in fks:
+                            print(f"      → {fk.get('source_column')} -> {fk.get('target_table')}.{fk.get('target_column')}", file=sys.stderr)
+            
             file_units = build_conversion_units(content)
             for unit in file_units:
                 unit["source_file"] = filename
@@ -458,11 +480,26 @@ class PLSQLModernizationPipeline:
                 if table_name not in sequence_map:
                     sequence_map[table_name] = sequence_name
 
-        return {
+        # DEBUG: Final FK count in merged schema
+        import sys
+        final_fks = sum(len(t.get("foreign_keys", [])) for t in merged_schema.get("tables", []))
+        print(f"\n[CONVERSION SEMANTICS FINAL] Total tables: {len(merged_schema.get('tables', []))}, Total FKs: {final_fks}", file=sys.stderr)
+        
+        if final_fks > 0:
+            for table in merged_schema.get("tables", []):
+                fks = table.get("foreign_keys", [])
+                if fks:
+                    print(f"  {table.get('name')}: {len(fks)} FKs", file=sys.stderr)
+                    for fk in fks:
+                        print(f"    → {fk.get('source_column')} -> {fk.get('target_table')}.{fk.get('target_column')}", file=sys.stderr)
+        
+        result = {
             "source_units": units,
             "schema": merged_schema,
             "sequences": sequence_map,
         }
+        print(f"[CONVERSION SEMANTICS] Returning schema with {final_fks} total FKs", file=sys.stderr)
+        return result
 
     def _register_procedures_with_generator(self, semantic_model: Dict[str, Any], plsql_files: Dict[str, str]) -> None:
         """

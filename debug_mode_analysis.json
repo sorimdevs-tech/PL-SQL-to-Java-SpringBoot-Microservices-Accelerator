@@ -1,0 +1,890 @@
+{
+  "source": "repository: c:\\projects\\plsql_Accelerator\\plsql_sample_repo",
+  "total_files": 16,
+  "files": {
+    "appl_error_pkg.pks": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\appl_error_pkg.pks",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "RAISE statements (found 1x)",
+          "EXCEPTION blocks (found 1x)"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": true,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "CUSTOM_EXCEPTION",
+          "mechanism": "RAISE statement",
+          "detected": true
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "appl_log_pkg.pks": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\appl_log_pkg.pks",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "customer_pkg.pks": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\customer_pkg.pks",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "invoice_api_pkg.pks": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\invoice_api_pkg.pks",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "invoice_pkg.pks": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\invoice_pkg.pks",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "paypal_util_pkg.pks": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\paypal_util_pkg.pks",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "simple_test_pkg.pks": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\simple_test_pkg.pks",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "xtp.pks": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\xtp.pks",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "appl_error_pkg.pkb": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\appl_error_pkg.pkb",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "raise_application_error (found 1x)",
+          "RAISE statements (found 1x)",
+          "EXCEPTION blocks (found 1x)"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": true,
+        "has_exception_block": true,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error",
+          "detected": true
+        },
+        {
+          "type": "CUSTOM_EXCEPTION",
+          "mechanism": "RAISE statement",
+          "detected": true
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "appl_log_pkg.pkb": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\appl_log_pkg.pkb",
+      "raw_detection": {
+        "tables": [
+          "appl_log"
+        ],
+        "dml_statements": [
+          "INSERT INTO appl_log"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "COMMIT (found 1x)",
+          "PRAGMA AUTONOMOUS_TRANSACTION (found 1x)"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": true,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": true,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "customer_pkg.pkb": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\customer_pkg.pkb",
+      "raw_detection": {
+        "tables": [
+          "xy_customer"
+        ],
+        "dml_statements": [
+          "SELECT FROM xy_customer",
+          "SELECT FROM xy_customer",
+          "INSERT INTO xy_customer",
+          "UPDATE xy_customer",
+          "UPDATE xy_customer",
+          "DELETE FROM xy_customer",
+          "DELETE FROM xy_customer"
+        ],
+        "exception_patterns": [
+          "NO_DATA_FOUND (found 2x)",
+          "EXCEPTION blocks (found 2x)"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": true,
+        "has_insert": true,
+        "has_update": true,
+        "has_delete": true,
+        "has_raise_application_error": false,
+        "has_exception_block": true,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception",
+          "detected": true
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "invoice_api_pkg.pkb": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\invoice_api_pkg.pkb",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "invoice_pkg.pkb": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\invoice_pkg.pkb",
+      "raw_detection": {
+        "tables": [
+          "xy_invoice",
+          "xy_vat"
+        ],
+        "dml_statements": [
+          "SELECT FROM xy_invoice",
+          "SELECT FROM xy_vat",
+          "INSERT INTO xy_invoice",
+          "INSERT INTO xy_invoice",
+          "UPDATE xy_invoice",
+          "DELETE FROM xy_invoice"
+        ],
+        "exception_patterns": [
+          "NO_DATA_FOUND (found 2x)",
+          "EXCEPTION blocks (found 2x)"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": true,
+        "has_insert": true,
+        "has_update": true,
+        "has_delete": true,
+        "has_raise_application_error": false,
+        "has_exception_block": true,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception",
+          "detected": true
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "paypal_util_pkg.pkb": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\paypal_util_pkg.pkb",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "raise_application_error (found 2x)"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": true,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error",
+          "detected": true
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "simple_test_pkg.pkb": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\simple_test_pkg.pkb",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "RAISE statements (found 1x)",
+          "EXCEPTION blocks (found 2x)"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": true,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "CUSTOM_EXCEPTION",
+          "mechanism": "RAISE statement",
+          "detected": true
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    },
+    "xtp.pkb": {
+      "source": "c:\\projects\\plsql_Accelerator\\plsql_sample_repo\\xtp.pkb",
+      "raw_detection": {
+        "tables": [],
+        "dml_statements": [
+          "NOT FOUND"
+        ],
+        "exception_patterns": [
+          "NOT FOUND"
+        ],
+        "cursor_patterns": [
+          "NOT FOUND"
+        ],
+        "loop_patterns": [
+          "NOT FOUND"
+        ],
+        "retry_patterns": [
+          "NOT FOUND"
+        ],
+        "transaction_patterns": [
+          "NOT FOUND"
+        ]
+      },
+      "flags": {
+        "has_select": false,
+        "has_insert": false,
+        "has_update": false,
+        "has_delete": false,
+        "has_raise_application_error": false,
+        "has_exception_block": false,
+        "has_cursor_keyword": false,
+        "has_for_select_loop": false,
+        "has_open_fetch_close": false,
+        "has_loop": false,
+        "has_while": false,
+        "has_for_loop": false,
+        "has_goto": false,
+        "has_retry_label": false,
+        "has_commit": false,
+        "has_rollback": false
+      },
+      "computed": {
+        "cursor_count": 0,
+        "retry_count": 0
+      },
+      "exceptions": [
+        {
+          "type": "NO_EXCEPTIONS",
+          "detected": false
+        }
+      ],
+      "notes": "cursor_count=0: No cursor signals found; retry_count=0: No LOOP keyword found"
+    }
+  }
+}

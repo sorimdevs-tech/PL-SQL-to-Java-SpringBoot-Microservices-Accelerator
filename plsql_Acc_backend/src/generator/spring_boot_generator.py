@@ -2082,6 +2082,9 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
         field_lines = []
         accessor_lines = []
         fk_list = fk_list or []
+        
+        # Collect FK columns to skip them in the main loop
+        fk_columns = {fk.get("column", "").upper() for fk in fk_list}
 
         id_column = None
         for col in columns:
@@ -2098,6 +2101,11 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
 
         for col in columns:
             col_name = col["name"].upper()
+            
+            # Skip FK columns - they'll be generated as @ManyToOne relationships
+            if col_name in fk_columns:
+                continue
+            
             java_type = self._map_sql_type_to_java(col.get("type", ""))
             if java_type == "LocalDateTime":
                 import_lines.append("import java.time.LocalDateTime;")
@@ -2131,6 +2139,46 @@ Swagger UI: `http://localhost:8080/swagger-ui/index.html`
 
     public void set{self._capitalize_first(field_name)}({java_type} {field_name}) {{
         this.{field_name} = {field_name};
+    }}
+"""
+            )
+
+        # PHASE 4: Generate @ManyToOne fields for foreign keys
+        for fk in fk_list:
+            fk_column = fk.get("column", "").upper()
+            ref_table = fk.get("ref_table", "").upper()
+            ref_column = fk.get("ref_column", "").upper()
+            
+            if not fk_column or not ref_table:
+                continue
+            
+            # Generate entity class name from ref_table
+            ref_entity_name = f"{self._to_camel_case(ref_table.lower())}Entity"
+            ref_entity_normalized = self._normalize_entity_name(ref_entity_name)
+            
+            # Generate field name from FK column (e.g., CUSTOMERID → customer)
+            fk_field_name = self._to_lower_camel_case(fk_column)
+            
+            # Import the related entity
+            import_lines.append(f"import {self.package_name}.entity.{ref_entity_normalized};")
+            
+            # Generate @ManyToOne and @JoinColumn annotations
+            fk_annotations = [
+                "@ManyToOne(fetch = FetchType.LAZY)",
+                f'@JoinColumn(name = "{fk_column}", referencedColumnName = "{ref_column}")'
+            ]
+            
+            field_lines.append("\n".join(f"    {a}" for a in fk_annotations))
+            field_lines.append(f"    private {ref_entity_normalized} {fk_field_name};\n")
+            
+            # Generate getter/setter for the FK field
+            accessor_lines.append(
+                f"""    public {ref_entity_normalized} get{self._capitalize_first(fk_field_name)}() {{
+        return {fk_field_name};
+    }}
+
+    public void set{self._capitalize_first(fk_field_name)}({ref_entity_normalized} {fk_field_name}) {{
+        this.{fk_field_name} = {fk_field_name};
     }}
 """
             )

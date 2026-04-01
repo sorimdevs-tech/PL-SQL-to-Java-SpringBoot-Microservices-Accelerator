@@ -1,0 +1,189 @@
+{
+  "analysis_scope": "REPOSITORY",
+  "source": "https://github.com/mortenbra/plsql-sample-code",
+  "total_packages": 8,
+  "validation_issues": 21,
+  "packages": [
+    {
+      "name": "appl_error_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": false,
+      "exceptions": [
+        "CUSTOM_EXCEPTION"
+      ],
+      "cursor_count": 0,
+      "retry_count": 0,
+      "dml_count": 0,
+      "tables_used": [],
+      "procedures": [
+        "assert"
+      ],
+      "functions": [],
+      "error_handling": "EXCEPTION_HANDLING",
+      "exception_behavior": "RAISE",
+      "recovery_strategy": "PROPAGATE"
+    },
+    {
+      "name": "appl_log_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": false,
+      "exceptions": [],
+      "cursor_count": 0,
+      "retry_count": 0,
+      "dml_count": 0,
+      "tables_used": [],
+      "procedures": [
+        "log"
+      ],
+      "functions": [],
+      "error_handling": "IMPLICIT",
+      "exception_behavior": null,
+      "recovery_strategy": null
+    },
+    {
+      "name": "customer_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": false,
+      "exceptions": [],
+      "cursor_count": 0,
+      "retry_count": 0,
+      "dml_count": 1,
+      "tables_used": [],
+      "procedures": [
+        "delete_customer",
+        "set_customer",
+        "purge_old_customers"
+      ],
+      "functions": [
+        "get_customer_name",
+        "get_customer",
+        "new_customer"
+      ],
+      "error_handling": "IMPLICIT",
+      "exception_behavior": null,
+      "recovery_strategy": null
+    },
+    {
+      "name": "invoice_api_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": false,
+      "exceptions": [],
+      "cursor_count": 0,
+      "retry_count": 0,
+      "dml_count": 0,
+      "tables_used": [],
+      "procedures": [
+        "approve_invoice"
+      ],
+      "functions": [
+        "get_color",
+        "create_invoice"
+      ],
+      "error_handling": "IMPLICIT",
+      "exception_behavior": null,
+      "recovery_strategy": null
+    },
+    {
+      "name": "invoice_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": false,
+      "exceptions": [],
+      "cursor_count": 0,
+      "retry_count": 0,
+      "dml_count": 1,
+      "tables_used": [],
+      "procedures": [
+        "delete_invoice",
+        "set_invoice"
+      ],
+      "functions": [
+        "new_invoice",
+        "get_vat_amount",
+        "get_default_invoice_description",
+        "get_invoice"
+      ],
+      "error_handling": "IMPLICIT",
+      "exception_behavior": null,
+      "recovery_strategy": null
+    },
+    {
+      "name": "paypal_util_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": false,
+      "exceptions": [],
+      "cursor_count": 0,
+      "retry_count": 0,
+      "dml_count": 1,
+      "tables_used": [],
+      "procedures": [
+        "to",
+        "switch_to_sandbox",
+        "set_api_base_url",
+        "set_wallet",
+        "delete_payment_experience"
+      ],
+      "functions": [
+        "create_payment",
+        "execute_payment",
+        "get_access_token",
+        "get_payment",
+        "create_payment_experience"
+      ],
+      "error_handling": "IMPLICIT",
+      "exception_behavior": null,
+      "recovery_strategy": null
+    },
+    {
+      "name": "simple_test_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": false,
+      "exceptions": [],
+      "cursor_count": 0,
+      "retry_count": 0,
+      "dml_count": 0,
+      "tables_used": [],
+      "procedures": [
+        "does",
+        "debug_something",
+        "execution",
+        "do_something"
+      ],
+      "functions": [
+        "get_something",
+        "returns"
+      ],
+      "error_handling": "IMPLICIT",
+      "exception_behavior": null,
+      "recovery_strategy": null
+    },
+    {
+      "name": "xtp",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": false,
+      "exceptions": [],
+      "cursor_count": 0,
+      "retry_count": 0,
+      "dml_count": 0,
+      "tables_used": [],
+      "procedures": [
+        "init",
+        "prn",
+        "p"
+      ],
+      "functions": [
+        "get_clob"
+      ],
+      "error_handling": "IMPLICIT",
+      "exception_behavior": null,
+      "recovery_strategy": null
+    }
+  ]
+}

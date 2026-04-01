@@ -1,0 +1,144 @@
+{
+  "schema": {
+    "status": "NOT_FOUND",
+    "note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+  },
+  "packages": [
+    {
+      "name": "appl_error_pkg",
+      "has_spec": true,
+      "has_body": true,
+      "cursor_count": 0,
+      "retry_count": 0,
+      "tables_used": [],
+      "exceptions": [
+        {
+          "type": "CUSTOM_EXCEPTION",
+          "mechanism": "RAISE statement",
+          "detected": true
+        },
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error",
+          "detected": true
+        }
+      ],
+      "schema_status": "NOT_FOUND",
+      "schema_note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+    },
+    {
+      "name": "appl_log_pkg",
+      "has_spec": true,
+      "has_body": true,
+      "cursor_count": 0,
+      "retry_count": 0,
+      "tables_used": [
+        "appl_log"
+      ],
+      "exceptions": [],
+      "schema_status": "NOT_FOUND",
+      "schema_note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+    },
+    {
+      "name": "customer_pkg",
+      "has_spec": true,
+      "has_body": true,
+      "cursor_count": 0,
+      "retry_count": 0,
+      "tables_used": [
+        "xy_customer"
+      ],
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception",
+          "detected": true
+        }
+      ],
+      "schema_status": "NOT_FOUND",
+      "schema_note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+    },
+    {
+      "name": "invoice_api_pkg",
+      "has_spec": true,
+      "has_body": true,
+      "cursor_count": 0,
+      "retry_count": 0,
+      "tables_used": [],
+      "exceptions": [],
+      "schema_status": "NOT_FOUND",
+      "schema_note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+    },
+    {
+      "name": "invoice_pkg",
+      "has_spec": true,
+      "has_body": true,
+      "cursor_count": 0,
+      "retry_count": 0,
+      "tables_used": [
+        "xy_invoice",
+        "xy_vat"
+      ],
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception",
+          "detected": true
+        }
+      ],
+      "schema_status": "NOT_FOUND",
+      "schema_note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+    },
+    {
+      "name": "paypal_util_pkg",
+      "has_spec": true,
+      "has_body": true,
+      "cursor_count": 0,
+      "retry_count": 0,
+      "tables_used": [],
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error",
+          "detected": true
+        }
+      ],
+      "schema_status": "NOT_FOUND",
+      "schema_note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+    },
+    {
+      "name": "simple_test_pkg",
+      "has_spec": true,
+      "has_body": true,
+      "cursor_count": 0,
+      "retry_count": 0,
+      "tables_used": [],
+      "exceptions": [
+        {
+          "type": "CUSTOM_EXCEPTION",
+          "mechanism": "RAISE statement",
+          "detected": true
+        }
+      ],
+      "schema_status": "NOT_FOUND",
+      "schema_note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+    },
+    {
+      "name": "xtp",
+      "has_spec": true,
+      "has_body": true,
+      "cursor_count": 0,
+      "retry_count": 0,
+      "tables_used": [],
+      "exceptions": [],
+      "schema_status": "NOT_FOUND",
+      "schema_note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+    }
+  ],
+  "total_packages": 8,
+  "validation": {
+    "no_defaults_applied": true,
+    "no_overrides_applied": true,
+    "no_false_positives": true
+  }
+}

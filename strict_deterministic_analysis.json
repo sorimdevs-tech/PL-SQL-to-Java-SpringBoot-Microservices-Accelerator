@@ -1,0 +1,438 @@
+{
+  "schema": {
+    "status": "NOT_FOUND",
+    "note": "No CREATE TABLE DDL found, but tables are referenced via DML"
+  },
+  "packages": [
+    {
+      "name": "appl_error_pkg",
+      "has_spec": true,
+      "has_body": true
+    },
+    {
+      "name": "appl_log_pkg",
+      "has_spec": true,
+      "has_body": true
+    },
+    {
+      "name": "customer_pkg",
+      "has_spec": true,
+      "has_body": true
+    },
+    {
+      "name": "invoice_api_pkg",
+      "has_spec": true,
+      "has_body": true
+    },
+    {
+      "name": "invoice_pkg",
+      "has_spec": true,
+      "has_body": true
+    },
+    {
+      "name": "paypal_util_pkg",
+      "has_spec": true,
+      "has_body": true
+    },
+    {
+      "name": "simple_test_pkg",
+      "has_spec": true,
+      "has_body": true
+    },
+    {
+      "name": "xtp",
+      "has_spec": true,
+      "has_body": true
+    }
+  ],
+  "procedures": [
+    {
+      "name": "assert",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error"
+        },
+        {
+          "type": "CUSTOM_EXCEPTION",
+          "mechanism": "RAISE statement"
+        }
+      ],
+      "error_handling": {
+        "type": "APPLICATION_ERROR",
+        "mechanism": "raise_application_error"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "log",
+      "tables_used": [
+        "appl_log"
+      ],
+      "crud_operations": [
+        "CREATE"
+      ],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "set_customer",
+      "tables_used": [
+        "xy_customer"
+      ],
+      "crud_operations": [
+        "CREATE",
+        "READ",
+        "UPDATE",
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception"
+        }
+      ],
+      "error_handling": {
+        "type": "NO_DATA_FOUND",
+        "mechanism": "predefined oracle exception"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "delete_customer",
+      "tables_used": [
+        "xy_customer"
+      ],
+      "crud_operations": [
+        "CREATE",
+        "READ",
+        "UPDATE",
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception"
+        }
+      ],
+      "error_handling": {
+        "type": "NO_DATA_FOUND",
+        "mechanism": "predefined oracle exception"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "purge_old_customers",
+      "tables_used": [
+        "xy_customer"
+      ],
+      "crud_operations": [
+        "CREATE",
+        "READ",
+        "UPDATE",
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception"
+        }
+      ],
+      "error_handling": {
+        "type": "NO_DATA_FOUND",
+        "mechanism": "predefined oracle exception"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "approve_invoice",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "set_invoice",
+      "tables_used": [
+        "xy_invoice"
+      ],
+      "crud_operations": [
+        "CREATE",
+        "READ",
+        "UPDATE",
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception"
+        }
+      ],
+      "error_handling": {
+        "type": "NO_DATA_FOUND",
+        "mechanism": "predefined oracle exception"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "delete_invoice",
+      "tables_used": [
+        "xy_invoice"
+      ],
+      "crud_operations": [
+        "CREATE",
+        "READ",
+        "UPDATE",
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "NO_DATA_FOUND",
+          "mechanism": "predefined oracle exception"
+        }
+      ],
+      "error_handling": {
+        "type": "NO_DATA_FOUND",
+        "mechanism": "predefined oracle exception"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "to",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "set_api_base_url",
+      "tables_used": [
+        "the"
+      ],
+      "crud_operations": [
+        "DELETE"
+      ],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "switch_to_sandbox",
+      "tables_used": [
+        "the"
+      ],
+      "crud_operations": [
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error"
+        }
+      ],
+      "error_handling": {
+        "type": "APPLICATION_ERROR",
+        "mechanism": "raise_application_error"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "set_wallet",
+      "tables_used": [
+        "the"
+      ],
+      "crud_operations": [
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error"
+        }
+      ],
+      "error_handling": {
+        "type": "APPLICATION_ERROR",
+        "mechanism": "raise_application_error"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "delete_payment_experience",
+      "tables_used": [
+        "the"
+      ],
+      "crud_operations": [
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error"
+        }
+      ],
+      "error_handling": {
+        "type": "APPLICATION_ERROR",
+        "mechanism": "raise_application_error"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "check_response_for_errors",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error"
+        }
+      ],
+      "error_handling": {
+        "type": "APPLICATION_ERROR",
+        "mechanism": "raise_application_error"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "as",
+      "tables_used": [],
+      "crud_operations": [
+        "DELETE"
+      ],
+      "exceptions": [
+        {
+          "type": "APPLICATION_ERROR",
+          "mechanism": "raise_application_error"
+        }
+      ],
+      "error_handling": {
+        "type": "APPLICATION_ERROR",
+        "mechanism": "raise_application_error"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "does",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "do_something",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "execution",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "debug_something",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [
+        {
+          "type": "CUSTOM_EXCEPTION",
+          "mechanism": "RAISE statement"
+        }
+      ],
+      "error_handling": {
+        "type": "CUSTOM_EXCEPTION",
+        "mechanism": "RAISE statement"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "calculate_something",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "calculates",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [
+        {
+          "type": "CUSTOM_EXCEPTION",
+          "mechanism": "RAISE statement"
+        }
+      ],
+      "error_handling": {
+        "type": "CUSTOM_EXCEPTION",
+        "mechanism": "RAISE statement"
+      },
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "init",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "p",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "prn",
+      "tables_used": [],
+      "crud_operations": [],
+      "exceptions": [],
+      "error_handling": {},
+      "cursor_count": 0,
+      "retry_count": 0
+    }
+  ],
+  "validation": {
+    "errors": [
+      "RULE 2 VIOLATION: raise_application_error in paypal_util_pkg.to but exceptions list is empty",
+      "RULE 2 VIOLATION: raise_application_error in paypal_util_pkg.set_api_base_url but exceptions list is empty"
+    ],
+    "total_violations": 2
+  }
+}

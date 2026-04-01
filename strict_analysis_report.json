@@ -1,0 +1,431 @@
+{
+  "schema": {
+    "status": "REPOSITORY",
+    "source": "https://github.com/mortenbra/plsql-sample-code"
+  },
+  "total_packages": 8,
+  "packages": [
+    {
+      "name": "appl_error_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": true,
+      "schema": {
+        "status": "NOT_FOUND",
+        "note": "No schema or table references detected"
+      },
+      "exceptions": [],
+      "error_handling": {},
+      "tables_used": [],
+      "procedures": [
+        {
+          "name": "assert",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        }
+      ],
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "appl_log_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": true,
+      "schema": {
+        "status": "NOT_FOUND",
+        "note": "No schema or table references detected"
+      },
+      "exceptions": [],
+      "error_handling": {},
+      "tables_used": [
+        "appl_log"
+      ],
+      "procedures": [
+        {
+          "name": "log",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        }
+      ],
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "customer_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": true,
+      "schema": {
+        "status": "NOT_FOUND",
+        "note": "No DDL found, but tables are referenced via DML statements"
+      },
+      "exceptions": [],
+      "error_handling": {},
+      "tables_used": [
+        "xy_customer"
+      ],
+      "procedures": [
+        {
+          "name": "set_customer",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "delete_customer",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "purge_old_customers",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        }
+      ],
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "invoice_api_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": true,
+      "schema": {
+        "status": "NOT_FOUND",
+        "note": "No schema or table references detected"
+      },
+      "exceptions": [],
+      "error_handling": {},
+      "tables_used": [],
+      "procedures": [
+        {
+          "name": "approve_invoice",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        }
+      ],
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "invoice_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": true,
+      "schema": {
+        "status": "NOT_FOUND",
+        "note": "No DDL found, but tables are referenced via DML statements"
+      },
+      "exceptions": [],
+      "error_handling": {},
+      "tables_used": [
+        "xy_invoice",
+        "xy_vat"
+      ],
+      "procedures": [
+        {
+          "name": "set_invoice",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "delete_invoice",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        }
+      ],
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "paypal_util_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": true,
+      "schema": {
+        "status": "NOT_FOUND",
+        "note": "No DDL found, but tables are referenced via DML statements"
+      },
+      "exceptions": [],
+      "error_handling": {},
+      "tables_used": [
+        "the"
+      ],
+      "procedures": [
+        {
+          "name": "to",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "set_api_base_url",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "switch_to_sandbox",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "set_wallet",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "delete_payment_experience",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "check_response_for_errors",
+          "tables_used": [
+            "the"
+          ],
+          "exceptions": [
+            {
+              "type": "APPLICATION_ERROR",
+              "mechanism": "raise_application_error"
+            }
+          ],
+          "error_handling": {
+            "type": "APPLICATION_ERROR",
+            "mechanism": "raise_application_error"
+          },
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "as",
+          "tables_used": [
+            "the"
+          ],
+          "exceptions": [
+            {
+              "type": "APPLICATION_ERROR",
+              "mechanism": "raise_application_error"
+            }
+          ],
+          "error_handling": {
+            "type": "APPLICATION_ERROR",
+            "mechanism": "raise_application_error"
+          },
+          "cursor_count": 0,
+          "retry_count": 0
+        }
+      ],
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "simple_test_pkg",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": true,
+      "schema": {
+        "status": "NOT_FOUND",
+        "note": "No schema or table references detected"
+      },
+      "exceptions": [],
+      "error_handling": {},
+      "tables_used": [],
+      "procedures": [
+        {
+          "name": "does",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "do_something",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "execution",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "debug_something",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "calculate_something",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "calculates",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        }
+      ],
+      "cursor_count": 0,
+      "retry_count": 0
+    },
+    {
+      "name": "xtp",
+      "type": "PACKAGE",
+      "has_spec": true,
+      "has_body": true,
+      "schema": {
+        "status": "NOT_FOUND",
+        "note": "No schema or table references detected"
+      },
+      "exceptions": [],
+      "error_handling": {},
+      "tables_used": [],
+      "procedures": [
+        {
+          "name": "init",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "p",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        },
+        {
+          "name": "prn",
+          "tables_used": [],
+          "exceptions": [],
+          "error_handling": {},
+          "cursor_count": 0,
+          "retry_count": 0
+        }
+      ],
+      "cursor_count": 0,
+      "retry_count": 0
+    }
+  ],
+  "rules_applied": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G"
+  ],
+  "validation": {
+    "false_positives": 0,
+    "duplicates": 0,
+    "violations": 49,
+    "errors": [
+      "RULE F VIOLATION: Duplicate procedure 'assert' in package 'appl_error_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'assert' in package 'appl_error_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'log' in package 'appl_log_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'log' in package 'appl_log_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_customer' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_customer' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_customer' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'delete_customer' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'purge_old_customers' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_customer' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_customer' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'delete_customer' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'purge_old_customers' in package 'customer_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'approve_invoice' in package 'invoice_api_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'approve_invoice' in package 'invoice_api_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_invoice' in package 'invoice_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'delete_invoice' in package 'invoice_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_invoice' in package 'invoice_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'delete_invoice' in package 'invoice_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'to' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_api_base_url' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'switch_to_sandbox' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_wallet' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'delete_payment_experience' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_api_base_url' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'switch_to_sandbox' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'to' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'set_wallet' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'delete_payment_experience' in package 'paypal_util_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'does' in package 'simple_test_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'do_something' in package 'simple_test_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'execution' in package 'simple_test_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'debug_something' in package 'simple_test_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'do_something' in package 'simple_test_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'does' in package 'simple_test_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'debug_something' in package 'simple_test_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'execution' in package 'simple_test_pkg'",
+      "RULE F VIOLATION: Duplicate procedure 'p' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'prn' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'init' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'p' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'prn' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'p' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'prn' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'init' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'p' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'prn' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'p' in package 'xtp'",
+      "RULE F VIOLATION: Duplicate procedure 'prn' in package 'xtp'"
+    ]
+  }
+}

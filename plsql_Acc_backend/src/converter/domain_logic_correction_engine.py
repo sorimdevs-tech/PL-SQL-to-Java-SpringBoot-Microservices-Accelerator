@@ -308,7 +308,7 @@ class DomainLogicCorrectionEngine:
         
         template = f'''
 /**
- * [DSLC-5] Domain model from PL/SQL record type
+ * [DSLC-5] Domain model from PL/SQL record type-
  * Equivalent to PL/SQL {model_name} record
  * All fields and behaviors preserved from source
  */

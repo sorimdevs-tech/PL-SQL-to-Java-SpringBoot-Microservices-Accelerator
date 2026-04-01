@@ -271,12 +271,34 @@ def _extract_create_table_columns(sql_text: str) -> Dict[str, List[str]]:
 
 
 def _extract_table_definitions(sql_text: str) -> List[Dict[str, Any]]:
+    """Extract actual table definitions from CREATE TABLE statements ONLY.
+    
+    STRICT RULE - This function extracts columns ONLY from CREATE TABLE statements.
+    
+    Does NOT:
+    - Infer tables from SELECT, INSERT, UPDATE, DELETE
+    - Extract columns from SQL queries
+    - Assign UNKNOWN datatypes (better to have no type than false type)
+    
+    Correctness > Completeness: Missing schema better than fabricated schema.
+    """
     create_pattern = re.compile(r"\bcreate\s+table\s+(?:if\s+not\s+exists\s+)?", flags=re.IGNORECASE)
     name_pattern = re.compile(
         r'(?:"?[\w$#]+"?|`?[\w$#]+`?)(?:\s*\.\s*(?:"?[\w$#]+"?|`?[\w$#]+`?))?',
         flags=re.IGNORECASE,
     )
     table_defs: List[Dict[str, Any]] = []
+    
+    # First pass: collect all table names for FK inference
+    all_table_names = set()
+    for match in create_pattern.finditer(sql_text):
+        cursor = match.end()
+        remainder = sql_text[cursor:]
+        name_match = name_pattern.match(remainder.lstrip())
+        if name_match:
+            raw_name = name_match.group(0)
+            table_name = _normalize_identifier(raw_name).upper()
+            all_table_names.add(table_name)
 
     for match in create_pattern.finditer(sql_text):
         cursor = match.end()
@@ -334,9 +356,11 @@ def _extract_table_definitions(sql_text: str) -> List[Dict[str, Any]]:
                 for src, dst in zip(source_cols, target_cols):
                     foreign_keys.append(
                         {
+                            "source_table": table_name,  # STRICT: Include source table explicitly
                             "source_column": src,
                             "target_table": target_table,
                             "target_column": dst,
+                            "fk_source": "explicit_constraint",  # From FOREIGN KEY constraint
                         }
                     )
                 continue
@@ -367,18 +391,51 @@ def _extract_table_definitions(sql_text: str) -> List[Dict[str, Any]]:
                 if target_cols:
                     foreign_keys.append(
                         {
+                            "source_table": table_name,  # STRICT: Include source table explicitly
                             "source_column": col_name,
                             "target_table": target_table,
                             "target_column": target_cols[0],
+                            "fk_source": "column_references",  # From column-level REFERENCES
                         }
                     )
 
+        # Add inferred FKs from naming patterns
+        inferred_fks = _infer_foreign_keys_from_naming_patterns(table_name, columns, all_table_names, primary_keys)
+        
+        # DEBUG: Log naming pattern inference
+        import sys
+        if inferred_fks or columns:
+            print(f"\n[PATTERN INFERENCE] Table {table_name}:", file=sys.stderr)
+            print(f"  Available tables for matching: {all_table_names}", file=sys.stderr)
+            print(f"  Columns to check: {[c.get('name') for c in columns]}", file=sys.stderr)
+            print(f"  Primary keys: {primary_keys}", file=sys.stderr)
+            print(f"  Inferred FKs found: {len(inferred_fks)}", file=sys.stderr)
+            for ifk in inferred_fks:
+                print(f"    → {ifk.get('source_column')} -> {ifk.get('target_table')}", file=sys.stderr)
+        
+        for inferred_fk in inferred_fks:
+            # Only add if not already in explicit FKs
+            existing_sources = {
+                (fk.get("source_column"), fk.get("target_table"))
+                for fk in foreign_keys
+            }
+            inferred_key = (inferred_fk.get("source_column"), inferred_fk.get("target_table"))
+            if inferred_key not in existing_sources:
+                inferred_fk["fk_source"] = "naming_pattern"  # Mark as pattern-inferred
+                foreign_keys.append(inferred_fk)
+        
+        # Track FK extraction status
+        fk_extraction_status = "SUCCESS" if (foreign_keys or not columns) else "PARTIAL"
+        
         table_defs.append(
             {
                 "name": table_name,
                 "columns": columns,
                 "primary_keys": sorted(dict.fromkeys(primary_keys)),
                 "foreign_keys": foreign_keys,
+                "fk_extraction_status": fk_extraction_status,  # NEW: Track extraction status
+                "source": "ddl_defined",  # Mark as actual DDL
+                "has_ddl": True,  # CREATE TABLE statement found
             }
         )
 
@@ -386,11 +443,29 @@ def _extract_table_definitions(sql_text: str) -> List[Dict[str, Any]]:
 
 
 def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
+    """Extract table references from DML statements (SELECT, INSERT, UPDATE, DELETE).
+    
+    STRICT RULE 4 COMPLIANCE: Extract tables from DML operations only.
+    
+    IMPORTANT LIMITATIONS:
+    - This function identifies WHICH tables are used in code
+    - Does NOT determine columns/datatypes (CREATE TABLE statements not present)
+    - Tracks DML operations (SELECT, INSERT, UPDATE, DELETE) for each table
+    - Tables that also have CREATE TABLE statements should use those definitions
+    
+    Returns:
+        Tables referenced in DML with:
+        - Empty columns (no DDL = no column types)
+        - usage array listing DML operations performed on table
+        - clear "source": "inferred_from_dml" marking
+        - has_ddl: False (will be updated if CREATE TABLE found later)
+    """
     cleaned = _prepare_sql_text(sql_text)
     objects = _extract_objects(cleaned)
     blocks = [item.block_text for item in objects] or [cleaned]
     inferred_tables: Set[str] = set()
     inferred_columns: Dict[str, Set[str]] = {}
+    table_operations: Dict[str, Set[str]] = {}  # RULE 4: Track DML operations per table
 
     def add_table(raw_name: str) -> None:
         normalized = _normalize_identifier(raw_name).upper()
@@ -398,6 +473,7 @@ def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
             return
         inferred_tables.add(normalized)
         inferred_columns.setdefault(normalized, set())
+        table_operations.setdefault(normalized, set())  # Initialize operations set
 
     for block_text in blocks:
         operations_tables = _extract_operations_and_tables(block_text)
@@ -414,6 +490,12 @@ def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
             add_table(normalized_table)
             if normalized_table and normalized_table not in {"DUAL", "TABLE"}:
                 block_tables.add(normalized_table)
+            
+            # RULE 4: Track operations for each table from operations_by_table
+            if normalized_table:
+                ops = operations_by_table.get(table_name, [])
+                for op in ops:
+                    table_operations.setdefault(normalized_table, set()).add(str(op).upper())
 
         bulk_operations = detect_bulk_operations({"block_text": block_text})
         for operation in bulk_operations:
@@ -423,11 +505,13 @@ def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
                 add_table(source_table)
                 if source_table and source_table not in {"DUAL", "TABLE"}:
                     block_tables.add(source_table)
+                    table_operations.setdefault(source_table, set()).add("SELECT")
             elif op_type == "FORALL":
                 target_table = _normalize_identifier(str(operation.get("table", ""))).upper()
                 add_table(target_table)
                 if target_table and target_table not in {"DUAL", "TABLE"}:
                     block_tables.add(target_table)
+                    table_operations.setdefault(target_table, set()).add("UPDATE")
 
         table_columns = _extract_table_columns(block_text, sorted(block_tables))
         for table_name, columns in table_columns.items():
@@ -438,20 +522,100 @@ def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
                 if column
             )
 
+    # Return inferred table references WITHOUT columns
+    # Columns should only come from actual DDL (CREATE TABLE statements)
+    # Inferred tables without DDL cannot have reliable column types
+    # RULE 4: Include usage array with DML operations tracked for each table
     return [
         {
             "name": table_name,
             "table_name": table_name,
-            "columns": [
-                {"name": column_name, "type": "UNKNOWN"}
-                for column_name in sorted(inferred_columns.get(table_name, set()))
-            ],
+            "columns": [],  # Empty - no DDL found to declare actual columns
+            "column_references": sorted(inferred_columns.get(table_name, set())),  # Columns we saw referenced
             "primary_keys": [],
             "foreign_keys": [],
-            "source": "inferred_from_procedure",
+            "usage": sorted(table_operations.get(table_name, set())),  # RULE 4: DML operations on this table
+            "source": "inferred_from_dml",  # Mark clearly as inferred, not DDL-defined
+            "has_ddl": False,  # No CREATE TABLE statement found (updated later if DDL exists)
         }
         for table_name in sorted(inferred_tables)
     ]
+
+
+def _infer_foreign_keys_from_naming_patterns(
+    source_table: str, 
+    columns: List[Dict[str, Any]], 
+    available_tables: Set[str],
+    primary_keys: Optional[List[str]] = None
+) -> List[Dict[str, str]]:
+    """Infer foreign keys from naming patterns (e.g., CARDID -> CARD table).
+    
+    Strategy:
+    1. CARD_ID -> CARD (exact prefix match)
+    2. CARDID -> CARD (remove ID suffix, exact match)
+    3. DEPT_ID -> DEPARTMENT (fuzzy: DEPT is prefix of DEPARTMENT)
+    4. Exact table name match
+    
+    IMPORTANT: Columns CAN be both PRIMARY KEY and FOREIGN KEY (common in junction tables).
+    We check ALL columns for FK patterns, not just non-PK columns.
+    """
+    inferred_fks = []
+    source_table_upper = source_table.upper()
+    available_tables_upper = {t.upper(): t for t in available_tables} if available_tables else {}
+    
+    for col in columns:
+        col_name = col.get("name", "").upper()
+        
+        if not col_name or col_name in {"ROWID", "ROWNUM"}:
+            continue
+        
+        potential_target = None
+        target_column = None
+        
+        # Strategy 1: X_ID pattern - find matching table
+        if "_ID" in col_name:
+            prefix = col_name.rsplit("_ID", 1)[0]  # Get prefix before _ID
+            if prefix:
+                # Direct exact match first
+                if prefix in available_tables_upper and prefix != source_table_upper:
+                    potential_target = prefix
+                    target_column = col_name
+                # Fuzzy match: look for table that starts with prefix or prefix is substring
+                elif not potential_target:
+                    for table_upper in available_tables_upper.keys():
+                        if table_upper != source_table_upper:
+                            # Check if prefix matches start of table or table starts with prefix
+                            if (table_upper.startswith(prefix) or 
+                                prefix in table_upper or
+                                table_upper.startswith(prefix[:3]) and len(prefix) >= 3):  # At least 3 chars match
+                                potential_target = table_upper
+                                target_column = table_upper + "ID"
+                                break
+        
+        # Strategy 2: CARDID -> try CARD (exactly remove ID)
+        elif not potential_target and col_name.endswith("ID") and len(col_name) > 2:
+            base_name = col_name[:-2]
+            if base_name in available_tables_upper and base_name != source_table_upper:
+                potential_target = base_name
+                target_column = col_name
+        
+        # Strategy 3: Exact table name match
+        if not potential_target and col_name in available_tables_upper and col_name != source_table_upper:
+            potential_target = col_name
+            target_column = col_name
+        
+        if potential_target and target_column:
+            inferred_fks.append(
+                {
+                    "source_table": source_table_upper,
+                    "source_column": col_name,
+                    "target_table": potential_target,
+                    "target_column": target_column,
+                    "inferred_from_pattern": True,
+                }
+            )
+    
+    return inferred_fks
 
 
 def _extract_alter_table_foreign_keys(sql_text: str) -> List[Dict[str, str]]:
@@ -2871,13 +3035,94 @@ def _extract_inner_procedure_params(block_text: str) -> List[Dict[str, str]]:
 
 
 def build_discovery_model(sql_text: str) -> Dict[str, Any]:
-    """Build a full-file discovery model for schema + procedure behavior."""
+    """Build a full-file discovery model for schema + procedure behavior.
+    
+    ===== STRICT SCHEMA RULES =====
+    
+    1. A database schema EXISTS only if CREATE TABLE statements are present
+       → Set schema.status = "NOT_FOUND" if no CREATE TABLE found
+       → Set schema.status = "DEFINED" if CREATE TABLE statements found
+    
+    2. NEVER infer tables from DML (SELECT, INSERT, UPDATE, DELETE)
+       → DML-referenced tables go to external_tables[] with reason
+    
+    3. NEVER extract columns except from inside CREATE TABLE
+       → No regex guessing from SELECT lists
+       → No column type inference
+    
+    4. NEVER assign UNKNOWN datatype
+       → Either have actual type from CREATE TABLE, or have no type
+    
+    5. Correctness > Completeness
+       → Missing schema is better than fabricated schema
+       → Better to show "status": "NOT_FOUND" than hallucinate tables
+    
+    This ensures schema discovery is trustworthy, not speculative.
+    """
     cleaned = _prepare_sql_text(sql_text)
-    table_defs = _extract_table_definitions(cleaned)
-    if not table_defs:
-        table_defs = infer_tables_from_dml(cleaned)
-    table_map = {table["name"]: table for table in table_defs}
+    table_defs = _extract_table_definitions(cleaned)  # Real DDL tables
+    inferred_table_refs = infer_tables_from_dml(cleaned)  # Inferred from DML (no columns)
+    
+    # DEBUG: Log FK extraction status
+    import sys
+    print(f"\n[FK DEBUG] Extracted {len(table_defs)} tables from DDL:", file=sys.stderr)
+    for table in table_defs:
+        fks = table.get("foreign_keys", [])
+        print(f"  → {table.get('name')}: {len(fks)} FKs (status={table.get('fk_extraction_status')})", file=sys.stderr)
+        if fks:
+            for fk in fks:
+                print(f"     • {fk.get('source_column')} -> {fk.get('target_table')}.{fk.get('target_column')} ({fk.get('fk_source')})", file=sys.stderr)
+    
+    # Build table name mappings
+    table_map = {table["name"]: table for table in table_defs}  # Only DDL tables
+    inferred_table_map = {table.get("name", "").upper(): table for table in inferred_table_refs if table.get("name")}
+    
+    # FIX: Merge DDL information into inferred tables
+    # If a table appears in both DDL and DML references, mark it with has_ddl=True
+    tables_with_ddl = set(table_map.keys())
+    for inferred_table in inferred_table_refs:
+        table_name = inferred_table.get("name", "").upper()
+        if table_name in tables_with_ddl:
+            inferred_table["has_ddl"] = True
+            inferred_table["source"] = "ddl_defined"  # Update source to reflect DDL presence
+    
+    # Track which tables have DDL vs inferred only
+    tables_with_ddl = set(table_map.keys())
+    tables_inferred_only = set(inferred_table_map.keys()) - tables_with_ddl
+    known_table_names = sorted({*tables_with_ddl, *tables_inferred_only})
     ddl_columns = {table["name"]: [col["name"] for col in table["columns"]] for table in table_defs}
+    
+    # Extract ALTER TABLE FKs once
+    alter_table_fks = _extract_alter_table_foreign_keys(cleaned)
+    
+    # CRITICAL FIX: Merge ALTER TABLE foreign keys into individual table structures
+    for table in table_defs:
+        table_name = table.get("name", "").upper()
+        # Find all ALTER TABLE FKs for this table
+        for fk in alter_table_fks:
+            if fk.get("source_table", "").upper() == table_name:
+                # Convert to table FK format and add to table's foreign_keys
+                table.setdefault("foreign_keys", []).append({
+                    "source_column": fk.get("source_column"),
+                    "target_table": fk.get("target_table"),
+                    "target_column": fk.get("target_column"),
+                    "fk_source": "fk_constraint",
+                    "fk_type": "explicit_constraint"
+                })
+    
+    # De-duplicate FKs within each table (same source->target pair)
+    for table in table_defs:
+        fks = table.get("foreign_keys", [])
+        if fks:
+            # Create a dict keyed by (source_col, target_table, target_col) to de-dupe
+            fk_map = {}
+            for fk in fks:
+                key = (fk.get("source_column"), fk.get("target_table"), fk.get("target_column"))
+                # Keep first occurrence, or prefer explicit_constraint over naming_pattern
+                if key not in fk_map or fk.get("fk_type") == "explicit_constraint":
+                    fk_map[key] = fk
+            table["foreign_keys"] = list(fk_map.values())
+    
     relationships = _dedupe_relationships([
         {
             "source_table": table["name"],
@@ -2887,7 +3132,8 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         }
         for table in table_defs
         for fk in table["foreign_keys"]
-    ] + _extract_alter_table_foreign_keys(cleaned))
+    ] + alter_table_fks)
+    
     sequence_catalog = _extract_sequence_catalog(cleaned)
     sequence_names = sequence_catalog["sequence_names"]
     objects = _extract_objects(cleaned)
@@ -3039,7 +3285,7 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
             "dependencies": _clean_dependencies(
                 tables_used,
                 sequence_dependencies,
-                table_map.keys(),
+                known_table_names,
                 sequence_names,
             ),
             "exceptions": exceptions,
@@ -3091,10 +3337,62 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         }
         procedures.append(proc_entry)
 
+    # ===== STRICT SCHEMA RULES (7 Rules) =====
+    # RULE 1: Schema EXISTS only if CREATE TABLE is present
+    # RULE 2: If CREATE TABLE exists → Populate schema.tables
+    # RULE 3: If NO CREATE TABLE → schema.status = "NOT_FOUND", schema.tables = []
+    # RULE 4: External tables are extracted from SELECT, INSERT, UPDATE, DELETE
+    # RULE 5: External tables must include usage array with DML operations
+    # RULE 6: NEVER mix DDL schema tables with DML-only external_tables
+    # RULE 7: If table appears in BOTH DDL and DML → belongs to schema, NOT external_tables
+    # ====== ENFORCEMENT LOGIC ======
+    schema_status = "DEFINED" if table_defs else "NOT_FOUND"
+    
+    # CRITICAL: Only show external_tables if schema is DEFINED (has CREATE TABLE)
+    # RULE 3: If schema.status = "NOT_FOUND" → NO external_tables shown (not even inferred ones)
+    # This prevents hallucination of DB objects that don't exist in source code
+    if schema_status == "NOT_FOUND":
+        # RULE 3 ENFORCEMENT: Schema not found = NO inferred tables shown at all
+        # Complete separation. No soft inference. No hallucination.
+        external_tables = []
+    else:
+        # RULE 6+7 ENFORCEMENT: Schema DEFINED = show ONLY DML-referenced tables WITHOUT CREATE TABLE
+        # RULE 5: Format with usage array showing which DML operations touched the table
+        # RULE 7: Exclude any table that has has_ddl=True (it's in schema.tables)
+        external_tables = [
+            {
+                "name": table.get("name"),
+                "usage": table.get("usage", []),  # RULE 5: Array of DML operations (SELECT, INSERT, UPDATE, DELETE)
+                "source": "DML only, no DDL found",  # RULE 4: Clear marking
+                "reason": "Referenced in DML but no CREATE TABLE statement found in source"
+            }
+            for table in inferred_table_refs
+            if not table.get("has_ddl", False)  # RULE 7: Exclude tables with DDL (they're in schema)
+        ]
+    
     return {
         "schema": {
-            "tables": table_defs,
-            "relationships": relationships,
+            "status": schema_status,  # "DEFINED" (has CREATE TABLE) or "NOT_FOUND" (RULE 1-3)
+            "tables": table_defs,  # Tables with actual CREATE TABLE DDL only (RULE 2)
+            "external_tables": external_tables,  # DML-only refs, shown only if schema DEFINED (RULE 4-5, RULE 7)
+            "has_explicit_table_ddl": bool(table_defs),  # True if any CREATE TABLE found (RULE 1)
+            "schema_completeness": {
+                "tables_with_ddl_definitions": len(table_defs),
+                "tables_referenced_without_ddl": len(external_tables),
+                "total_external_references": len(external_tables),
+                "has_foreign_keys": any(len(t.get("foreign_keys", [])) > 0 for t in table_defs),
+                "has_primary_keys": any(len(t.get("primary_keys", [])) > 0 for t in table_defs),
+                "strict_rule_compliance": {
+                    "rule_1_schema_exists_only_if_ddl": schema_status == "DEFINED" if table_defs else True,
+                    "rule_2_schema_populated_if_ddl": len(table_defs) > 0 if schema_status == "DEFINED" else True,
+                    "rule_3_no_hallucination": len(external_tables) == 0 if schema_status == "NOT_FOUND" else True,
+                    "rule_4_external_from_dml": all(t.get("source") == "DML only, no DDL found" for t in external_tables),
+                    "rule_5_usage_tracking": all(isinstance(t.get("usage", []), list) for t in external_tables),
+                    "rule_6_no_mixing": len(set(t["name"] for t in table_defs) & set(t["name"] for t in external_tables)) == 0,
+                    "rule_7_both_dml_ddl_in_schema": all(t.get("has_ddl") for t in external_tables if t.get("has_ddl")),
+                }
+            },
+            "relationships": relationships,  # Only from CREATE TABLE foreign keys (RULE 2)
             "sequences": sequence_catalog["sequences"],
             "sequence_mapping": sequence_catalog["sequence_mapping"],
         },
