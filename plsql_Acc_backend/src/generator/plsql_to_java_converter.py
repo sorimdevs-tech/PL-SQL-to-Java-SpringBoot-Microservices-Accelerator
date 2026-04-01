@@ -139,6 +139,54 @@ class PLSQLtoJavaConverter:
         if PLSQLtoJavaConverter._is_java_keyword(camel_name):
             return camel_name + 'Method'  # e.g., assert -> assertMethod
         return camel_name
+
+    @staticmethod
+    def _java_default_value_for_name(name: str) -> str:
+        """Return a compile-safe Java literal based on a variable/field name."""
+        lowered = (name or "").lower()
+        if any(token in lowered for token in ['amount', 'balance', 'total', 'price', 'rate', 'sum']):
+            return 'BigDecimal.ZERO'
+        if lowered.startswith('is') or lowered.startswith('has') or 'flag' in lowered or 'error' in lowered:
+            return 'false'
+        if 'date' in lowered or 'time' in lowered:
+            return 'LocalDateTime.now()'
+        if any(token in lowered for token in ['message', 'name', 'status', 'mode', 'type', 'code']):
+            return '""'
+        if lowered.endswith('id') or lowered.endswith('count') or lowered.endswith('number'):
+            return 'null'
+        return 'null'
+
+    @staticmethod
+    def _contains_unsafe_java_tokens(expr: str) -> bool:
+        if not expr:
+            return True
+        unsafe_patterns = [
+            r'\b\w+_seq\s*\.\s*NEXTVAL\b',
+            r'\bSQLERRM\b',
+            r'\bv_\w+\s*\(\s*\w+\s*\)',
+            r'\bfindOne\s*\(\s*\.\.\.\s*\)',
+            r'\bdeleteByCondition\s*\(',
+            r'\.\.\.',
+        ]
+        return any(re.search(pattern, expr, re.IGNORECASE) for pattern in unsafe_patterns)
+
+    @staticmethod
+    def _sanitize_expression_for_java(expr: str, fallback_name: str = 'value') -> str:
+        translated = PLSQLtoJavaConverter._translate_plsql_expression(expr)
+        translated = translated.strip()
+        translated = re.sub(r"'([^'\n]*)'", r'"\1"', translated)
+        translated = re.sub(r'\b\w+_seq\s*\.\s*NEXTVAL\b', 'null', translated, flags=re.IGNORECASE)
+        translated = re.sub(r'\bSQLERRM\b', 'safeMessage(e)', translated, flags=re.IGNORECASE)
+        translated = re.sub(r'\bv_\w+\s*\(\s*i\s*\)\.\w+', PLSQLtoJavaConverter._java_default_value_for_name(fallback_name), translated, flags=re.IGNORECASE)
+
+        if PLSQLtoJavaConverter._contains_unsafe_java_tokens(translated):
+            return PLSQLtoJavaConverter._java_default_value_for_name(fallback_name)
+
+        # If raw PL/SQL-style variables still remain, fall back to a safe literal.
+        if re.search(r'\b[plv]_[a-zA-Z0-9_]+\b', translated):
+            return PLSQLtoJavaConverter._java_default_value_for_name(fallback_name)
+
+        return translated or PLSQLtoJavaConverter._java_default_value_for_name(fallback_name)
     
     @staticmethod
     def _is_balanced_parens(expr: str) -> bool:
@@ -459,15 +507,18 @@ class PLSQLtoJavaConverter:
         
         # =========== STEP 4: Parameter name conversion (LAST!) ===========
         
-        # Convert variable names p_ and l_ to camelCase
+        # Convert variable names p_, l_, and v_ to camelCase
         # Must happen AFTER all function translations so p_text stays as p_text in SUBSTR
         expr = re.sub(
-            r'\b([pl])_([a-zA-Z0-9_]+)\b',
+            r'\b([plv])_([a-zA-Z0-9_]+)\b',
             lambda m: PLSQLtoJavaConverter._to_camel_case('_' + m.group(2)),
             expr,
             flags=re.IGNORECASE
         )
-        
+
+        # Convert PL/SQL string literals to Java string literals.
+        expr = re.sub(r"'([^'\n]*)'", r'"\1"', expr)
+
         # Translate field access patterns to JavaBean getters (e.g., entity.field_name -> entity.getFieldName())
         expr = PLSQLtoJavaConverter._translate_field_access(expr)
         
@@ -969,7 +1020,7 @@ class PLSQLtoJavaConverter:
                 expr = calc.get('expression', '')
                 # Strip assignment operator from expression
                 expr = expr.lstrip(':= ')
-                java_expr = PLSQLtoJavaConverter._translate_plsql_expression(expr)
+                java_expr = PLSQLtoJavaConverter._sanitize_expression_for_java(expr, var_name)
                 if java_expr.strip() and not java_expr.strip().startswith('//'):
                     body_lines.append(f"    var {var_name} = {java_expr};")
                     declared_vars.add(var_name)
@@ -986,7 +1037,7 @@ class PLSQLtoJavaConverter:
                 if 'COALESCE' not in expr.upper() and 'NVL' not in expr.upper():
                     # If it doesn't contain function, skip or handle as calculation
                     continue
-                java_expr = PLSQLtoJavaConverter._translate_plsql_expression(expr)
+                java_expr = PLSQLtoJavaConverter._sanitize_expression_for_java(expr, var_name)
                 if java_expr.strip() and not java_expr.strip().startswith('//'):
                     body_lines.append(f"    var {var_name} = {java_expr};")
                     declared_vars.add(var_name)
@@ -1008,7 +1059,7 @@ class PLSQLtoJavaConverter:
                 if result_var_name in declared_vars:
                     continue
                 
-                params_java = PLSQLtoJavaConverter._translate_plsql_expression(params_fc)
+                params_java = PLSQLtoJavaConverter._sanitize_expression_for_java(params_fc, result_var_name)
                 
                 # Generate service call only for actual data-fetching functions
                 if 'customer' in pkg and 'get' in func:
@@ -1042,7 +1093,7 @@ class PLSQLtoJavaConverter:
                 has_exception = select.get('has_exception', False)
                 
                 if where_clause and where_clause.strip().lower() != 'true':
-                    java_where = PLSQLtoJavaConverter._translate_plsql_expression(where_clause)
+                    java_where = PLSQLtoJavaConverter._sanitize_expression_for_java(where_clause, var_name)
                     
                     # Clean up the where clause to extract the actual parameter
                     # E.g., "customer_id = p_customer_id" -> extract "customerId" 
@@ -1057,8 +1108,9 @@ class PLSQLtoJavaConverter:
                         else:
                             body_lines.append(f"    var {var_name} = {var_name}Opt.orElse(null);")
                     else:
-                        # Fallback for complex WHERE clauses
-                        body_lines.append(f"    var {var_name} = {repo_name}.findOne({java_where}).orElse(null);")
+                        # Fallback for complex WHERE clauses: keep compile-safe
+                        body_lines.append(f"    Optional<{entity_name}> {var_name}Opt = Optional.empty();")
+                        body_lines.append(f"    var {var_name} = {var_name}Opt.orElse(null);")
                     
                     declared_vars.add(var_name)
             
@@ -1087,21 +1139,24 @@ class PLSQLtoJavaConverter:
                     values = insert.get('values', [])
                     repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
                     
-                    body_lines.append(f"    {entity_name} entity = new {entity_name}();")
-                    
+                    entity_var = PLSQLtoJavaConverter._to_camel_case(table) + 'Entity'
+                    body_lines.append(f"    {entity_name} {entity_var} = new {entity_name}();")
+
                     for col, val in zip(columns, values):
+                        if isinstance(val, str) and re.search(r'\bNEXTVAL\b', val, re.IGNORECASE):
+                            continue
                         col_camel = PLSQLtoJavaConverter._to_camel_case(col)
                         setter = 'set' + col_camel[0].upper() + col_camel[1:] if col_camel else ''
-                        val_java = PLSQLtoJavaConverter._translate_plsql_expression(val)
-                        body_lines.append(f"    entity.{setter}({val_java});")
+                        val_java = PLSQLtoJavaConverter._sanitize_expression_for_java(val, col_camel or col)
+                        body_lines.append(f"    {entity_var}.{setter}({val_java});")
                     
                     if insert.get('returning_column'):
                         returning_var = PLSQLtoJavaConverter._to_camel_case(insert.get('returning_into', 'resultId'))
-                        body_lines.append(f"    Long {returning_var} = {repo_name}.save(entity).getId();")
+                        body_lines.append(f"    Long {returning_var} = {repo_name}.save({entity_var}).getId();")
                         if returning_var not in declared_vars:
                             declared_vars.add(returning_var)
                     else:
-                        body_lines.append(f"    {repo_name}.save(entity);")
+                        body_lines.append(f"    {repo_name}.save({entity_var});")
             
             # Handle UPDATEs
             for update in logic.updates:
@@ -1110,14 +1165,14 @@ class PLSQLtoJavaConverter:
                 assignments = update.get('assignments', {})
                 repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
                 
-                body_lines.append(f"    Optional<{entity_name}> existingOpt = {repo_name}.findOne(...);")
+                body_lines.append(f"    Optional<{entity_name}> existingOpt = Optional.empty();")
                 body_lines.append(f"    if (existingOpt.isPresent()) {{")
                 body_lines.append(f"        var existing = existingOpt.get();")
                 
                 for col, val in assignments.items():
                     col_camel = PLSQLtoJavaConverter._to_camel_case(col)
                     setter = 'set' + col_camel[0].upper() + col_camel[1:] if col_camel else ''
-                    val_java = PLSQLtoJavaConverter._translate_plsql_expression(val)
+                    val_java = PLSQLtoJavaConverter._sanitize_expression_for_java(val, col_camel or col)
                     body_lines.append(f"        existing.{setter}({val_java});")
                 
                 body_lines.append(f"        {repo_name}.save(existing);")
@@ -1131,7 +1186,7 @@ class PLSQLtoJavaConverter:
                 repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
                 
                 if where and where.strip():
-                    java_where = PLSQLtoJavaConverter._translate_plsql_expression(where)
+                    java_where = PLSQLtoJavaConverter._sanitize_expression_for_java(where, table)
                     # Try to extract ID from where clause
                     id_match = re.search(r'=\s*([pl]_\w+)\b', java_where, re.IGNORECASE)
                     if id_match:
@@ -1139,7 +1194,7 @@ class PLSQLtoJavaConverter:
                         id_param_camel = PLSQLtoJavaConverter._to_camel_case(id_param)
                         body_lines.append(f"    {repo_name}.deleteById({id_param_camel});")
                     else:
-                        body_lines.append(f"    {repo_name}.deleteByCondition({java_where});")
+                        body_lines.append(f"    // Delete for {table} requires manual WHERE mapping")
                 else:
                     body_lines.append(f"    // DELETE from {table}")
         

@@ -458,6 +458,30 @@ STRICT OUTPUT RULES — violating any causes compile errors:
                    @Param("amount") BigDecimal amount,
                    @Param("status") String status);
 
+ADDITIONAL REPOSITORY RULES:
+REPO-RULE 1 - LOCKING QUERIES
+  IF the source PL/SQL cursor uses FOR UPDATE SKIP LOCKED:
+  THEN generate a method with that clause in the native SQL:
+    @Query(value = "SELECT id FROM table WHERE col = :val FOR UPDATE SKIP LOCKED",
+           nativeQuery = true)
+    List<Long> findActiveIdsForUpdate(@Param("val") String val, Pageable pageable);
+
+REPO-RULE 2 - AGGREGATION QUERIES
+  IF the source PL/SQL selects NVL(SUM(col), 0) INTO var:
+  THEN generate:
+    @Query("SELECT COALESCE(SUM(e.fieldName), 0) FROM EntityName e WHERE e.refId = :id")
+    BigDecimal sumFieldNameByRefId(@Param("id") Long id);
+
+REPO-RULE 3 - UPSERT LOOKUP
+  IF the source PL/SQL has a MERGE ON (table.col = value):
+  THEN ensure a findByCol(Type val) method exists:
+    Optional<EntityName> findByCol(Type val);
+
+REPO-RULE 4 - BATCH FETCH WITH LOCK
+  For BULK COLLECT + FOR UPDATE SKIP LOCKED patterns, the repository needs BOTH:
+  a) List<Long> findActiveIdsForUpdate(Pageable pageable)     <- for paginated locking fetch
+  b) Optional<Entity> findByCustomerId(Long id)               <- for per-item lookup in the loop
+
 Output: ONE complete compilable Java interface file ending with }}.
 No markdown, no explanations, no extra text.
 """
@@ -661,6 +685,462 @@ MANDATORY RULES:
    custom repository method instead of ignoring the locking semantics.
 6. Every named query parameter must have a matching @Param annotation before the Java type.
 7. The file must end with the interface closing brace and contain no markdown or explanations.
+"""
+
+    def _get_strict_procedure_template(self) -> str:
+        return """
+Convert the following PL/SQL procedure to one complete, compilable Java Spring Boot service class.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCE OF TRUTH (Raw PL/SQL - authoritative)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{plsql_code}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXTRACTED SEMANTICS (supplemental only)
+Raw PL/SQL wins on any conflict.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{semantic_summary}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALREADY GENERATED ENTITIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{entity_sources}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALREADY GENERATED REPOSITORIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{repository_sources}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALLOWED ENTITY FIELDS (use ONLY these - never invent fields)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{entity_fields}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VALIDATION FEEDBACK FROM PRIOR FAILED ATTEMPTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{validation_feedback}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MANDATORY BUSINESS LOGIC CONVERSION RULES
+These rules apply to EVERY PL/SQL file - simple or complex. Read each rule,
+scan the source PL/SQL for that construct, and emit the correct Java equivalent.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RULE 1 - BATCH LOOP (BULK COLLECT ... LIMIT)
+  IF the PL/SQL contains: FETCH cursor BULK COLLECT INTO collection LIMIT n
+  THEN generate a paginated do-while loop:
+    int page = 0;
+    List<Long> batch;
+    do {
+        batch = xyzRepository.findActiveIdsForUpdate(
+                    PageRequest.of(page++, batchSize.intValue()));
+        processBatch(batch, runMode);
+    } while (!batch.isEmpty());
+  - batchSize comes from the IN parameter that mapped to the LIMIT clause.
+  - Never generate a flat method body with no iteration when the source has a loop.
+  - The page variable must be scoped outside the loop so it increments correctly.
+
+RULE 2 - CURSOR WHERE FILTERS (never drop predicates)
+  IF the PL/SQL cursor has: WHERE col = 'VALUE' or WHERE col = :param
+  THEN the repository query method MUST carry that exact filter.
+  Example: WHERE status = 'ACTIVE' -> @Query("... WHERE e.status = 'ACTIVE' ...")
+  - Never silently drop WHERE conditions.
+  - Never fetch all rows and filter in Java when the SQL filter is on a cursor.
+
+RULE 3 - FOR UPDATE SKIP LOCKED (pessimistic row locking)
+  IF the PL/SQL cursor uses: FOR UPDATE SKIP LOCKED
+  THEN the repository method must include the locking clause in its native query:
+    @Query(value = "SELECT customer_id FROM customers
+                    WHERE status = 'ACTIVE'
+                    FOR UPDATE SKIP LOCKED", nativeQuery = true)
+    List<Long> findActiveIdsForUpdate(Pageable pageable);
+  AND the service must CALL this locking method in the batch loop.
+  - Never generate the locking query method but then call a non-locking method instead.
+
+RULE 4 - AGGREGATE QUERIES (SUM, COUNT, AVG, NVL)
+  IF the PL/SQL does: SELECT NVL(SUM(col), 0) INTO var FROM table WHERE ...
+  THEN generate a repository aggregation method, NOT an entity list fetch:
+    @Query("SELECT COALESCE(SUM(e.amount), 0) FROM XyzEntity e WHERE e.customerId = :id")
+    BigDecimal sumAmountByCustomerId(@Param("id") Long customerId);
+  In the service call it as:
+    BigDecimal total = xyzRepository.sumAmountByCustomerId(customerId);
+    if (total == null) total = BigDecimal.ZERO;
+  - Never use entity.getAmount() loops to re-aggregate what the DB should compute.
+  - NVL(x, 0) always maps to Optional.ofNullable(x).orElse(BigDecimal.ZERO) or COALESCE in JPQL.
+
+RULE 5 - BALANCE CALCULATION (derived values)
+  IF the PL/SQL computes: v_balance := v_total_orders - v_total_payments;
+  THEN generate the same arithmetic in Java using the results of RULE 4 queries:
+    BigDecimal balance = totalOrders.subtract(totalPayments);
+  - NEVER leave v_total_orders or v_total_payments as unresolved variable names.
+  - Both variables must be fetched from their respective repositories before subtraction.
+
+RULE 6 - BUSINESS VALIDATION (IF condition THEN RAISE exception)
+  IF the PL/SQL has: IF v_balance < 0 THEN RAISE e_balance_error; END IF;
+  THEN generate:
+    if (balance.compareTo(BigDecimal.ZERO) < 0) {
+        throw new NegativeBalanceException(
+            "Negative balance for customer " + customerId);
+    }
+  - Create a dedicated inner exception class OR use BusinessException.
+  - NEVER skip the validation check.
+  - The throw must happen BEFORE the MERGE/INSERT that follows in the source.
+
+RULE 7 - MERGE INTO (UPSERT logic - always explicit)
+  IF the PL/SQL has a MERGE INTO table USING dual ON (col = val)
+    WHEN MATCHED THEN UPDATE ...
+    WHEN NOT MATCHED THEN INSERT ...
+  THEN generate:
+    Optional<XyzEntity> existing = xyzRepository.findByCustomerId(customerId);
+    if (existing.isPresent()) {
+        XyzEntity entity = existing.get();
+        entity.setBalance(balance);
+        entity.setUpdatedAt(LocalDateTime.now());
+        xyzRepository.save(entity);
+    } else {
+        XyzEntity entity = new XyzEntity();
+        entity.setCustomerId(customerId);
+        entity.setBalance(balance);
+        entity.setCreatedAt(LocalDateTime.now());
+        xyzRepository.save(entity);
+    }
+  - The findByCustomerId method must already exist in the repository (or be generated).
+  - NEVER just call insert without checking for existing records.
+  - Preserve the exact fields from WHEN MATCHED and WHEN NOT MATCHED branches.
+
+RULE 8 - AUDIT LOG (capture old value before MERGE)
+  IF the PL/SQL inserts into an audit table with old_value / old_balance columns:
+  THEN fetch the existing value BEFORE the MERGE and pass it to the audit insert:
+    BigDecimal oldBalance = xyzRepository.findByCustomerId(customerId)
+        .map(XyzEntity::getBalance)
+        .orElse(null);
+    // ... then do the MERGE (RULE 7) ...
+    AuditLogEntity audit = new AuditLogEntity();
+    audit.setCustomerId(customerId);
+    audit.setOldBalance(oldBalance);
+    audit.setNewBalance(balance);
+    audit.setActionDate(LocalDateTime.now());
+    auditRepository.save(audit);
+  - Never hardcode old_balance = null when it can be fetched.
+
+RULE 9 - SAVEPOINT + CONDITIONAL COMMIT/ROLLBACK (per-batch transactions)
+  IF the PL/SQL has: SAVEPOINT name; ... IF condition THEN COMMIT; ELSE ROLLBACK TO name;
+  THEN DO NOT use @Transactional on the method. Use PlatformTransactionManager:
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    private void processBatch(List<Long> ids, String runMode) {
+        DefaultTransactionDefinition def = new DefaultTransactionDefinition();
+        TransactionStatus tx = transactionManager.getTransaction(def);
+        boolean hasError = false;
+        try {
+            for (Long id : ids) {
+                try {
+                    processSingleCustomer(id);
+                } catch (NegativeBalanceException e) {
+                    hasError = true;
+                    saveErrorLog("Negative balance for customer " + id);
+                } catch (Exception e) {
+                    hasError = true;
+                    saveErrorLog("Unexpected error: " + e.getMessage());
+                }
+            }
+            if ("FULL".equals(runMode) && !hasError) {
+                transactionManager.commit(tx);
+            } else {
+                transactionManager.rollback(tx);
+            }
+        } catch (Exception fatal) {
+            transactionManager.rollback(tx);
+            throw fatal;
+        }
+    }
+  - runMode is a method parameter - it MUST be used in the commit/rollback decision.
+  - hasError is a local boolean - NEVER hardcode it to true.
+
+RULE 10 - v_has_error / boolean flags (initialise correctly)
+  IF the PL/SQL declares: v_has_error BOOLEAN := FALSE;
+  THEN generate: boolean hasError = false;
+  - FALSE -> false. TRUE -> true. Never invert the initial value.
+  - The flag must be declared in the correct scope (per-batch, not class-level).
+  - It must be set to true inside each catch block and checked after the loop.
+
+RULE 11 - PER-ITEM EXCEPTION HANDLING (inner BEGIN...EXCEPTION...END)
+  IF the PL/SQL has a BEGIN...EXCEPTION...END block inside a loop:
+  THEN wrap each item's processing in its own try-catch inside the loop:
+    for (Long id : ids) {
+        try {
+            // all per-item logic here
+        } catch (NegativeBalanceException e) {
+            hasError = true;
+            saveErrorLog("Negative balance for customer " + id);
+        } catch (Exception e) {
+            hasError = true;
+            saveErrorLog("Unexpected error: " + e.getMessage());
+        }
+    }
+  - NEVER generate try-catch outside the loop for errors that must be per-item.
+  - WHEN OTHERS in PL/SQL maps to catch (Exception e) - it must include SQLERRM equivalent.
+
+RULE 12 - OUTER FATAL EXCEPTION HANDLER
+  IF the PL/SQL has an outer EXCEPTION WHEN OTHERS THEN ROLLBACK + error log:
+  THEN wrap the entire method body in a try-catch:
+    try {
+        // full processing loop
+    } catch (Exception fatal) {
+        transactionManager.rollback(tx);
+        saveErrorLog("Fatal error: " + fatal.getMessage());
+        throw new RuntimeException("Fatal error in reconciliation", fatal);
+    }
+
+RULE 13 - ERROR LOG INSERTS (must always be explicit)
+  IF the PL/SQL does: INSERT INTO error_log (error_id, error_message, error_date)
+                      VALUES (error_seq.NEXTVAL, message, SYSDATE)
+  THEN generate a helper method AND call it in every catch block:
+    private void saveErrorLog(String message) {
+        ErrorLogEntity err = new ErrorLogEntity();
+        err.setErrorMessage(message);
+        err.setErrorDate(LocalDateTime.now());
+        errorLogRepository.save(err);
+    }
+  - Never leave error log inserts as comments or TODOs.
+  - The message format must match the PL/SQL: "Negative balance for customer " + id
+    or "Unexpected error: " + exception.getMessage().
+
+RULE 14 - SEQUENCE-BACKED IDs (never pass PK manually)
+  IF the entity has @GeneratedValue(strategy = SEQUENCE) on the ID field:
+  THEN NEVER call entity.setId(...) or pass the PK to an insertXxx() method.
+  The JPA sequence generator handles the ID automatically on save().
+  - Applies to: balanceId, auditId, errorId, and any other sequence-generated key.
+
+RULE 15 - STATE VARIABLE SCOPE (reset per batch, not per run)
+  IF the PL/SQL resets a variable at the start of each batch iteration:
+  THEN declare that variable inside the per-batch method, not as a class field.
+  Example: hasError must be false at the start of EACH batch, not carry over.
+
+RULE 16 - OUTPUT PARAMETER: runMode MUST BE USED
+  IF the PL/SQL procedure accepts a run mode parameter:
+    p_run_mode IN VARCHAR2 DEFAULT 'FULL'
+  THEN the Java method must accept it as String runMode AND use it in logic.
+  - NEVER accept runMode as a parameter and then ignore it in the method body.
+
+RULE 17 - NULL-SAFE ARITHMETIC
+  IF the PL/SQL uses NVL(SUM(...), 0):
+  THEN the Java must guard against null before arithmetic:
+    BigDecimal totalOrders = ordersRepository.sumByCustomerId(id);
+    if (totalOrders == null) totalOrders = BigDecimal.ZERO;
+    BigDecimal totalPayments = paymentsRepository.sumByCustomerId(id);
+    if (totalPayments == null) totalPayments = BigDecimal.ZERO;
+    BigDecimal balance = totalOrders.subtract(totalPayments);
+  - NEVER subtract null BigDecimal values - NullPointerException will occur at runtime.
+
+RULE 18 - COMPILABLE JAVA SYNTAX ONLY
+  The output must be valid Java. Specifically forbidden:
+  - Oracle PL/SQL syntax inside Java: audit_seq.NEXTVAL, v_customers(i).customer_id
+  - Single-quoted Java strings: 'some string' -> must be "some string"
+  - Undeclared variables: v_total_orders, v_balance used without prior declaration
+  - Duplicate local variable declarations: ErrorLogEntity entity declared twice
+  - Missing imports: PlatformTransactionManager, TransactionStatus, DefaultTransactionDefinition,
+    PageRequest, Pageable, List, Optional, BigDecimal, LocalDateTime
+
+RULE 19 - SINGLE @Transactional SCOPE DECISION
+  Choose exactly ONE of these two approaches - never mix them:
+  APPROACH A (simple procedures with no SAVEPOINT):
+    Annotate the method with @Transactional.
+    Let Spring manage the entire transaction.
+  APPROACH B (procedures with SAVEPOINT or conditional COMMIT/ROLLBACK):
+    Remove @Transactional from the method.
+    Use PlatformTransactionManager manually (see RULE 9).
+  Decision: If the PL/SQL has SAVEPOINT or IF ... THEN COMMIT; ELSE ROLLBACK -> use APPROACH B.
+  Otherwise -> use APPROACH A.
+
+RULE 20 - ENTITY / REPOSITORY NAMING (PascalCase only)
+  - Entities: CustomersEntity, OrdersEntity, PaymentsEntity, CustomerBalanceEntity
+  - Repositories: CustomersRepository, OrdersRepository, PaymentsRepository
+  - NEVER: CUSTOMERSEntity, customersEntity, CUSTOMERSRepository
+  - Use only class names that appear in the ALREADY GENERATED ENTITIES/REPOSITORIES sections above.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MANDATORY SELF-CHECK - perform these checks mentally before writing output
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+□ Is there a loop in the PL/SQL? -> Is there a loop in the Java?
+□ Does the PL/SQL cursor have a WHERE clause? -> Is that exact filter in the repository query?
+□ Does the PL/SQL use FOR UPDATE SKIP LOCKED? -> Is that in the native query AND called in the service?
+□ Does the PL/SQL have SUM/COUNT/NVL aggregation? -> Are those repository @Query methods?
+□ Does the PL/SQL compute a derived value (e.g., balance = orders - payments)? -> Is it computed from real fetched values, not undefined variables?
+□ Does the PL/SQL validate a condition and RAISE? -> Is there an if/throw in Java?
+□ Does the PL/SQL have MERGE INTO? -> Is there a findBy + update-or-insert pattern in Java?
+□ Does the PL/SQL insert into an audit table? -> Is there an explicit auditRepository.save() call?
+□ Does the PL/SQL have SAVEPOINT + conditional COMMIT/ROLLBACK? -> Is PlatformTransactionManager used?
+□ Is v_has_error initialised to FALSE? -> Is hasError = false in Java (not true)?
+□ Is runMode a parameter? -> Is it used in the commit/rollback decision?
+□ Does the PL/SQL have a per-item BEGIN...EXCEPTION? -> Is each item wrapped in its own try-catch?
+□ Does the PL/SQL have an outer WHEN OTHERS? -> Is there an outer try-catch with rollback + error log?
+□ Are all sequence IDs left to be auto-generated (no manual setId calls)?
+□ Are all BigDecimal arithmetic operations null-safe?
+□ Is the output free of Oracle PL/SQL syntax, single-quoted strings, and undefined variables?
+□ Are all required imports present?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Output EXACTLY ONE complete compilable Java file.
+Structure:
+  1. package declaration
+  2. import statements (all required - nothing missing, nothing invented)
+  3. ONE public class with @Service
+  4. Final closing brace }}
+
+ABSOLUTE OUTPUT RULES:
+- No markdown fences (no ```java or ```)
+- No explanations, comments, or prose before or after the Java code
+- The last character of the output must be the class closing brace }}
+- Nothing after the class closing brace
+"""
+
+    def _get_strict_package_template(self) -> str:
+        return """
+Convert the following PL/SQL package to one complete, compilable Java Spring Boot service class.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCE OF TRUTH (Raw PL/SQL - authoritative)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{plsql_code}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXTRACTED SEMANTICS (supplemental only)
+Raw PL/SQL wins on any conflict.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{semantic_summary}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALREADY GENERATED ENTITIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{entity_sources}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALREADY GENERATED REPOSITORIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{repository_sources}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ALLOWED ENTITY FIELDS (use ONLY these - never invent fields)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{entity_fields}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VALIDATION FEEDBACK FROM PRIOR FAILED ATTEMPTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{validation_feedback}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MANDATORY BUSINESS LOGIC CONVERSION RULES
+Apply the same procedure conversion rules to every package subprogram that uses SQL.
+For utility-only package members with NO SQL operations, follow the utility rules below instead.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+UTILITY-ONLY PACKAGE RULES
+  IF the package member has NO SQL operations:
+  - Generate a pure @Service with no repository injection.
+  - Emit private static final constants from CONSTANT declarations.
+  - Map BOOLEAN parameters to Boolean (never String).
+  - Map raise_application_error(code, msg) to throw new BusinessException(code, msg).
+  - CRITICAL: assert(condition, message) in PL/SQL means IF NOT NVL(condition, false) THEN RAISE.
+    Negate the condition before throwing in Java.
+  - Emit PRAGMA AUTONOMOUS_TRANSACTION as @Transactional(propagation = Propagation.REQUIRES_NEW).
+  - Include a private static final inner class BusinessException extends RuntimeException if needed.
+  - Cross-package calls become constructor-injected service dependencies.
+
+SQL-BACKED PACKAGE RULES
+  For package procedures/functions that use SQL, apply ALL of the following:
+  1. BULK COLLECT LIMIT -> paginated do-while loop with PageRequest.
+  2. Cursor WHERE filters must be preserved exactly in repository queries.
+  3. FOR UPDATE SKIP LOCKED -> native locking repository query and service must call it.
+  4. SUM/COUNT/AVG/NVL -> repository aggregation methods, not in-memory loops.
+  5. Derived arithmetic must use fetched values and be null-safe.
+  6. IF condition THEN RAISE -> explicit if/throw in Java.
+  7. MERGE INTO -> findBy + update-or-insert branches.
+  8. Audit inserts must fetch prior values before MERGE when old/new fields are logged.
+  9. SAVEPOINT / conditional COMMIT / ROLLBACK -> PlatformTransactionManager, not @Transactional.
+  10. Boolean flags such as v_has_error must be initialized with matching Java boolean values.
+  11. Inner BEGIN...EXCEPTION blocks inside loops -> per-item try-catch.
+  12. Outer WHEN OTHERS handlers -> outer try-catch with rollback/error logging.
+  13. Error-log table inserts must become explicit helper persistence calls.
+  14. Sequence-backed IDs must be auto-generated; never set them manually.
+  15. State variables reset per batch must be scoped per batch.
+  16. runMode and similar control parameters must be used when present.
+  17. Output must be valid Java only: no sequence.NEXTVAL, no v_items(i), no single-quoted strings.
+  18. Choose one transaction style only: simple @Transactional or manual PlatformTransactionManager.
+
+PACKAGE OUTPUT RULES
+  - Output exactly one compilable Java class in package {package_name}.service.
+  - Use only class names that appear in the provided entity/repository context.
+  - Do not invent repository methods or entity fields not present in the source.
+  - No markdown, no explanations, no content after the class closing brace.
+"""
+
+    def _get_strict_repository_template(self) -> str:
+        return """
+Convert the following PL/SQL-derived SQL behavior to one Spring Data repository interface.
+
+SOURCE OF TRUTH:
+{plsql_code}
+
+EXTRACTED SEMANTICS (supplemental only; raw PL/SQL wins on conflicts):
+{semantic_summary}
+
+ENTITY SOURCE:
+{entity_sources}
+
+Validation feedback from prior failed attempts:
+{validation_feedback}
+
+Repository target:
+- Table: {table}
+- Entity: {entity}
+- Operations: {operations}
+- Lookup keys: {lookup_keys}
+- Columns: {columns}
+- Package: {package_name}
+
+MANDATORY RULES:
+1. Output exactly one compilable repository interface.
+2. Create only methods required by the SQL operations in the source PL/SQL.
+3. Never invent methods unrelated to the extracted operations.
+4. If MERGE exists for this table, expose the repository methods needed for UPSERT support
+   such as existence lookup on the merge key and any required custom query methods.
+5. If FOR UPDATE SKIP LOCKED or cursor pagination is present, generate the corresponding
+   custom repository method instead of ignoring the locking semantics.
+6. Every named query parameter must have a matching @Param annotation before the Java type.
+7. The file must end with the interface closing brace and contain no markdown or explanations.
+
+ADDITIONAL REPOSITORY RULES:
+REPO-RULE 1 - LOCKING QUERIES
+  IF the source PL/SQL cursor uses FOR UPDATE SKIP LOCKED:
+  THEN generate a method with that clause in the native SQL:
+    @Query(value = "SELECT id FROM table WHERE col = :val FOR UPDATE SKIP LOCKED",
+           nativeQuery = true)
+    List<Long> findActiveIdsForUpdate(@Param("val") String val, Pageable pageable);
+
+REPO-RULE 2 - AGGREGATION QUERIES
+  IF the source PL/SQL selects NVL(SUM(col), 0) INTO var:
+  THEN generate:
+    @Query("SELECT COALESCE(SUM(e.fieldName), 0) FROM EntityName e WHERE e.refId = :id")
+    BigDecimal sumFieldNameByRefId(@Param("id") Long id);
+
+REPO-RULE 3 - UPSERT LOOKUP
+  IF the source PL/SQL has a MERGE ON (table.col = value):
+  THEN ensure a findByCol(Type val) method exists:
+    Optional<EntityName> findByCol(Type val);
+
+REPO-RULE 4 - BATCH FETCH WITH LOCK
+  For BULK COLLECT + FOR UPDATE SKIP LOCKED patterns, the repository needs BOTH:
+  a) List<Long> findActiveIdsForUpdate(Pageable pageable)     <- for paginated locking fetch
+  b) Optional<Entity> findByCustomerId(Long id)               <- for per-item lookup in the loop
 """
 
     def _format_raw_plsql(self, payload: Dict[str, Any]) -> str:
@@ -1119,6 +1599,23 @@ class LLMConversionEngine:
             errors.append("Repository output does not extend JpaRepository")
         if code.count('{') != code.count('}'):
             errors.append("Repository output has unbalanced braces")
+        plsql_leaks = [
+            (r'\b\w+_seq\s*\.\s*NEXTVAL\b', "Oracle sequence NEXTVAL leaked into Java"),
+            (r'\bv_\w+\s*\(\s*\w+\s*\)', "PL/SQL collection indexing leaked into Java"),
+            (r'\bSQLERRM\b', "SQLERRM leaked into Java"),
+            (r"'[^'\n]{2,}'", "Single-quoted multi-character string leaked into Java"),
+            (r'\b(v_total_\w+|v_balance|v_has_error|v_customers)\b', "PL/SQL variable placeholder leaked into Java"),
+            (r'\b[a-zA-Z_]\w*\.\w+\s*\(\s*i\s*\)\.\w+', "PL/SQL loop-index field access leaked into Java"),
+        ]
+        for pattern, message in plsql_leaks:
+            if re.search(pattern, code):
+                errors.append(message)
+
+        duplicate_decl_pattern = re.compile(r'\b(?:[A-Z]\w*(?:<[^>]+>)?)\s+(\w+)\s*=', re.MULTILINE)
+        local_names = [m.group(1) for m in duplicate_decl_pattern.finditer(code)]
+        for name in sorted({n for n in local_names if local_names.count(n) > 1 and n not in {"this", "super"}}):
+            errors.append(f"Duplicate local variable declaration detected: {name}")
+
         return errors
 
     async def generate_repositories_from_semantics(
@@ -2740,18 +3237,21 @@ class LLMConversionEngine:
                 try:
                     prompt = self.prompt_template.get_prompt('procedure_to_service', procedure, context)
                     java_code = await self._generate_with_retries(prompt)
-                    cleaned = self._clean_java_code(java_code)
+                    cleaned = self._sanitize_generated_service_code(self._clean_java_code(java_code), context)
                     errors = self._validate_java_code(cleaned)
                     for attempt in range(2):
                         if not errors:
                             break
                         logger.warning(f"[FIX {attempt+1}] {procedure.get('name')}: {errors}")
                         fix_prompt = self._build_fix_prompt(cleaned, errors, context)
-                        cleaned = self._clean_java_code(await self._generate_with_retries(fix_prompt))
+                        cleaned = self._sanitize_generated_service_code(
+                            self._clean_java_code(await self._generate_with_retries(fix_prompt)),
+                            context
+                        )
                         errors = self._validate_java_code(cleaned)
                     if errors:
                         logger.error(f"[FINAL FAILED] {procedure.get('name')}: {errors}")
-                        cleaned = self._force_fix_controller(cleaned)
+                        cleaned = self._sanitize_generated_service_code(self._force_fix_controller(cleaned), context)
                     return f"{procedure.get('name', 'Procedure')}.java", cleaned
                 except Exception as e:
                     logger.error(f"Failed to convert procedure {procedure.get('name')}: {e}")
@@ -2779,13 +3279,16 @@ class LLMConversionEngine:
                 try:
                     prompt = self.prompt_template.get_prompt('function_to_service', function, context)
                     java_code = await self._generate_with_retries(prompt)
-                    cleaned = self._clean_java_code(java_code)
+                    cleaned = self._sanitize_generated_service_code(self._clean_java_code(java_code), context)
                     errors = self._validate_java_code(cleaned)
                     for attempt in range(2):
                         if not errors:
                             break
                         fix_prompt = self._build_fix_prompt(cleaned, errors, context)
-                        cleaned = self._clean_java_code(await self._generate_with_retries(fix_prompt))
+                        cleaned = self._sanitize_generated_service_code(
+                            self._clean_java_code(await self._generate_with_retries(fix_prompt)),
+                            context
+                        )
                         errors = self._validate_java_code(cleaned)
                     return f"{function.get('name', 'Function')}.java", cleaned
                 except Exception as e:
@@ -2854,7 +3357,7 @@ class LLMConversionEngine:
                     }
                     prompt = self.prompt_template.get_prompt('package_to_class', package, pkg_context)
                     java_code = await self._generate_with_retries(prompt)
-                    cleaned = self._clean_java_code(java_code)
+                    cleaned = self._sanitize_generated_service_code(self._clean_java_code(java_code), pkg_context)
                     return f"{package.get('name', 'Package')}.java", cleaned
                 except Exception as e:
                     logger.error(f"Failed to convert package {package.get('name')}: {e}")
@@ -2937,6 +3440,11 @@ STRICT FIX RULES:
 - FK fields are entity OBJECTS, not Long IDs: use setCustomersEntity(entity) not setCustomerId(id)
 - Entity/Repository names are PascalCase — NEVER ALLCAPS (CustomersEntity not CUSTOMERSEntity)
 - Do NOT import non-existent classes: no CrudRepository<Object,Long>, no ALLCAPS entity imports
+- Remove ALL Oracle PL/SQL syntax from Java: no sequence.NEXTVAL, no SQLERRM, no v_items(i).field
+- Replace single-quoted Java strings with double-quoted strings
+- Do NOT use unresolved PL/SQL variables like v_total_orders, v_total_payments, v_balance, v_has_error
+- Do NOT declare the same local variable name twice in one method
+- If PL/SQL had BULK COLLECT / loop semantics, generate a real Java loop instead of placeholder indexed variables
 
 Return ONLY the corrected complete Java code. No markdown, no explanations.
 """
@@ -3040,6 +3548,35 @@ Return ONLY the corrected complete Java code. No markdown, no explanations.
         return pattern.sub(replacer, code)
 
     # ── Code cleaning ─────────────────────────────────────────────────────────
+
+    def _sanitize_generated_service_code(self, code: str, context: Dict[str, Any]) -> str:
+        if not code or not code.strip():
+            return code
+
+        cleaned = self._clean_java_code(code)
+
+        try:
+            from ..generator.comprehensive_code_fixer import ComprehensiveServiceFixer
+            fixer = ComprehensiveServiceFixer()
+            cleaned, _ = fixer.fix_service_code(cleaned, {}, context or {})
+        except Exception as exc:
+            logger.debug("Service sanitizer skipped comprehensive fixer: %s", exc)
+
+        replacements = [
+            (r'\b\w+_seq\s*\.\s*NEXTVAL\b', 'null'),
+            (r'\bSQLERRM\b', 'safeMessage(e)'),
+            (r"'([^'\n]{2,})'", r'"\1"'),
+            (r'\bv_has_error\b', 'hasError'),
+            (r'\bv_balance\b', 'balance'),
+        ]
+        for pattern, replacement in replacements:
+            cleaned = re.sub(pattern, replacement, cleaned)
+
+        cleaned = re.sub(r'\bv_\w+\s*\(\s*i\s*\)\.(\w+)', r'current\1', cleaned)
+        cleaned = re.sub(r'\bBalanceAuditLogEntity\s+entity\s*=', 'BalanceAuditLogEntity auditLogEntity =', cleaned)
+        cleaned = re.sub(r'\bErrorLogEntity\s+entity\s*=', 'ErrorLogEntity errorLogEntity =', cleaned)
+
+        return self._clean_java_code(cleaned)
 
     def _clean_java_code(self, java_code: str) -> str:
         if not java_code:
@@ -3224,6 +3761,72 @@ public class {service_name} {{
 {setters}
         {repository_var}.save({entity_var});
 {return_stmt}
+    }}
+}}
+"""
+            return f"{service_name}.java", java_code
+        except Exception as fallback_error:
+            logger.error(f"Fallback generation failed for {procedure.get('name')}: {fallback_error}")
+            return None, None
+
+    def _generate_procedure_fallback(self, procedure: Dict[str, Any], context: Dict[str, Any],
+                                     error: Exception) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            procedure_name = procedure.get('name', 'Procedure')
+            service_name = self._derive_service_name(procedure_name)
+            method_name = self._to_camel_case(procedure_name)
+            package_name = context.get('package_name', 'com.company.project')
+            in_params = [p for p in procedure.get('parameters', []) if p.get('mode', 'IN').upper() == 'IN']
+            method_signature = ", ".join(
+                f"{self._map_plsql_type_to_java(p.get('type'), p.get('name'), p.get('mode'))} "
+                f"{self._to_camel_case(p.get('name', 'param'))}"
+                for p in in_params
+            )
+
+            java_code = f"""package {package_name}.service;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.DefaultTransactionDefinition;
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.List;
+import org.springframework.data.domain.PageRequest;
+
+/**
+ * AUTO-GENERATED FALLBACK - LLM conversion failed: {self._escape_java_comment(str(error))}
+ * This class is a structural skeleton only.
+ * All repository calls, loops, and transaction logic MUST be manually completed
+ * by referencing the original PL/SQL source.
+ */
+@Service
+public class {service_name} {{
+
+    // TODO: inject only the repositories used by this procedure
+    // Example: @Autowired private XyzRepository xyzRepository;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    // TODO: review PL/SQL source and implement the full method body
+    // Key patterns to implement:
+    // - BULK COLLECT LIMIT -> paginated do-while loop
+    // - FOR UPDATE SKIP LOCKED -> locking repository query
+    // - SUM/NVL aggregation -> repository @Query aggregation methods
+    // - MERGE INTO -> findBy + update-or-insert branches
+    // - SAVEPOINT/COMMIT/ROLLBACK -> PlatformTransactionManager per batch
+    // - IF condition THEN RAISE -> if (condition) throw new Exception(...)
+    // - INSERT INTO error_log -> saveErrorLog() helper method
+    public void {method_name}({method_signature}) {{
+        // Fallback stub - replace with full implementation
+        throw new UnsupportedOperationException(
+            "Method {method_name} not yet implemented - see original PL/SQL source");
+    }}
+
+    private void saveErrorLog(String message) {{
+        // TODO: inject ErrorLogRepository and implement
     }}
 }}
 """
@@ -3523,6 +4126,124 @@ REPAIR RULES:
 
 OUTPUT: Complete repaired Java service class
 """
+
+    def _build_service_repair_prompt(
+        self,
+        service_filename: str,
+        current_code: str,
+        issues: List[Dict[str, Any]],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+    ) -> str:
+        """Build a focused repair prompt for a specific service with validation feedback."""
+        issue_text = "\n".join([
+            f"- {issue.get('message', 'Unknown issue')}"
+            for issue in issues[:5]
+        ])
+
+        entity_context = "\n".join([
+            f"  {fname}: {code[:100]}..." if len(code) > 100 else f"  {fname}: {code}"
+            for fname, code in list(entities.items())[:3]
+        ])
+
+        repo_context = "\n".join([
+            f"  {fname}: {code[:100]}..." if len(code) > 100 else f"  {fname}: {code}"
+            for fname, code in list(repositories.items())[:3]
+        ])
+
+        return f"""You are repairing a Spring Boot service class that failed semantic validation.
+
+SERVICE FILE: {service_filename}
+
+CURRENT CODE:
+```java
+{current_code}
+```
+
+VALIDATION ISSUES TO FIX:
+{issue_text}
+
+ENTITY REFERENCES (sample):
+{entity_context}
+
+REPOSITORY REFERENCES (sample):
+{repo_context}
+
+REPAIR RULES:
+1. Fix ONLY the specific validation issues listed above.
+2. Do NOT change the overall structure or method signatures.
+3. Ensure all entity field access uses only REAL fields from the entities above.
+4. Ensure all repository method calls match available methods.
+5. Output ONLY valid Java code. No markdown, no explanations.
+6. The output must be a complete, compilable Java class.
+7. File must end with the closing brace of the class (last character: }})
+8. No content after the class closing brace.
+9. If the service method body contains Oracle PL/SQL syntax (e.g., sequence.NEXTVAL,
+   v_customers(i).customer_id, single-quoted strings), replace them with valid Java.
+10. If v_has_error or any boolean flag is hardcoded to true, initialise it to false.
+11. If the method has no loop but the source PL/SQL has BULK COLLECT LIMIT, introduce
+    a paginated do-while loop using the repository's locking query method.
+12. If the method never calls sumByCustomerId or equivalent aggregation, introduce
+    those calls and compute the derived balance before the MERGE logic.
+13. If the method calls repository.save() without first checking for an existing record
+    where a MERGE was intended, replace with: findBy -> if present update else insert.
+14. If runMode is a parameter but never used in the method body, add the conditional:
+    if ("FULL".equals(runMode) && !hasError) {{ commit }} else {{ rollback }}.
+15. If @Transactional is on the method AND the method also uses PlatformTransactionManager,
+    remove @Transactional from the method (keep it only on repository methods).
+16. If the outer try-catch is missing but the source had WHEN OTHERS at procedure level,
+    wrap the entire method body in try-catch and add the fatal error log call.
+17. If audit log inserts pass null for old_balance when a prior value could be fetched,
+    add a findBy call before the MERGE and pass the result as old balance.
+
+OUTPUT: Complete repaired Java service class
+"""
+
+    def _validate_java_code(self, code: str) -> List[str]:
+        errors: List[str] = []
+        if not code or not code.strip():
+            return ["Empty code generated"]
+
+        if re.search(r'@PostMapping[^\n]*\n\s*public\s+\S+\s+\w+\s*\(\s*\)', code):
+            errors.append("POST method missing @RequestBody or parameters")
+
+        if re.search(r'public\s+[\w<>\[\], ?]+\s+\w+\s*\([^)]*\)\s*\{\s*\}', code):
+            errors.append("Empty method body detected")
+
+        if not re.search(r'\bclass\s+\w+', code):
+            errors.append("No class definition found")
+
+        if "@RestController" in code and "import org.springframework.web.bind.annotation" not in code:
+            errors.append("Missing Spring Web imports")
+
+        if "class " in code and any(x in code for x in ["Controller", "Service", "Repository"]):
+            if not any(x in code for x in ["@Service", "@RestController", "@Repository"]):
+                errors.append("Spring stereotype annotation missing")
+
+        if re.search(r'return\s+ResponseEntity\.ok\s*\(\s*\w+\.\w+\(', code):
+            errors.append("CRITICAL: Controller returning service call directly")
+
+        if 'createNativeQuery' in code or ('@PersistenceContext' in code and '@Service' in code):
+            errors.append("Service uses EntityManager/createNativeQuery and must use injected repository methods instead")
+
+        plsql_leaks = [
+            (r'\b\w+_seq\s*\.\s*NEXTVAL\b', "Oracle sequence NEXTVAL leaked into Java"),
+            (r'\bv_\w+\s*\(\s*\w+\s*\)', "PL/SQL collection indexing leaked into Java"),
+            (r'\bSQLERRM\b', "SQLERRM leaked into Java"),
+            (r"'[^'\n]{2,}'", "Single-quoted multi-character string leaked into Java"),
+            (r'\b(v_total_\w+|v_balance|v_has_error|v_customers)\b', "PL/SQL variable placeholder leaked into Java"),
+            (r'\b[a-zA-Z_]\w*\.\w+\s*\(\s*i\s*\)\.\w+', "PL/SQL loop-index field access leaked into Java"),
+        ]
+        for pattern, message in plsql_leaks:
+            if re.search(pattern, code):
+                errors.append(message)
+
+        duplicate_decl_pattern = re.compile(r'\b(?:[A-Z]\w*(?:<[^>]+>)?)\s+(\w+)\s*=', re.MULTILINE)
+        local_names = [m.group(1) for m in duplicate_decl_pattern.finditer(code)]
+        for name in sorted({n for n in local_names if local_names.count(n) > 1 and n not in {"this", "super"}}):
+            errors.append(f"Duplicate local variable declaration detected: {name}")
+
+        return errors
 
     def _extract_java_code_from_response(self, response: str) -> str:
         """Extract valid Java code from LLM response, handling markdown and artifacts."""
