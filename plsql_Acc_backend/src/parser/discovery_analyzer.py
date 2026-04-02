@@ -960,6 +960,48 @@ def _extract_skip_locked_tables(
     return sorted(tables)
 
 
+def _ensure_raw_plsql(unit: Dict[str, Any], full_sql_text: str) -> Dict[str, Any]:
+    """Guarantee a raw PL/SQL source block is attached to each conversion unit."""
+    if unit.get('raw_plsql') and str(unit['raw_plsql']).strip():
+        return unit
+
+    name = str(unit.get('name', '')).strip()
+    obj_type = str(unit.get('object_type', '')).upper()
+    if not name or not full_sql_text:
+        unit['raw_plsql'] = ''
+        return unit
+
+    type_pattern_map = {
+        'PROCEDURE': r'PROCEDURE',
+        'FUNCTION': r'FUNCTION',
+        'PACKAGE': r'PACKAGE(?:\s+BODY)?',
+        'PACKAGE BODY': r'PACKAGE\s+BODY',
+        'TRIGGER': r'TRIGGER',
+        'PACKAGE_PROCEDURE': r'PROCEDURE',
+        'PACKAGE_FUNCTION': r'FUNCTION',
+    }
+    type_kw = type_pattern_map.get(obj_type, r'(?:PROCEDURE|FUNCTION|PACKAGE(?:\s+BODY)?|TRIGGER)')
+    pattern = (
+        r'(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:EDITIONABLE\s+|NONEDITIONABLE\s+)?)?'
+        + type_kw
+        + r'\s+(?:\w+\.)?'
+        + re.escape(name)
+        + r'\b'
+        + r'[\s\S]*?'
+        + r'\bEND\b'
+        + r'(?:\s+' + re.escape(name) + r')?'
+        + r'\s*;'
+    )
+    match = re.search(pattern, full_sql_text, re.IGNORECASE)
+    if match:
+        unit['raw_plsql'] = match.group(0).strip()
+    elif len(full_sql_text) < 50_000:
+        unit['raw_plsql'] = full_sql_text.strip()
+    else:
+        unit['raw_plsql'] = f'-- raw_plsql extraction failed for {obj_type} {name}'
+    return unit
+
+
 def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
     """Return raw object blocks plus extracted semantics for code generation."""
     cleaned = _prepare_sql_text(sql_text)
@@ -1012,6 +1054,7 @@ def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
                     )
                     if merged_constants:
                         sub_unit["package_constants"] = list(merged_constants.values())
+                    sub_unit = _ensure_raw_plsql(sub_unit, cleaned)
                     expanded_units.append(sub_unit)
 
             if expanded_units:
@@ -1023,39 +1066,33 @@ def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
             # placeholder service. Package body subprograms are handled above.
             continue
 
-        units.append(
-            {
-                "name": item.object_name,
-                "object_type": item.object_type,
-                "raw_plsql": item.block_text.strip(),
-                "tables_used": semantics.get("tables_used", []),
-                "driving_table": semantics.get("driving_table", ""),
-                "target_tables": semantics.get("target_tables", []),
-                "skip_locked_tables": semantics.get("skip_locked_tables", []),
-                "operations_by_table": semantics.get("operations", {}),
-                "input_parameters": semantics.get("input_parameters", []),
-                "output_parameters": semantics.get("output_parameters", []),
-                "variables": semantics.get("variables", []),
-                "lookup_keys": semantics.get("lookup_keys", {}),
-                "bulk_operations": semantics.get("bulk_operations", []),
-                "cursor": semantics.get("cursor", {}),
-                "transaction": semantics.get("transaction", {}),
-                "exceptions": semantics.get("exceptions", []),
-                "business_rules": semantics.get("business_rules", []),
-                "issues": semantics.get("issues", []),
-                "semantic_analysis": semantics.get("semantic_analysis", {}),
-                # RC4 FIX
-                "programmatic_raises": semantics.get("programmatic_raises", []),
-                # RC8 FIX
-                "autonomous_transaction": semantics.get("autonomous_transaction", False),
-                # RC6 FIX
-                "package_constants": semantics.get("package_constants", []),
-                # RC3 FIX
-                "null_safe_params": semantics.get("null_safe_params", []),
-                # dependency graph for RC7
-                "dependency_graph": semantics.get("dependency_graph", {}),
-            }
-        )
+        unit = {
+            "name": item.object_name,
+            "object_type": item.object_type,
+            "raw_plsql": item.block_text.strip(),
+            "tables_used": semantics.get("tables_used", []),
+            "driving_table": semantics.get("driving_table", ""),
+            "target_tables": semantics.get("target_tables", []),
+            "skip_locked_tables": semantics.get("skip_locked_tables", []),
+            "operations_by_table": semantics.get("operations", {}),
+            "input_parameters": semantics.get("input_parameters", []),
+            "output_parameters": semantics.get("output_parameters", []),
+            "variables": semantics.get("variables", []),
+            "lookup_keys": semantics.get("lookup_keys", {}),
+            "bulk_operations": semantics.get("bulk_operations", []),
+            "cursor": semantics.get("cursor", {}),
+            "transaction": semantics.get("transaction", {}),
+            "exceptions": semantics.get("exceptions", []),
+            "business_rules": semantics.get("business_rules", []),
+            "issues": semantics.get("issues", []),
+            "semantic_analysis": semantics.get("semantic_analysis", {}),
+            "programmatic_raises": semantics.get("programmatic_raises", []),
+            "autonomous_transaction": semantics.get("autonomous_transaction", False),
+            "package_constants": semantics.get("package_constants", []),
+            "null_safe_params": semantics.get("null_safe_params", []),
+            "dependency_graph": semantics.get("dependency_graph", {}),
+        }
+        units.append(_ensure_raw_plsql(unit, cleaned))
 
     return units
 

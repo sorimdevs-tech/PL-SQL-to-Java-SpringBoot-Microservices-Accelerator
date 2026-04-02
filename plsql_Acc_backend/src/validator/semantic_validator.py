@@ -77,6 +77,15 @@ class SemanticValidator:
 
         issues.extend(self._validate_repository_files(repositories))
         issues.extend(self._validate_service_files(services))
+        unit_by_service = {self._derive_service_filename(unit): unit for unit in source_units}
+        for service_file, service_code in services.items():
+            issues.extend(
+                self._validate_service_behavioral_completeness(
+                    service_file,
+                    service_code,
+                    unit_by_service.get(service_file),
+                )
+            )
         issues.extend(
             self._validate_repository_usage(
                 source_units=source_units,
@@ -287,6 +296,64 @@ class SemanticValidator:
                         file_name=filename,
                     )
                 )
+        return issues
+
+    def _validate_service_behavioral_completeness(
+        self,
+        service_file: str,
+        service_code: str,
+        source_unit: Optional[Dict[str, Any]] = None,
+    ) -> List[SemanticIssue]:
+        """Check that a generated service contains real executable behavior."""
+        issues: List[SemanticIssue] = []
+        object_name = service_file.replace(".java", "")
+        required_operations = self._extract_required_operations(source_unit or {})
+        raw_plsql = str((source_unit or {}).get('raw_plsql', ''))
+        has_db_semantics = bool(required_operations) or bool((source_unit or {}).get("operations_by_table")) or bool(
+            re.search(r"\b(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|SELECT\b|MERGE\s+INTO)\b", raw_plsql, re.IGNORECASE)
+        )
+        has_repo_calls = self._service_has_repository_call(service_code)
+
+        if has_db_semantics and not has_repo_calls:
+            issues.append(SemanticIssue("service", object_name, "missing_repo_calls",
+                                        f"{service_file}: Service method has no repository calls - method body is likely empty or stub",
+                                        file_name=service_file))
+
+        if re.search(r'findById\s*\(\s*0L\s*\)', service_code):
+            issues.append(SemanticIssue("service", object_name, "stub_findbyid",
+                                        f"{service_file}: findById(0L) hardcoded stub - lookup key was not resolved",
+                                        file_name=service_file))
+
+        if self._service_has_stub_transaction_comment(service_code):
+            issues.append(SemanticIssue("service", object_name, "stub_transaction",
+                                        f"{service_file}: Transaction boundary is a comment stub - must be real code",
+                                        file_name=service_file))
+
+        has_error_declared = bool(re.search(r'boolean\s+hasError\s*=', service_code))
+        has_error_used = bool(
+            re.search(r'if\s*\(\s*(?:has|batch)Error\s*\)', service_code)
+            or re.search(r'\bhasError\s*=\s*hasError\s*\|\|', service_code)
+            or re.search(r'\blog\w*\([^;\n]*hasError', service_code)
+        )
+        if has_error_declared and not has_error_used:
+            issues.append(SemanticIssue("service", object_name, "unused_haserror",
+                                        f"{service_file}: hasError flag is declared but never checked - post-loop logic missing",
+                                        severity="warning", file_name=service_file))
+
+        if re.search(r'for\s*\(\s*int\s+rowIndex\s*=\s*0\s*;\s*rowIndex\s*<\s*1\s*;', service_code):
+            issues.append(SemanticIssue("service", object_name, "fake_loop",
+                                        f"{service_file}: Fake single-iteration loop detected - should fetch real data or use proper loop",
+                                        file_name=service_file))
+
+        if re.search(r'\bMERGE\s+INTO\b', raw_plsql, re.IGNORECASE):
+            if 'isPresent' not in service_code and 'orElse' not in service_code:
+                issues.append(SemanticIssue("service", object_name, "missing_upsert_logic",
+                                            f"{service_file}: SQL has MERGE INTO but service has no Optional-based UPSERT logic",
+                                            file_name=service_file))
+        if re.search(r'\bEXCEPTION\b', raw_plsql, re.IGNORECASE) and not self._service_has_catch_block(service_code):
+            issues.append(SemanticIssue("service", object_name, "missing_catch",
+                                        f"{service_file}: SQL has EXCEPTION block but service has no try/catch",
+                                        file_name=service_file))
         return issues
 
     def _validate_repository_usage(
@@ -671,10 +738,8 @@ class SemanticValidator:
                 "@Transactional" in service_code
                 or "TransactionTemplate" in service_code
                 or "setRollbackOnly" in service_code
-                or (
-                    "commit boundary handled per batch" in service_code
-                    and "rollback boundary handled per batch" in service_code
-                )
+                or "PlatformTransactionManager" in service_code
+                or ("hasError" in service_code and "batchHasError" in service_code)
             )
             if transaction.get("has_savepoint") and not has_transaction_boundary:
                 issues.append(
@@ -686,18 +751,43 @@ class SemanticValidator:
                         file_name=service_filename,
                     )
                 )
-            if transaction.get("has_savepoint") or has_exception_block:
-                row_level_try_pattern = re.compile(
-                    r"\b(for|while)\s*\([^\)]*\)\s*\{[\s\S]*?\btry\s*\{[\s\S]*?\}\s*catch\s*\(\s*Exception[^\)]*\)\s*\{[\s\S]*?\bcontinue\s*;",
-                    flags=re.IGNORECASE,
+            has_iterative_semantics = (
+                bool(unit.get("cursor"))
+                or any(str(item.get("type", "")).upper() == "BULK_COLLECT" for item in (unit.get("bulk_operations") or []))
+                or bool(re.search(r"\b(for|while)\b.+\bloop\b", raw_plsql, flags=re.IGNORECASE | re.DOTALL))
+            )
+            if transaction.get("has_savepoint") or (has_exception_block and has_iterative_semantics):
+                has_loop = bool(re.search(r"\b(for|while)\s*\(", service_code, flags=re.IGNORECASE))
+                has_try = "try {" in service_code or bool(re.search(r"\btry\s*\{", service_code))
+                has_catch = self._service_has_catch_block(service_code)
+                has_continue = "continue;" in service_code
+                has_row_level_try = bool(
+                    re.search(
+                        r"\b(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,800}?\btry\s*\{",
+                        service_code,
+                        flags=re.IGNORECASE,
+                    )
                 )
-                if not row_level_try_pattern.search(service_code):
+                if not ((has_row_level_try and has_catch and has_continue) or (has_loop and has_try and has_catch and has_continue)):
                     issues.append(
                         SemanticIssue(
                             component="service",
                             object_name=object_name,
                             code="missing_row_level_try_catch",
                             message=f"{service_filename} must preserve SAVEPOINT/EXCEPTION semantics with row-level try/catch + continue",
+                            file_name=service_filename,
+                        )
+                    )
+            elif has_exception_block:
+                has_try = "try {" in service_code or bool(re.search(r"\btry\s*\{", service_code))
+                has_catch = self._service_has_catch_block(service_code)
+                if not (has_try and has_catch):
+                    issues.append(
+                        SemanticIssue(
+                            component="service",
+                            object_name=object_name,
+                            code="missing_exception_mapping",
+                            message=f"{service_filename} must preserve EXCEPTION handling with try/catch",
                             file_name=service_filename,
                         )
                     )
@@ -770,6 +860,30 @@ class SemanticValidator:
             if str(upsert.get("operation", "")).upper() == "UPSERT":
                 required.add("MERGE")
         return required
+
+    def _service_has_repository_call(self, service_code: str) -> bool:
+        repo_vars = self._extract_repository_variables(service_code)
+        for repo_var in repo_vars:
+            if re.search(rf"\b{re.escape(repo_var)}\.\w+\s*\(", service_code):
+                return True
+        return bool(
+            re.search(
+                r'\.(save(?:All|AndFlush)?|find\w*|exists\w*|delete\w*|update\w*|insert\w*|flush|sum\w*|count\w*)\s*\(',
+                service_code,
+            )
+        )
+
+    def _service_has_catch_block(self, service_code: str) -> bool:
+        return bool(re.search(r"\bcatch\s*\([^\)]+\)", service_code, flags=re.IGNORECASE))
+
+    def _service_has_stub_transaction_comment(self, service_code: str) -> bool:
+        return bool(
+            re.search(
+                r'//\s*(?:commit|rollback)\s+boundary\s+handled\s+per\s+batch',
+                service_code,
+                flags=re.IGNORECASE,
+            )
+        )
 
     def _validate_deterministic_repository_contracts(
         self,

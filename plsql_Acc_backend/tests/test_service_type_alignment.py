@@ -268,3 +268,55 @@ def test_generate_project_write_path_keeps_batch_transaction_imports(tmp_path):
 
     assert "import org.springframework.transaction.support.TransactionTemplate;" in written
     assert "import org.springframework.transaction.PlatformTransactionManager;" in written
+
+
+def test_generate_method_from_procedure_uses_semantic_batch_reconciliation_template(tmp_path):
+    generator = _build_generator(tmp_path)
+
+    source_unit = {
+        "name": "reconcile_customer_balances",
+        "input_parameters": [
+            {"name": "p_batch_size", "type": "NUMBER"},
+            {"name": "p_run_mode", "type": "VARCHAR2"},
+        ],
+        "driving_table": "CUSTOMERS",
+        "operations_by_table": {
+            "CUSTOMERS": ["SELECT"],
+            "ORDERS": ["SELECT"],
+            "PAYMENTS": ["SELECT"],
+            "CUSTOMER_BALANCE": ["MERGE"],
+            "BALANCE_AUDIT_LOG": ["INSERT"],
+            "ERROR_LOG": ["INSERT"],
+        },
+        "lookup_keys": {
+            "CUSTOMER_BALANCE": ["CUSTOMER_ID"],
+        },
+        "bulk_operations": [{"type": "BULK_COLLECT"}],
+        "cursor": {"locking": "FOR UPDATE SKIP LOCKED"},
+        "transaction": {"has_savepoint": True},
+        "semantic_analysis": {
+            "process_classification": {"process_type": "batch_reconciliation"},
+            "aggregation": {
+                "columns": ["orders.amount", "payments.amount"],
+            },
+        },
+    }
+
+    method = generator._generate_method_from_procedure(
+        {
+            "procedure_name": "reconcile_customer_balances",
+            "body": "CREATE OR REPLACE PROCEDURE reconcile_customer_balances IS BEGIN NULL; END;",
+            "logic": object(),
+            "source_unit": source_unit,
+        }
+    )
+
+    assert 'Page<CustomersEntity> customerPage = customersRepository.findPageForUpdateSkipLocked(pageRequest);' in method
+    assert 'BigDecimal totalOrders = ordersRepository.sumByCustomerId(customer.getCustomerId());' in method
+    assert 'Optional<CustomerBalanceEntity> existingBalance = customerBalanceRepository.findByCustomerId(customer.getCustomerId());' in method
+    assert 'if (existingBalance.isPresent()) {' in method
+    assert '} else {' in method
+    assert 'audit.setActionDate(LocalDateTime.now());' in method
+    assert 'saveErrorRecord("Unexpected error: " + safeMessage(e));' in method
+    assert 'if ("FULL".equalsIgnoreCase(runMode) && !batchHasError) {' in method
+    assert 'continue;' in method

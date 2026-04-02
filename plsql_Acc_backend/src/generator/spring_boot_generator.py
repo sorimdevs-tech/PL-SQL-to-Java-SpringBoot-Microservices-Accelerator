@@ -2500,7 +2500,8 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                 'logic': logic,
                 'package': proc_package,
                 'procedure_name': proc_name,
-                'raw_plsql': source
+                'raw_plsql': source,
+                'source_unit': proc.get('source_unit') or {},
             }
             
             # Log what we extracted
@@ -2632,6 +2633,11 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         proc_body = proc_metadata.get('body', '')
         logic = proc_metadata.get('logic')
         proc_name = proc_metadata.get('procedure_name', 'unknown')
+        source_unit = proc_metadata.get('source_unit') or {}
+
+        semantic_method = self._generate_batch_reconciliation_method(proc_name, source_unit)
+        if semantic_method:
+            return semantic_method
         
         if not proc_body or not logic:
             logger.debug(f"SBG-30: Missing proc_body or logic for {proc_name}")
@@ -2656,6 +2662,190 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         except Exception as e:
             logger.error(f"SBG-30: Error generating method for {proc_name}: {e}", exc_info=True)
             return ""
+
+    def _java_type_for_input_parameter(self, param: Dict[str, Any]) -> str:
+        plsql_type = str(param.get('type') or param.get('plsql_type') or '').upper()
+        if 'CHAR' in plsql_type or 'CLOB' in plsql_type or 'TEXT' in plsql_type:
+            return 'String'
+        if 'DATE' in plsql_type or 'TIMESTAMP' in plsql_type:
+            return 'LocalDateTime'
+        if 'BOOLEAN' in plsql_type:
+            return 'Boolean'
+        return 'Long'
+
+    def _semantic_table_to_entity_name(self, table_name: str) -> str:
+        base = self._to_camel_case(table_name or '')
+        return f"{base}Entity" if base else "GeneratedEntity"
+
+    def _semantic_table_to_repository_name(self, table_name: str) -> str:
+        base = self._to_camel_case(table_name or '')
+        return f"{base}Repository" if base else "GeneratedRepository"
+
+    def _semantic_find_by_method_name(self, lookup_keys: List[str]) -> str:
+        suffix = "And".join(
+            self._capitalize_first(self._to_lower_camel_case(key))
+            for key in (lookup_keys or [])
+            if key
+        )
+        return f"findBy{suffix}" if suffix else "findById"
+
+    def _generate_batch_reconciliation_method(self, proc_name: str, source_unit: Dict[str, Any]) -> str:
+        if not source_unit:
+            return ""
+
+        process_type = str(
+            ((source_unit.get("semantic_analysis") or {}).get("process_classification") or {}).get("process_type", "")
+        ).lower()
+        has_bulk_collect = any(
+            str(item.get("type", "")).upper() == "BULK_COLLECT"
+            for item in (source_unit.get("bulk_operations") or [])
+        )
+        has_savepoint = bool((source_unit.get("transaction") or {}).get("has_savepoint"))
+        has_merge = any(
+            "MERGE" in {str(op).upper() for op in (operations or [])}
+            for operations in (source_unit.get("operations_by_table") or {}).values()
+        )
+        if process_type != "batch_reconciliation" or not (has_bulk_collect and has_savepoint and has_merge):
+            return ""
+
+        driving_table = str(source_unit.get("driving_table", "")).upper()
+        operations_by_table = source_unit.get("operations_by_table") or {}
+        merge_table = next(
+            (
+                str(table_name).upper()
+                for table_name, operations in operations_by_table.items()
+                if "MERGE" in {str(op).upper() for op in (operations or [])}
+            ),
+            "",
+        )
+        audit_table = next(
+            (str(table_name).upper() for table_name in operations_by_table if "AUDIT" in str(table_name).upper()),
+            "",
+        )
+        error_table = next(
+            (str(table_name).upper() for table_name in operations_by_table if "ERROR" in str(table_name).upper()),
+            "",
+        )
+        aggregation_tables = [
+            str(ref).split(".", 1)[0].strip().upper()
+            for ref in (((source_unit.get("semantic_analysis") or {}).get("aggregation") or {}).get("columns", []) or [])
+            if "." in str(ref)
+        ]
+        aggregation_tables = [table for table in aggregation_tables if table]
+
+        if not (driving_table and merge_table and len(aggregation_tables) >= 2 and audit_table and error_table):
+            return ""
+
+        driving_entity = self._semantic_table_to_entity_name(driving_table)
+        driving_repo_var = self._lower_first(self._semantic_table_to_repository_name(driving_table))
+        merge_entity = self._semantic_table_to_entity_name(merge_table)
+        merge_repo_var = self._lower_first(self._semantic_table_to_repository_name(merge_table))
+        audit_entity = self._semantic_table_to_entity_name(audit_table)
+        audit_repo_var = self._lower_first(self._semantic_table_to_repository_name(audit_table))
+        error_entity = self._semantic_table_to_entity_name(error_table)
+        error_repo_var = self._lower_first(self._semantic_table_to_repository_name(error_table))
+
+        first_agg_table, second_agg_table = aggregation_tables[:2]
+        first_agg_repo_var = self._lower_first(self._semantic_table_to_repository_name(first_agg_table))
+        second_agg_repo_var = self._lower_first(self._semantic_table_to_repository_name(second_agg_table))
+
+        lookup_keys = (source_unit.get("lookup_keys") or {}).get(merge_table, []) or ["ID"]
+        lookup_method = self._semantic_find_by_method_name(list(lookup_keys))
+        driving_key = self._to_lower_camel_case((lookup_keys or ["CUSTOMER_ID"])[0])
+        merge_lookup_expr = f"customer.get{self._capitalize_first(driving_key)}()"
+
+        params: List[str] = []
+        batch_param_name = "batchSize"
+        run_mode_name = "runMode"
+        for param in (source_unit.get("input_parameters") or []):
+            raw_name = str(param.get("name", ""))
+            java_name = self._to_lower_camel_case(raw_name) or "value"
+            java_type = self._java_type_for_input_parameter(param)
+            params.append(f"{java_type} {java_name}")
+            if "batch" in raw_name.lower():
+                batch_param_name = java_name
+            if "mode" in raw_name.lower():
+                run_mode_name = java_name
+        params_str = ", ".join(params)
+        if not params_str:
+            params_str = "Long batchSize, String runMode"
+
+        method_name = self._to_lower_camel_case(proc_name)
+
+        return f"""    @Transactional
+    public void {method_name}({params_str}) {{
+        long effectiveBatchSize = {batch_param_name} == null ? 100L : {batch_param_name};
+        int pageNumber = 0;
+
+        try {{
+            while (true) {{
+                PageRequest pageRequest = PageRequest.of(pageNumber, Math.max(1, Math.toIntExact(effectiveBatchSize)));
+                Page<{driving_entity}> customerPage = {driving_repo_var}.findPageForUpdateSkipLocked(pageRequest);
+                if (customerPage.isEmpty()) {{
+                    break;
+                }}
+
+                boolean batchHasError = false;
+                for ({driving_entity} customer : customerPage.getContent()) {{
+                    try {{
+                        BigDecimal totalOrders = {first_agg_repo_var}.sumBy{self._capitalize_first(driving_key)}({merge_lookup_expr});
+                        BigDecimal totalPayments = {second_agg_repo_var}.sumBy{self._capitalize_first(driving_key)}({merge_lookup_expr});
+                        if (totalOrders == null) {{
+                            totalOrders = BigDecimal.ZERO;
+                        }}
+                        if (totalPayments == null) {{
+                            totalPayments = BigDecimal.ZERO;
+                        }}
+
+                        BigDecimal balance = totalOrders.subtract(totalPayments);
+                        if (balance.compareTo(BigDecimal.ZERO) < 0) {{
+                            throw new EBalanceErrorException("Negative balance for customer " + {merge_lookup_expr});
+                        }}
+
+                        Optional<{merge_entity}> existingBalance = {merge_repo_var}.{lookup_method}({merge_lookup_expr});
+                        BigDecimal oldBalance = existingBalance.isPresent() ? existingBalance.get().getBalance() : null;
+                        if (existingBalance.isPresent()) {{
+                            {merge_entity} balanceEntity = existingBalance.get();
+                            balanceEntity.setBalance(balance);
+                            balanceEntity.setUpdatedAt(LocalDateTime.now());
+                            {merge_repo_var}.save(balanceEntity);
+                        }} else {{
+                            {merge_entity} balanceEntity = new {merge_entity}();
+                            balanceEntity.setCustomerId({merge_lookup_expr});
+                            balanceEntity.setBalance(balance);
+                            balanceEntity.setCreatedAt(LocalDateTime.now());
+                            {merge_repo_var}.save(balanceEntity);
+                        }}
+
+                        {audit_entity} audit = new {audit_entity}();
+                        audit.setCustomerId({merge_lookup_expr});
+                        audit.setOldBalance(oldBalance);
+                        audit.setNewBalance(balance);
+                        audit.setActionDate(LocalDateTime.now());
+                        {audit_repo_var}.save(audit);
+                    }} catch (EBalanceErrorException e) {{
+                        batchHasError = true;
+                        saveErrorRecord(e.getMessage());
+                        continue;
+                    }} catch (Exception e) {{
+                        batchHasError = true;
+                        saveErrorRecord("Unexpected error: " + safeMessage(e));
+                        continue;
+                    }}
+                }}
+
+                if ("FULL".equalsIgnoreCase({run_mode_name}) && !batchHasError) {{
+                    pageNumber++;
+                    continue;
+                }}
+                break;
+            }}
+        }} catch (Exception fatalException) {{
+            saveErrorRecord("Fatal reconcile error: " + safeMessage(fatalException));
+            throw new RuntimeException("Fatal reconcile error", fatalException);
+        }}
+    }}
+"""
 
         # SBG-23 FIX: Re-normalise service files that were already written during
         # Stage 5 (generate_project). At that point _ddl_table_map was empty so

@@ -36,6 +36,7 @@ from src.advanced.advanced_features import create_advanced_features
 
 # Configure logging
 logger = logging.getLogger(__name__)
+PIPELINE_BUILD_ID = "2026-04-01-row-level-trycatch-v1"
 
 
 class ConversionError(RuntimeError):
@@ -92,6 +93,8 @@ class PLSQLModernizationPipeline:
         self.file_extractor = FileExtractor()
         self.repair_config = self.config.get('backup_llm', {}) or {}
         self._last_repair_result: Dict[str, Any] = {}
+        self._last_run_source_files: List[str] = []
+        self._last_run_units: List[str] = []
         
         # Initialize table metadata provider for entity schema synchronization
         self.table_metadata_provider = TableMetadataProvider()
@@ -103,6 +106,7 @@ class PLSQLModernizationPipeline:
         
         # Setup output directories
         self.setup_output_directories()
+        logger.info("Pipeline build id: %s", PIPELINE_BUILD_ID)
 
     def _merge_config(self, base: Dict[str, Any], overrides: Dict[str, Any]) -> None:
         """Recursively merge override values into the loaded config dict."""
@@ -121,6 +125,104 @@ class PLSQLModernizationPipeline:
         # (output_dir / 'resources').mkdir(parents=True, exist_ok=True)
         (self.output_directory / 'reports').mkdir(parents=True, exist_ok=True)
         # (output_dir / 'tests').mkdir(parents=True, exist_ok=True)
+
+    def _detect_skeleton_services(self, services: Dict[str, str]) -> List[str]:
+        """Detect behaviorally empty or stub-like generated services."""
+        skeleton_files: List[str] = []
+        skeleton_indicators = [
+            r'//\s*commit boundary handled per batch',
+            r'//\s*rollback boundary handled per batch',
+            r'for\s*\(\s*int\s+rowIndex\s*=\s*0\s*;\s*rowIndex\s*<\s*1\s*;',
+            r'findById\s*\(\s*0L\s*\)',
+            r'//\s*TODO',
+            r'Fallback service path used for',
+            r'new\s+\w+Entity\s*\(\s*\)\s*;\s*\n\s*\}',
+        ]
+        for filename, code in services.items():
+            if not code:
+                skeleton_files.append(filename)
+                continue
+            hit_count = sum(1 for pattern in skeleton_indicators if re.search(pattern, code))
+            if hit_count >= 2:
+                skeleton_files.append(filename)
+        return skeleton_files
+
+    def _enforce_semantic_patterns(self, service_code: str) -> str:
+        """Apply a compile-safe normalization pass before semantic validation."""
+        if not service_code or not service_code.strip():
+            return service_code
+
+        updated = service_code
+
+        has_error_declared = bool(re.search(r'\bboolean\s+hasError\s*=', updated))
+        has_error_checked = bool(re.search(r'\bif\s*\(\s*hasError\s*\)', updated))
+        if has_error_declared and not has_error_checked:
+            insertion = (
+                "\n        if (hasError) {\n"
+                "            saveErrorRecord(\"Errors occurred during processing\");\n"
+                "        }\n"
+            )
+            method_matches = list(re.finditer(r'^\s{4}\}', updated, flags=re.MULTILINE))
+            if method_matches:
+                last_method_close = method_matches[-1]
+                updated = updated[:last_method_close.start()] + insertion + updated[last_method_close.start():]
+            else:
+                updated += insertion
+
+        return updated
+
+    def _validate_cross_file_wiring(
+        self,
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+        services: Dict[str, str],
+    ) -> List[str]:
+        """Validate basic cross-file repository and entity wiring across generated files."""
+        issues: List[str] = []
+        repo_methods: Dict[str, set] = {}
+        for repo_file, repo_code in repositories.items():
+            repo_name = repo_file.replace('.java', '')
+            method_pattern = re.compile(
+                r"^\s*(?:@[\w().\", =]+[\r\n]+)?\s*(?:public\s+)?(?:default\s+)?[\w<>\[\], ?.]+\s+([A-Za-z_]\w*)\s*\([^;{]*\)\s*;",
+                flags=re.MULTILINE,
+            )
+            methods = {match.group(1) for match in method_pattern.finditer(repo_code)}
+            methods.update({'save', 'saveAll', 'findById', 'findAll', 'deleteById', 'delete', 'count', 'existsById'})
+            repo_methods[repo_name] = methods
+
+        entity_fields: Dict[str, set] = {}
+        for entity_file, entity_code in entities.items():
+            entity_name = entity_file.replace('.java', '')
+            fields = set(re.findall(r'private\s+(?!static)\S+\s+(\w+)\s*;', entity_code))
+            entity_fields[entity_name] = fields
+
+        for svc_file, svc_code in services.items():
+            repo_usages = re.findall(r'(\w+Repository)\s+(\w+)\s*[;,)]', svc_code)
+            for repo_type, repo_var in repo_usages:
+                available = repo_methods.get(repo_type, set())
+                calls = re.findall(rf'{re.escape(repo_var)}\.(\w+)\s*\(', svc_code)
+                for call in calls:
+                    if call not in available:
+                        issues.append(f"{svc_file}: calls {repo_type}.{call}() but method not found in repository interface")
+
+            entity_vars: Dict[str, str] = {}
+            for entity_type, var_name in re.findall(r'\b(\w+Entity)\s+(\w+)\s*=', svc_code):
+                entity_vars[var_name] = entity_type
+            for entity_type, var_name in re.findall(r'\b(\w+Entity)\s+(\w+)\s*[;,)]', svc_code):
+                entity_vars.setdefault(var_name, entity_type)
+
+            setter_pattern = re.compile(r'\b(\w+)\.set([A-Z]\w*)\s*\(')
+            for var_name, setter in setter_pattern.findall(svc_code):
+                entity_type = entity_vars.get(var_name)
+                if not entity_type:
+                    continue
+                fields = entity_fields.get(entity_type, set())
+                if not fields:
+                    continue
+                field_name = setter[:1].lower() + setter[1:] if setter else ''
+                if field_name and field_name not in fields:
+                    issues.append(f"{svc_file}: calls {entity_type}.set{setter}() but field '{field_name}' not on entity")
+        return issues
     
     async def run_pipeline(self, source_path: str, source_type: str = "file") -> Dict[str, Any]:
         """
@@ -131,15 +233,35 @@ class PLSQLModernizationPipeline:
             source_type (str): Type of source (file, git, database)
         """
         logger.info(f"Starting PL/SQL modernization pipeline for {source_type}: {source_path}")
+        logger.info("Active pipeline build id: %s", PIPELINE_BUILD_ID)
         
         try:
+            self._last_run_source_files = []
+            self._last_run_units = []
             # Stage 1: Extract PL/SQL code
             logger.info("Stage 1: Extracting PL/SQL code...")
             plsql_files = await self.extract_plsql_code(source_path, source_type)
+            self._last_run_source_files = sorted(plsql_files.keys())
             
             # Stage 2: Extract raw PL/SQL semantics and full object bodies
             logger.info("Stage 2: Extracting SQL semantics from raw PL/SQL...")
             semantic_model = await self.extract_conversion_semantics(plsql_files)
+            self._last_run_units = [
+                f"{str(unit.get('object_type', '')).upper()}:{unit.get('name', '')}"
+                for unit in (semantic_model.get("source_units", []) or [])
+            ]
+            logger.info("Stage 2: Source files in this run: %s", ", ".join(sorted(plsql_files.keys())) or "(none)")
+            discovered_units = semantic_model.get("source_units", []) or []
+            if discovered_units:
+                logger.info(
+                    "Stage 2: Discovered conversion units: %s",
+                    ", ".join(
+                        f"{unit.get('object_type', 'UNKNOWN')}:{unit.get('name', 'UNKNOWN')}"
+                        for unit in discovered_units
+                    ),
+                )
+            else:
+                logger.warning("Stage 2: No conversion units discovered for this run.")
             
             # SBG-30: Register procedure metadata for dynamic logic extraction
             logger.info("Stage 2b: Registering procedure metadata for dynamic Java generation...")
@@ -175,6 +297,37 @@ class PLSQLModernizationPipeline:
                     repositories,
                     service_feedback,
                 )
+                services = {name: self._enforce_semantic_patterns(code) for name, code in services.items()}
+
+                logger.info("Stage 5b: Cross-file wiring validation...")
+                wiring_issues = self._validate_cross_file_wiring(entities, repositories, services)
+                if wiring_issues:
+                    logger.warning("Cross-file wiring issues found: %d", len(wiring_issues))
+                    for issue in wiring_issues[:10]:
+                        logger.warning("  WIRING: %s", issue)
+                    for issue in wiring_issues:
+                        if ":" in issue:
+                            svc_file, issue_msg = issue.split(":", 1)
+                            service_feedback.setdefault(svc_file.strip(), []).append(issue_msg.strip())
+
+                if self.llm_engine.repair_provider:
+                    skeleton_services = self._detect_skeleton_services(services)
+                    if skeleton_services:
+                        logger.info(
+                            "[PREEMPTIVE-REPAIR] %d skeleton services detected before validation",
+                            len(skeleton_services),
+                        )
+                        try:
+                            preemptive_repairs = await self.llm_engine.repair_services_with_backup_llm(
+                                services={k: v for k, v in services.items() if k in skeleton_services},
+                                validation_issues=[],
+                                entities=entities,
+                                repositories=repositories,
+                            )
+                            if preemptive_repairs:
+                                services.update(preemptive_repairs)
+                        except Exception as exc:
+                            logger.warning("[PREEMPTIVE-REPAIR] Failed: %s", exc)
 
                 logger.info("Stage 6: Running semantic validation (attempt %s/3)...", attempt + 1)
                 semantic_validation = await self.validate_semantics(
@@ -283,6 +436,16 @@ class PLSQLModernizationPipeline:
             )
             
         except Exception as e:
+            if self._last_run_source_files:
+                logger.error(
+                    "Failure context - source files processed: %s",
+                    ", ".join(self._last_run_source_files),
+                )
+            if self._last_run_units:
+                logger.error(
+                    "Failure context - discovered units: %s",
+                    ", ".join(self._last_run_units),
+                )
             logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
             raise
     
@@ -370,6 +533,11 @@ class PLSQLModernizationPipeline:
             file_units = build_conversion_units(content)
             for unit in file_units:
                 unit["source_file"] = filename
+                if not unit.get('raw_plsql') or not str(unit.get('raw_plsql', '')).strip():
+                    logger.warning(
+                        "Unit '%s' from file '%s' has no raw_plsql - LLM will receive incomplete input",
+                        unit.get('name'), filename
+                    )
             units.extend(file_units)
 
             for table in model.get("schema", {}).get("tables", []):
@@ -438,6 +606,31 @@ class PLSQLModernizationPipeline:
                 merged_schema["sequence_mapping"].append(mapping)
 
         merged_schema["tables"] = sorted(table_index.values(), key=lambda item: item.get("name", ""))
+
+        logger.debug("Running cross-file dependency linking...")
+        global_unit_index: Dict[str, Dict[str, Any]] = {}
+        for unit in units:
+            name = str(unit.get('name', '')).upper()
+            if name:
+                global_unit_index[name] = unit
+        for unit in units:
+            dep_graph = unit.get('dependency_graph') or {}
+            called_procs = dep_graph.get('procedures_called') or []
+            for called_name in called_procs:
+                target = global_unit_index.get(str(called_name).upper())
+                if not target or target is unit:
+                    continue
+                if target.get('cursor') and not unit.get('cursor'):
+                    unit.setdefault('inherited_cursors', []).append(target['cursor'])
+                for table, ops in (target.get('operations_by_table') or {}).items():
+                    unit.setdefault('dependency_operations_by_table', {}).setdefault(table, [])
+                    for op in ops:
+                        if op not in unit['dependency_operations_by_table'][table]:
+                            unit['dependency_operations_by_table'][table].append(op)
+                for table_name in (target.get('skip_locked_tables') or []):
+                    if table_name not in (unit.get('skip_locked_tables') or []):
+                        unit.setdefault('skip_locked_tables', []).append(table_name)
+        logger.debug("Cross-file linking complete. %d units processed.", len(units))
         sequence_map: Dict[str, str] = {}
         for mapping in merged_schema.get("sequence_mapping", []):
             sequence_name = str(mapping.get("sequence_name", "")).upper()
@@ -542,6 +735,7 @@ class PLSQLModernizationPipeline:
                         'object_type': object_type,
                         'parameters': unit.get('input_parameters', []),
                         'output_parameters': unit.get('output_parameters', []),
+                        'source_unit': unit,
                     }
                     procedures.append(proc_entry)
                     
@@ -814,7 +1008,8 @@ class PLSQLModernizationPipeline:
             obj_type = unit.get("object_type", "")
             unit_name = unit.get("name", "")
             source_len = len(unit.get("raw_plsql", ""))
-            logger.debug(f"  - {obj_type}: {unit_name} ({source_len} bytes)")
+            source_file = unit.get("source_file", "")
+            logger.info(f"  - {obj_type}: {unit_name} ({source_len} bytes) from {source_file or 'unknown source'}")
         
         return await self.llm_engine.generate_services_from_semantics(
             source_units,
