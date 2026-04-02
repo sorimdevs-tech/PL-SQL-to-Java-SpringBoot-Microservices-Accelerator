@@ -156,7 +156,9 @@ class PLSQLModernizationPipeline:
 
         has_error_declared = bool(re.search(r'\bboolean\s+hasError\s*=', updated))
         has_error_checked = bool(re.search(r'\bif\s*\(\s*hasError\s*\)', updated))
-        if has_error_declared and not has_error_checked:
+        has_save_error_record = "saveErrorRecord(" in updated
+        has_nested_class = bool(re.search(r'\b(public|private|protected)\s+(static\s+)?class\b', updated))
+        if has_error_declared and not has_error_checked and has_save_error_record and not has_nested_class:
             insertion = (
                 "\n        if (hasError) {\n"
                 "            saveErrorRecord(\"Errors occurred during processing\");\n"

@@ -29,6 +29,9 @@ from src.parser.discovery_analyzer import analyze_sql_source, build_discovery_mo
 from src.utils.config import load_config
 from src.parser.sql_table_discovery import SQLDiscoveryParseError, extract_create_table_names
 
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = BACKEND_ROOT / "config.json"
+
 
 def _utc_now() -> str:
     """Return an ISO timestamp in UTC."""
@@ -1379,7 +1382,7 @@ async def list_git_tree(request: GitRepoTreeRequest) -> Dict[str, Any]:
 async def dependency_suggestions(request: DependencySuggestionRequest) -> Dict[str, Any]:
     """Return optional dependency suggestions from the LLM."""
     try:
-        config = load_config("config.json")
+        config = load_config(str(DEFAULT_CONFIG_PATH))
         llm_cfg = config.llm.model_dump() if hasattr(config.llm, "model_dump") else config.llm.dict()
         llm = LLMConversionEngine(llm_cfg)
         suggestions = await llm.suggest_dependencies(
@@ -1398,7 +1401,17 @@ async def dependency_suggestions(request: DependencySuggestionRequest) -> Dict[s
         )
         return {"suggestions": suggestions}
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logging.getLogger(__name__).warning("Dependency suggestions unavailable: %s", exc)
+        return {"suggestions": []}
+    except FileNotFoundError as exc:
+        logging.getLogger(__name__).warning("Dependency suggestions unavailable: %s", exc)
+        return {"suggestions": []}
+    except RuntimeError as exc:
+        logging.getLogger(__name__).warning("Dependency suggestions unavailable: %s", exc)
+        return {"suggestions": []}
+    except ImportError as exc:
+        logging.getLogger(__name__).warning("Dependency suggestions unavailable: %s", exc)
+        return {"suggestions": []}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Suggestion failed: {exc}") from exc
 

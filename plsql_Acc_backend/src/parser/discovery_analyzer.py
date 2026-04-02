@@ -556,17 +556,21 @@ def _infer_foreign_keys_from_naming_patterns(
     3. DEPT_ID -> DEPARTMENT (fuzzy: DEPT is prefix of DEPARTMENT)
     4. Exact table name match
     
-    IMPORTANT: Columns CAN be both PRIMARY KEY and FOREIGN KEY (common in junction tables).
-    We check ALL columns for FK patterns, not just non-PK columns.
+    IMPORTANT: explicit constraints are handled separately. For naming-based inference,
+    primary-key columns are too noisy and create false positives such as
+    CUSTOMERS.CUSTOMER_ID -> CUSTOMER_BALANCE, so we skip PK columns here.
     """
     inferred_fks = []
     source_table_upper = source_table.upper()
     available_tables_upper = {t.upper(): t for t in available_tables} if available_tables else {}
+    primary_keys_upper = {str(key).upper() for key in (primary_keys or []) if key}
     
     for col in columns:
         col_name = col.get("name", "").upper()
         
         if not col_name or col_name in {"ROWID", "ROWNUM"}:
+            continue
+        if col_name in primary_keys_upper:
             continue
         
         potential_target = None
@@ -580,14 +584,25 @@ def _infer_foreign_keys_from_naming_patterns(
                 if prefix in available_tables_upper and prefix != source_table_upper:
                     potential_target = prefix
                     target_column = col_name
+                elif f"{prefix}S" in available_tables_upper and f"{prefix}S" != source_table_upper:
+                    potential_target = f"{prefix}S"
+                    target_column = col_name
+                elif f"{prefix}ES" in available_tables_upper and f"{prefix}ES" != source_table_upper:
+                    potential_target = f"{prefix}ES"
+                    target_column = col_name
+                elif prefix.endswith("Y") and f"{prefix[:-1]}IES" in available_tables_upper and f"{prefix[:-1]}IES" != source_table_upper:
+                    potential_target = f"{prefix[:-1]}IES"
+                    target_column = col_name
                 # Fuzzy match: look for table that starts with prefix or prefix is substring
                 elif not potential_target:
                     for table_upper in available_tables_upper.keys():
                         if table_upper != source_table_upper:
-                            # Check if prefix matches start of table or table starts with prefix
-                            if (table_upper.startswith(prefix) or 
-                                prefix in table_upper or
-                                table_upper.startswith(prefix[:3]) and len(prefix) >= 3):  # At least 3 chars match
+                            # Only use broader prefix heuristics when a cleaner singular/plural
+                            # table-name match was not found above.
+                            if (
+                                table_upper.startswith(f"{prefix}_")
+                                or (len(prefix) >= 3 and table_upper.startswith(prefix[:3]) and "_" in table_upper)
+                            ):
                                 potential_target = table_upper
                                 target_column = table_upper + "ID"
                                 break

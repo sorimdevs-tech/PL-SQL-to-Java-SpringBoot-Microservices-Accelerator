@@ -2103,6 +2103,9 @@ class LLMConversionEngine:
             service_feedback = feedback_for_service.get(filename, []) or feedback_for_service.get(unit_name, [])
             sanitize_context = {
                 'package_name': self.config.get('output', {}).get('package_name', 'com.company.project'),
+                'service_filename': filename,
+                'entity_names': list(entities.keys()),
+                'repository_names': list(repositories.keys()),
             }
 
             unit = self._apply_feedback_flags_to_unit(unit, service_feedback)
@@ -3924,14 +3927,42 @@ Return ONLY the corrected complete Java code. No markdown, no explanations.
         cleaned = re.sub(r'\bv_\w+\s*\(\s*i\s*\)\.(\w+)', r'current\1', cleaned)
         cleaned = re.sub(r'\bBalanceAuditLogEntity\s+entity\s*=', 'BalanceAuditLogEntity auditLogEntity =', cleaned)
         cleaned = re.sub(r'\bErrorLogEntity\s+entity\s*=', 'ErrorLogEntity errorLogEntity =', cleaned)
+        cleaned = self._normalize_service_class_name(cleaned, context)
+        cleaned = self._normalize_generated_service_aliases(cleaned, context)
         cleaned = self._ensure_row_level_continue_in_paged_catches(cleaned)
 
         return self._clean_java_code(cleaned)
 
-    def _ensure_row_level_continue_in_paged_catches(self, code: str) -> str:
+    def _normalize_service_class_name(self, code: str, context: Dict[str, Any]) -> str:
+        filename = str((context or {}).get('service_filename') or '').strip()
+        if not filename.endswith('.java'):
+            return code
+        expected_class = filename[:-5]
+        return re.sub(
+            r'\bpublic\s+class\s+\w+',
+            f'public class {expected_class}',
+            code,
+            count=1,
+        )
+
+    def _normalize_generated_service_aliases(self, code: str, context: Dict[str, Any]) -> str:
         if not code:
             return code
-        if "PageRequest.of(" not in code and "pageBatch.getContent()" not in code and "findPageForUpdateSkipLocked" not in code:
+
+        cleaned = code
+        entity_names = set((context or {}).get('entity_names') or [])
+        repository_names = set((context or {}).get('repository_names') or [])
+
+        if 'BalanceAuditLogEntity.java' in entity_names and 'AuditLogEntity.java' not in entity_names:
+            cleaned = re.sub(r'\bAuditLogEntity\b', 'BalanceAuditLogEntity', cleaned)
+        if 'BalanceAuditLogRepository.java' in repository_names and 'AuditLogRepository.java' not in repository_names:
+            cleaned = re.sub(r'\bAuditLogRepository\b', 'BalanceAuditLogRepository', cleaned)
+
+        cleaned = re.sub(r'\b([A-Za-z_]\w*Entity)get([A-Z]\w*)\b', r'\1::get\2', cleaned)
+        return cleaned
+
+    def _ensure_row_level_continue_in_paged_catches(self, code: str) -> str:
+        if not code:
             return code
         if "catch" not in code:
             return code
@@ -3945,7 +3976,7 @@ Return ONLY the corrected complete Java code. No markdown, no explanations.
             prefix, body, suffix = match.groups()
             if "continue;" in body:
                 return match.group(0)
-            if "saveErrorRecord(" not in body:
+            if "saveErrorRecord(" not in body and "saveErrorLog(" not in body:
                 return match.group(0)
             if not any(flag in body for flag in ("batchHasError", "currentBatchHasError", "hasError")):
                 return match.group(0)
