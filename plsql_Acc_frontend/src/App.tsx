@@ -21,7 +21,7 @@ function App() {
       <div className="pointer-events-none absolute right-0 top-0 h-72 w-72 rounded-full bg-sky-300/20 blur-3xl" />
       <div className="pointer-events-none absolute inset-0 bg-grid-pattern opacity-40" />
 
-      <div className="relative z-10 mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 pb-10 pt-6 md:px-6 lg:px-8">
+      <div className="relative z-10 mx-auto flex w-[90%] flex-col gap-6 px-2 pb-10 pt-6 sm:px-3 md:px-4">
         <header className="rounded-2xl border border-slate-200/80 bg-white/85 p-5 shadow-lg shadow-slate-200/40 backdrop-blur">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -40,9 +40,9 @@ function App() {
               <Badge variant="info" className="normal-case tracking-normal">
                 Wizard Mode
               </Badge>
-              <Button variant="outline" size="sm">
+              {/* <Button variant="outline" size="sm">
                 Docs
-              </Button>
+              </Button> */}
               {/* <Button size="sm">
                 Run latest profile
                 <ArrowRight className="h-4 w-4" />

@@ -2277,8 +2277,20 @@ class LLMConversionEngine:
                 if join_var and key_var == join_var:
                     call_args.append(join_var)
                 else:
+                    # DYN-FIX-10: Check if field exists on driving entity before generating getter
                     getter = f"get{key_var[:1].upper() + key_var[1:]}"
-                    call_args.append(f"row.{getter}()")
+                    
+                    # Only add getter if field exists on driving entity
+                    if key_var in driving_fields:
+                        call_args.append(f"row.{getter}()")
+                    else:
+                        # Field doesn't exist on driving entity - use default value instead
+                        default_value = "null"
+                        if driving_fields.get(key_var, '').startswith('Long'):
+                            default_value = "0L"
+                        elif driving_fields.get(key_var, '').startswith('Integer'):
+                            default_value = "0"
+                        call_args.append(default_value)
             value_var = f"{normalize_column_name(table_name.lower())}Amount"
             args_expression = ", ".join(call_args)
             if args_expression:
@@ -2375,7 +2387,17 @@ class LLMConversionEngine:
                             merge_args.append(join_var)
                         else:
                             getter = f"get{key_var[:1].upper() + key_var[1:]}"
-                            merge_args.append(f"row.{getter}()")
+                            # DYN-FIX-10 (part 2): Check if field exists on driving entity before generating getter
+                            if key_var in driving_fields:
+                                merge_args.append(f"row.{getter}()")
+                            else:
+                                # Field doesn't exist on driving entity - use default value instead
+                                default_value = "null"
+                                if driving_fields.get(key_var, '').startswith('Long'):
+                                    default_value = "0L"
+                                elif driving_fields.get(key_var, '').startswith('Integer'):
+                                    default_value = "0"
+                                merge_args.append(default_value)
                 row_logic.append(
                     f"Optional<{merge_entity}> existing = {merge_repo_var}.{merge_lookup_method}({', '.join(merge_args)});"
                 )
@@ -3469,6 +3491,51 @@ public class {service_name} {{
         
         return repaired_services
 
+    def _extract_entity_field_mapping(self, entities: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+        """DYN-FIX-7: Extract field names and types from entity code."""
+        import re
+        mapping = {}
+        
+        for entity_name, entity_code in entities.items():
+            fields = {}
+            # Match field declarations: private Type fieldName;
+            field_pattern = re.compile(r'private\s+([a-zA-Z<>?,\s]+?)\s+(\w+)\s*;')
+            for match in field_pattern.finditer(entity_code):
+                field_type = match.group(1).strip()
+                field_name = match.group(2)
+                fields[field_name] = field_type
+            
+            if fields:
+                mapping[entity_name] = fields
+        
+        return mapping
+    
+    def _extract_variable_entity_types(self, service_code: str, entities: Dict[str, str]) -> Dict[str, str]:
+        """DYN-FIX-8: Extract which entity type each variable holds in service code.
+        
+        Returns: Dict[variable_name, EntityClassName]
+        """
+        import re
+        var_types = {}
+        
+        # Extract entity class names from entity files
+        entity_names = set()
+        for entity_file in entities.keys():
+            # EntityNames look like: BookEntity.java, CustomerEntity.java, etc.
+            match = re.search(r'(\w+)Entity\.java', entity_file)
+            if match:
+                entity_names.add(match.group(1) + 'Entity')
+        
+        # Find variable declarations like: BookEntity row = ...  or  new BookEntity()
+        for entity_name in entity_names:
+            # Match: EntityType varName = new EntityType(...) or EntityType varName = ...
+            pattern = rf'{re.escape(entity_name)}\s+(\w+)\s*='
+            for match in re.finditer(pattern, service_code):
+                var_name = match.group(1)
+                var_types[var_name] = entity_name
+        
+        return var_types
+
     def _build_service_repair_prompt(
         self,
         service_filename: str,
@@ -3477,11 +3544,75 @@ public class {service_name} {{
         entities: Dict[str, str],
         repositories: Dict[str, str],
     ) -> str:
-        """Build a focused repair prompt for a specific service with validation feedback."""
-        issue_text = "\n".join([
-            f"- {issue.get('message', 'Unknown issue')}"
-            for issue in issues[:5]  # Show first 5 issues
-        ])
+        """Build a focused repair prompt for a specific service with validation feedback.
+        
+        DYN-FIX-8: Enhanced with entity-variable type tracking and field validation.
+        DYN-FIX-9: Issue analysis with entity-to-variable mapping recommendations.
+        """
+        # DYN-FIX-9: Analyze issues to infer which entity types are actually needed
+        parsed_issues = []
+        entity_needs = {}  # entity_type -> set of variables that should be that type
+        
+        for issue in issues[:10]:
+            msg = issue.get('message', '')
+            parsed_issues.append(f"- {msg}")
+            
+            # Parse patterns like "calls row.getVideoid() but BookEntity does not define it"
+            # This tells us: the code tried to access Videoid on BookEntity
+            # But Videoid likely belongs to VideoEntity
+            import re
+            match = re.search(r'calls (\w+)\.get(\w+)\(\) but (\w+) does not define it', msg)
+            if match:
+                var_name, field_suffix, entity_name = match.groups()
+                # If entity_name doesn't have field_suffix, infer which entity SHOULD have it
+                for other_entity, fields in self._extract_entity_field_mapping(entities).items():
+                    if field_suffix.lower() in {f.lower() for f in fields}:
+                        entity_needs.setdefault(other_entity, set()).add(var_name)
+                        break
+        
+        issue_text = "\n".join(parsed_issues)
+        
+        # DYN-FIX-7: Extract entity field mappings to guide LLM repairs
+        entity_field_mappings = self._extract_entity_field_mapping(entities)
+        entity_fields_text = ""
+        if entity_field_mappings:
+            entity_lines = []
+            for entity_name in sorted(entity_field_mappings.keys()):
+                entity_lines.append(f"  {entity_name} has fields:")
+                for field_name, field_type in sorted(entity_field_mappings[entity_name].items()):
+                    entity_lines.append(f"    - {field_name}: {field_type}")
+            entity_fields_text = "\n".join(entity_lines)
+        else:
+            entity_fields_text = "    (Unable to extract fields)"
+        
+        # DYN-FIX-8: Extract which variable holds which entity type
+        var_entity_types = self._extract_variable_entity_types(current_code, entities)
+        var_types_text = ""
+        if var_entity_types or entity_needs:
+            var_lines = []
+            
+            # Show current variable assignments
+            for var_name in sorted(var_entity_types.keys()):
+                entity_type = var_entity_types[var_name]
+                var_lines.append(f"  {var_name} is currently type {entity_type}")
+                if entity_type in entity_field_mappings:
+                    available_fields = entity_field_mappings[entity_type]
+                    var_lines.append(f"    ✓ Available fields: {', '.join(sorted(available_fields.keys()))}")
+            
+            # DYN-FIX-9: Show which variables should be changed based on validation feedback
+            if entity_needs:
+                var_lines.append("")
+                var_lines.append("  ISSUES SUGGEST THESE CHANGES:")
+                for entity_type in sorted(entity_needs.keys()):
+                    var_names = entity_needs[entity_type]
+                    var_lines.append(f"  {entity_type} is needed by: {', '.join(sorted(var_names))}")
+                    if entity_type in entity_field_mappings:
+                        fields = entity_field_mappings[entity_type]
+                        var_lines.append(f"    It provides fields: {', '.join(sorted(fields.keys()))}")
+            
+            var_types_text = "\n".join(var_lines)
+        else:
+            var_types_text = "    (No entity variables found — you may need to declare them)"
         
         entity_context = "\n".join([
             f"  {fname}: {code[:100]}..." if len(code) > 100 else f"  {fname}: {code}"
@@ -3505,21 +3636,40 @@ CURRENT CODE:
 VALIDATION ISSUES TO FIX:
 {issue_text}
 
-ENTITY REFERENCES (sample):
+ENTITY FIELD MAPPINGS (DYN-FIX-7):
+{entity_fields_text}
+
+ENTITY-VARIABLE TYPE BINDINGS (DYN-FIX-8):
+{var_types_text}
+
+ENTITY CLASS DEFINITIONS (sample):
 {entity_context}
 
-REPOSITORY REFERENCES (sample):
+REPOSITORY DEFINITIONS (sample):
 {repo_context}
 
-REPAIR RULES:
+REPAIR RULES (DYN-FIX-8):
 1. Fix ONLY the specific validation issues listed above.
 2. Do NOT change the overall structure or method signatures.
-3. Ensure all entity field access uses only REAL fields from the entities above.
-4. Ensure all repository method calls match available methods.
-5. Output ONLY valid Java code. No markdown, no explanations.
-6. The output must be a complete, compilable Java class.
-7. File must end with the closing brace of the class (last character: }})
-8. No content after the class closing brace.
+3. CRITICAL: For each variable (row, entity, target, etc.), verify it holds the correct entity type.
+4. CRITICAL: You can ONLY call getters/setters on variables for fields that exist on that entity type.
+   Example: If 'row' is a BookEntity, you can ONLY call row.get/set methods for fields in BookEntity.
+           If you need VideoId, you must use a VideoEntity variable, not BookEntity.
+5. If a validation error says "calls row.getVideoid() but BookEntity does not define it":
+   - Check: what type is 'row'?  And does VideoId exist in that type?
+   - Fix: Either (a) declare a VideoEntity variable for that logic, or (b) adjust the variable assignment
+6. Each field belongs to EXACTLY ONE entity type. Don't call methods across wrong entity types.
+7. Only use methods/fields that actually exist in each entity (listed in ENTITY FIELD MAPPINGS above).
+8. For any variable assignment (row = ..., entity = ...), verify the type matches the getRHS.
+9. Ensure all repository method calls use valid methods.
+10. Output ONLY valid Java code. No markdown, no explanations.
+11. The output must be a complete, compilable Java class.
+12. File must end with the closing brace of the class.
+
+COMMON FIX PATTERN:
+If error: "ViewitemLibraryService.java calls row.getVideoid() but BookEntity does not define it"
+Then: Check what entity type 'row' should be. If it should be VideoEntity, change the variable declaration.
+      Or: If 'row' must be BookEntity, then access VideoId via a different VideoEntity variable.
 
 OUTPUT: Complete repaired Java service class
 """

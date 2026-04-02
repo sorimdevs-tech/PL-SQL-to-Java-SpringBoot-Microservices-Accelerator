@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import {
-  ChevronLeft,
   ChevronRight,
   Database,
   Download,
@@ -46,6 +45,7 @@ import type {
   SqlDiscoveryProcedure,
   SqlDiscoveryObject,
   SqlErrorHandling,
+  SqlLocalVariable,
   SqlRetryLogic,
   SqlDiscoverySchema,
   SqlSchemaRelationship,
@@ -319,8 +319,20 @@ interface GlobalSchemaPanelProps {
 }
 
 function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
+  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set())
   const globalTables = props.schema.tables ?? []
   const selectedSchemaTable = globalTables.find((table) => table.name === props.selectedTable) ?? null
+
+  // DYN-UI-5: Toggle expand/collapse per table dynamically
+  const toggleExpanded = (tableName: string) => {
+    const newExpanded = new Set(expandedTables)
+    if (newExpanded.has(tableName)) {
+      newExpanded.delete(tableName)
+    } else {
+      newExpanded.add(tableName)
+    }
+    setExpandedTables(newExpanded)
+  }
 
   return (
     <Card>
@@ -352,7 +364,7 @@ function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
         <div className="space-y-3">
           <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-white">
             <div className="absolute inset-0 bg-grid-pattern opacity-30" />
-            <div className="relative h-full min-h-[320px] overflow-auto p-6">
+            <div className="relative h-full min-h-[320px] overflow-auto p-6 flex items-center justify-center">
               {(() => {
                 const relationships: SqlSchemaRelationship[] = props.schema.relationships ?? []
                 const cardWidth = 220
@@ -419,30 +431,86 @@ function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
                       if (!pos) {
                         return null
                       }
+                      
+                      // DYN-UI-1: Dynamic card height based on column count and expansion state
+                      const isExpanded = expandedTables.has(table.name)
+                      
+                      const HEADER_HEIGHT = 32
+                      const CONTENT_PADDING = 16
+                      const LINE_HEIGHT = 18
+                      const MIN_HEIGHT = cardHeight
+                      const MAX_HEIGHT_COLLAPSED = 220
+                      const MAX_HEIGHT_EXPANDED = 500
+                      
+                      const contentHeightNeeded = table.columns.length > 0 
+                        ? (table.columns.length * LINE_HEIGHT) + CONTENT_PADDING
+                        : 24
+                        
+                      const totalHeightNeeded = HEADER_HEIGHT + contentHeightNeeded
+                      
+                      let actualCardHeight: number
+                      let needsScroll: boolean
+                      
+                      if (isExpanded) {
+                        actualCardHeight = Math.min(Math.max(totalHeightNeeded, MIN_HEIGHT), MAX_HEIGHT_EXPANDED)
+                        needsScroll = totalHeightNeeded > MAX_HEIGHT_EXPANDED
+                      } else {
+                        actualCardHeight = Math.min(Math.max(MIN_HEIGHT, totalHeightNeeded), MAX_HEIGHT_COLLAPSED)
+                        needsScroll = totalHeightNeeded > MAX_HEIGHT_COLLAPSED
+                      }
+                      
+                      const contentHeight = actualCardHeight - HEADER_HEIGHT
+                      
                       return (
                         <div
                           key={table.name}
-                          className="absolute overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
-                          style={{ width: cardWidth, height: cardHeight, left: pos.x, top: pos.y }}
+                          className="absolute overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm hover:shadow-md transition-shadow"
+                          style={{ width: cardWidth, height: actualCardHeight, left: pos.x, top: pos.y }}
                         >
-                          <div className="rounded-t-xl border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
-                            {table.name}
+                          {/* Header with expand toggle */}
+                          <div 
+                            className="cursor-pointer rounded-t-xl border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 transition-colors"
+                            onClick={() => toggleExpanded(table.name)}
+                            title={isExpanded ? 'Click to collapse' : 'Click to expand all columns'}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="flex-1">{table.name}</span>
+                              <div className="flex items-center gap-1">
+                                {/* DYN-UI-2: Dynamic column count label */}
+                                <span className="text-[10px] font-normal text-slate-500">
+                                  {table.columns.length}
+                                </span>
+                                {/* DYN-UI-5: Expand/collapse indicator */}
+                                <span className={`text-[12px] text-slate-400 transition-transform ${ isExpanded ? 'rotate-180' : ''}`}>
+                                  ▼
+                                </span>
+                              </div>
+                            </div>
                           </div>
-                          <div className="flex h-[108px] flex-col overflow-auto px-3 py-2 text-xs text-slate-600">
+                          
+                          {/* Content with dynamic height and scrolling */}
+                          <div 
+                            className={`relative flex flex-col px-3 py-2 text-xs text-slate-600 ${needsScroll ? 'overflow-y-auto' : 'overflow-hidden'}`}
+                            style={{ height: contentHeight }}
+                          >
                             {table.columns.length > 0 ? (
-                              <ul className="space-y-1">
-                                {table.columns.slice(0, 5).map((col) => (
-                                  <li key={`${table.name}-${col.name}`}>
-                                    {col.name} <span className="text-slate-400">({col.type})</span>
+                              <ul className="space-y-0.5">
+                                {/* DYN-UI-3: Show ALL columns dynamically, no hard-coded limit */}
+                                {table.columns.map((col) => (
+                                  <li key={`${table.name}-${col.name}`} className="truncate" title={`${col.name} (${col.type})`}>
+                                    <span className="font-medium text-slate-700">{col.name}</span>
+                                    <span className="text-slate-400"> ({col.type})</span>
                                   </li>
                                 ))}
                               </ul>
                             ) : (
                               <p className="text-slate-400">No columns detected</p>
                             )}
-                            {table.columns.length > 5 ? (
-                              <p className="mt-1 text-[11px] text-slate-400">+{table.columns.length - 5} more</p>
-                            ) : null}
+                            
+                            {/* DYN-UI-4: Gradient fade indicator for scrollable content */}
+                            {needsScroll && (
+                              <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-6 bg-gradient-to-t from-white to-transparent" />
+                            )}
                           </div>
                         </div>
                       )
@@ -528,6 +596,8 @@ function GlobalSchemaPanel(props: GlobalSchemaPanelProps) {
 interface ProcedureBehaviorPanelProps {
   activeProcedure: SqlDiscoveryProcedure | null
   activeAnalysis: SqlDiscoveryAnalyzeResponse | SqlDiscoveryObject | null
+  globalSchema?: SqlDiscoverySchema | null
+  fullAnalysis?: SqlDiscoveryAnalyzeResponse | null
 }
 
 interface CollapsibleInsightSectionProps {
@@ -687,6 +757,15 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
                   <li key={tableName}>{tableName}</li>
                 ))}
               </ul>
+            ) : (props.globalSchema?.tables ?? []).length > 0 ? (
+              <div className="space-y-1">
+                <p className="text-xs text-slate-500 mb-2">Tables discovered in repository:</p>
+                <ul className="space-y-1 text-slate-700">
+                  {(props.globalSchema?.tables ?? []).map((table) => (
+                    <li key={table.name}>{table.name}</li>
+                  ))}
+                </ul>
+              </div>
             ) : (
               <p className="text-slate-500">No tables detected</p>
             )}
@@ -709,9 +788,57 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
                   </div>
                 ))}
               </div>
-            ) : (
-              <p className="text-slate-500">No CRUD operations detected</p>
-            )}
+            ) : (() => {
+              // Fallback 1: Check if activeAnalysis has operationsByTable
+              const analysisOps = (props.activeAnalysis as any)?.operationsByTable as Record<string, string[]> | undefined
+              if (analysisOps && Object.entries(analysisOps).length > 0) {
+                return (
+                  <div className="space-y-2 text-slate-700">
+                    {Object.entries(analysisOps).map(([tableName, operations]) => (
+                      <div key={tableName} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                        <p className="font-semibold">{tableName}</p>
+                        <p>{operations.join(", ")}</p>
+                      </div>
+                    ))}
+                  </div>
+                )
+              }
+              
+              // Fallback 2: Aggregate from all procedures in fullAnalysis
+              if (props.fullAnalysis?.discovery?.procedures) {
+                const allProcOps: Record<string, Set<string>> = {}
+                
+                props.fullAnalysis.discovery.procedures.forEach((proc) => {
+                  const ops = proc.operations ?? {}
+                  Object.entries(ops).forEach(([table, tableOps]) => {
+                    if (!allProcOps[table]) {
+                      allProcOps[table] = new Set()
+                    }
+                    if (Array.isArray(tableOps)) {
+                      tableOps.forEach((op: string) => allProcOps[table].add(op))
+                    }
+                  })
+                })
+                
+                if (Object.entries(allProcOps).length > 0) {
+                  return (
+                    <div className="space-y-2 text-slate-700">
+                      <p className="text-xs text-slate-500 mb-2">CRUD operations discovered in repository:</p>
+                      {Object.entries(allProcOps)
+                        .map(([tableName, operations]) => [tableName, Array.from(operations).sort()] as const)
+                        .map(([tableName, operations]) => (
+                          <div key={tableName} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <p className="font-semibold">{tableName}</p>
+                            <p>{operations.join(", ")}</p>
+                          </div>
+                        ))}
+                    </div>
+                  )
+                }
+              }
+              
+              return <p className="text-slate-500">No CRUD operations detected</p>
+            })()}
           </CardContent>
         </Card>
 
@@ -728,9 +855,48 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
                   </li>
                 ))}
               </ul>
-            ) : (
-              <p className="text-slate-500">No variables detected</p>
-            )}
+            ) : (() => {
+              // Fallback 1: Check if activeAnalysis has localVariables
+              const analysisVars = (props.activeAnalysis as any)?.localVariables as SqlLocalVariable[] | undefined
+              if (analysisVars && analysisVars.length > 0) {
+                return (
+                  <ul className="space-y-1 text-slate-700">
+                    {analysisVars.map((variable) => (
+                      <li key={variable.name}>
+                        {variable.name} ({variable.type})
+                      </li>
+                    ))}
+                  </ul>
+                )
+              }
+              
+              // Fallback 2: Aggregate from all procedures in fullAnalysis
+              if (props.fullAnalysis?.discovery?.procedures) {
+                const allVariables: SqlLocalVariable[] = []
+                
+                props.fullAnalysis.discovery.procedures.forEach((proc) => {
+                  const vars = proc.variables ?? []
+                  allVariables.push(...vars)
+                })
+                
+                if (allVariables.length > 0) {
+                  return (
+                    <div>
+                      <p className="text-xs text-slate-500 mb-2">Variables discovered in repository:</p>
+                      <ul className="space-y-1 text-slate-700">
+                        {allVariables.map((variable) => (
+                          <li key={variable.name}>
+                            {variable.name} ({variable.type})
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )
+                }
+              }
+              
+              return <p className="text-slate-500">No variables detected</p>
+            })()}
           </CardContent>
         </Card>
       </div>
@@ -749,9 +915,46 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
                   </div>
                 ))}
               </div>
-            ) : (
-              <p className="text-slate-500">No SELECT INTO data flow detected</p>
-            )}
+            ) : (() => {
+              // Fallback 1: Check if activeAnalysis has dataFlow
+              const analysisDataFlow = (props.activeAnalysis as any)?.dataFlow as SqlDataFlow[] | undefined
+              if (analysisDataFlow && analysisDataFlow.length > 0) {
+                return (
+                  <div className="space-y-2 text-slate-700">
+                    {analysisDataFlow.map((flow: SqlDataFlow, index: number) => (
+                      <div key={`${flow.variable}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                        {flow.variable} {"<-"} {flow.source}
+                      </div>
+                    ))}
+                  </div>
+                )
+              }
+              
+              // Fallback 2: Aggregate from all procedures in fullAnalysis
+              if (props.fullAnalysis?.discovery?.procedures) {
+                const allDataFlows: SqlDataFlow[] = []
+                
+                props.fullAnalysis.discovery.procedures.forEach((proc) => {
+                  const flows = proc.data_flow ?? []
+                  allDataFlows.push(...flows)
+                })
+                
+                if (allDataFlows.length > 0) {
+                  return (
+                    <div className="space-y-2 text-slate-700">
+                      <p className="text-xs text-slate-500 mb-2">Data flows discovered in repository:</p>
+                      {allDataFlows.map((flow: SqlDataFlow, index: number) => (
+                        <div key={`${flow.variable}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                          {flow.variable} {"<-"} {flow.source}
+                        </div>
+                      ))}
+                    </div>
+                  )
+                }
+              }
+              
+              return <p className="text-slate-500">No SELECT INTO data flow detected</p>
+            })()}
           </CardContent>
         </Card>
 
@@ -770,9 +973,50 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
                   </div>
                 ))}
               </div>
-            ) : (
-              <p className="text-slate-500">No conditional business logic detected</p>
-            )}
+            ) : (() => {
+              // Fallback 1: Check if activeAnalysis has businessRules
+              const analysisRules = (props.activeAnalysis as any)?.businessRules as SqlBusinessRule[] | undefined
+              if (analysisRules && analysisRules.length > 0) {
+                return (
+                  <div className="space-y-2 text-slate-700">
+                    {analysisRules.map((rule: SqlBusinessRule, index: number) => (
+                      <div key={`${rule.condition}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                        <p className="font-semibold">IF {rule.condition}</p>
+                        <p>THEN {rule.true_action || "N/A"}</p>
+                        {rule.false_action ? <p>ELSE {rule.false_action}</p> : null}
+                      </div>
+                    ))}
+                  </div>
+                )
+              }
+              
+              // Fallback 2: Aggregate from all procedures in fullAnalysis
+              if (props.fullAnalysis?.discovery?.procedures) {
+                const allRules: SqlBusinessRule[] = []
+                
+                props.fullAnalysis.discovery.procedures.forEach((proc) => {
+                  const rules = proc.business_rules ?? []
+                  allRules.push(...rules)
+                })
+                
+                if (allRules.length > 0) {
+                  return (
+                    <div className="space-y-2 text-slate-700">
+                      <p className="text-xs text-slate-500 mb-2">Business rules discovered in repository:</p>
+                      {allRules.map((rule: SqlBusinessRule, index: number) => (
+                        <div key={`${rule.condition}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                          <p className="font-semibold">IF {rule.condition}</p>
+                          <p>THEN {rule.true_action || "N/A"}</p>
+                          {rule.false_action ? <p>ELSE {rule.false_action}</p> : null}
+                        </div>
+                      ))}
+                    </div>
+                  )
+                }
+              }
+              
+              return <p className="text-slate-500">No conditional business logic detected</p>
+            })()}
           </CardContent>
         </Card>
       </div>
@@ -837,9 +1081,46 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
                     <li key={exceptionName}>{exceptionName}</li>
                   ))}
                 </ul>
-              ) : (
-                <p className="text-slate-500">No exceptions detected</p>
-              )}
+              ) : (() => {
+                // Fallback 1: Check if activeAnalysis has exceptions
+                const analysisExceptions = (props.activeAnalysis as any)?.exceptions as string[] | undefined
+                if (analysisExceptions && analysisExceptions.length > 0) {
+                  return (
+                    <ul className="space-y-1 text-slate-700">
+                      {analysisExceptions.map((exceptionName: string) => (
+                        <li key={exceptionName}>{exceptionName}</li>
+                      ))}
+                    </ul>
+                  )
+                }
+                
+                // Fallback 2: Aggregate from all procedures in fullAnalysis
+                if (props.fullAnalysis?.discovery?.procedures) {
+                  const allExceptions: Set<string> = new Set()
+                  
+                  props.fullAnalysis.discovery.procedures.forEach((proc) => {
+                    const excs = proc.exceptions ?? []
+                    excs.forEach((exc: string) => allExceptions.add(exc))
+                  })
+                  
+                  if (allExceptions.size > 0) {
+                    return (
+                      <div>
+                        <p className="text-xs text-slate-500 mb-2">Exceptions discovered in repository:</p>
+                        <ul className="space-y-1 text-slate-700">
+                          {Array.from(allExceptions)
+                            .sort()
+                            .map((exceptionName: string) => (
+                              <li key={exceptionName}>{exceptionName}</li>
+                            ))}
+                        </ul>
+                      </div>
+                    )
+                  }
+                }
+                
+                return <p className="text-slate-500">No exceptions detected</p>
+              })()}
             </div>
           </CardContent>
         </Card>
@@ -995,23 +1276,42 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
             description="Bulk or procedural error handling patterns surfaced by the analyzer."
             count={errorHandling ? 1 : 0}
           >
-            {errorHandling ? (
-              <div className="space-y-2 text-sm text-slate-700">
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p>
-                    <span className="font-semibold">Type:</span> {errorHandling.type}
-                  </p>
-                  <p>
-                    <span className="font-semibold">Mechanism:</span> {errorHandling.mechanism ?? "N/A"}
-                  </p>
-                  <p>
-                    <span className="font-semibold">Behavior:</span> {errorHandling.behavior ?? "N/A"}
-                  </p>
-                </div>
-              </div>
-            ) : (
-              <p className="text-sm text-slate-500">No error handling pattern detected.</p>
-            )}
+            {(() => {
+              let handler = errorHandling
+              
+              // Fallback: check if activeAnalysis has errorHandling
+              if (!handler && (props.activeAnalysis as any)?.error_handling) {
+                handler = (props.activeAnalysis as any).error_handling
+              }
+              
+              // Fallback 2: get from fullAnalysis procedures
+              if (!handler && props.fullAnalysis?.discovery?.procedures) {
+                const procWithHandler = props.fullAnalysis.discovery.procedures.find((p) => p.error_handling)
+                if (procWithHandler?.error_handling) {
+                  handler = procWithHandler.error_handling
+                }
+              }
+              
+              if (handler) {
+                return (
+                  <div className="space-y-2 text-sm text-slate-700">
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p>
+                        <span className="font-semibold">Type:</span> {handler.type || "N/A"}
+                      </p>
+                      <p>
+                        <span className="font-semibold">Mechanism:</span> {handler.mechanism ?? "N/A"}
+                      </p>
+                      <p>
+                        <span className="font-semibold">Behavior:</span> {handler.behavior ?? "N/A"}
+                      </p>
+                    </div>
+                  </div>
+                )
+              }
+              
+              return <p className="text-sm text-slate-500">No error handling detected — exceptions propagate to caller</p>
+            })()}
           </CollapsibleInsightSection>
 
           <CollapsibleInsightSection
@@ -1019,19 +1319,34 @@ function ProcedureBehaviorPanel(props: ProcedureBehaviorPanelProps) {
             description="Execution patterns that indicate throughput or context-switch reduction."
             count={performancePatterns.length}
           >
-            {performancePatterns.length > 0 ? (
-              <div className="space-y-2 text-sm text-slate-700">
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <ul className="space-y-1">
-                    {performancePatterns.map((pattern) => (
-                      <li key={pattern}>{pattern}</li>
-                    ))}
-                  </ul>
-                </div>
-              </div>
-            ) : (
-              <p className="text-sm text-slate-500">No performance patterns detected.</p>
-            )}
+            {(() => {
+              let patterns = [...performancePatterns]
+              
+              // Fallback: aggregate from all procedures if empty
+              if (patterns.length === 0 && props.fullAnalysis?.discovery?.procedures) {
+                const allPatterns: Set<string> = new Set()
+                props.fullAnalysis.discovery.procedures.forEach((proc) => {
+                  const procPatterns = proc.performance_patterns ?? []
+                  procPatterns.forEach((p: string) => allPatterns.add(p))
+                })
+                patterns = Array.from(allPatterns).sort()
+              }
+              
+              if (patterns.length > 0) {
+                return (
+                  <div className="space-y-2 text-sm text-slate-700">
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <ul className="space-y-1">
+                        {patterns.map((pattern) => (
+                          <li key={pattern}>{pattern}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )
+              }
+              return <p className="text-sm text-slate-500">No performance patterns detected.</p>
+            })()}
           </CollapsibleInsightSection>
         </CardContent>
       </Card>
@@ -1110,7 +1425,6 @@ function SqlSourceDiscovery(props: {
   const [selectedTable, setSelectedTable] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [gitStep, setGitStep] = useState<1 | 2>(1)
   const [gitPath, setGitPath] = useState("")
   const [gitEntries, setGitEntries] = useState<{ name: string; path: string; type: "dir" | "file" }[]>([])
   const [gitTreeError, setGitTreeError] = useState<string | null>(null)
@@ -1118,8 +1432,8 @@ function SqlSourceDiscovery(props: {
   const requestIdRef = useRef(0)
 
   useEffect(() => {
-    props.onLoadingChange?.(isLoading && (props.sourceMethod !== "git" || gitStep === 2))
-  }, [gitStep, isLoading, props.onLoadingChange, props.sourceMethod])
+    props.onLoadingChange?.(isLoading)
+  }, [isLoading, props.onLoadingChange])
 
   function deriveDependencies(value: SqlDiscoveryAnalyzeResponse): DependencyInsight[] {
     const dependencies: DependencyInsight[] = []
@@ -1297,7 +1611,6 @@ function SqlSourceDiscovery(props: {
       return
     }
     setAnalysis(null)
-    setGitStep(1)
     setGitPath("")
     setGitEntries([])
     setGitTreeError(null)
@@ -1425,104 +1738,224 @@ function SqlSourceDiscovery(props: {
   return (
     <div className="space-y-4">
       {props.sourceMethod === "git" ? (
-        <Card>
-          <CardContent className="flex items-center justify-between gap-3 p-4">
-            <div>
-              <p className="text-xs uppercase tracking-wide text-slate-500">Discovery Steps</p>
-              <p className="text-sm font-semibold text-slate-900">Step {gitStep} of 2</p>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setGitStep(1)}
-                className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition ${gitStep === 1 ? "border-cyan-400 bg-cyan-50 text-cyan-700" : "border-slate-200 text-slate-600"
-                  }`}
-                aria-label="Project structure"
-              >
-                <ChevronLeft className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setGitStep(2)}
-                className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition ${gitStep === 2 ? "border-cyan-400 bg-cyan-50 text-cyan-700" : "border-slate-200 text-slate-600"
-                  }`}
-                aria-label="Schema explorer"
-              >
-                <ChevronRight className="h-4 w-4" />
-              </button>
-            </div>
-          </CardContent>
-        </Card>
+        <>
+          {/* Discovery Progress Indicator */}
+          <Card className="border-slate-300 bg-slate-50">
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3 text-sm">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-6 w-6 items-center justify-center rounded-full bg-sky-600 text-white text-xs font-semibold">
+                    ✓
+                  </div>
+                  <span className="text-slate-700">Repository URL Provided</span>
+                </div>
+                <div className="h-1 w-8 bg-slate-300" />
+                <div className="flex items-center gap-3">
+                  <div className={`flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
+                    isLoading 
+                      ? "bg-sky-600 text-white" 
+                      : analysis 
+                      ? "bg-emerald-600 text-white" 
+                      : "bg-slate-300 text-slate-600"
+                  }`}>
+                    {isLoading ? <LoaderCircle className="h-3 w-3 animate-spin" /> : analysis ? "✓" : "2"}
+                  </div>
+                  <span className={isLoading || analysis ? "text-slate-900 font-semibold" : "text-slate-600"}>
+                    Analyzing & Discovering
+                  </span>
+                </div>
+                <div className="h-1 w-8 bg-slate-300" />
+                <div className="flex items-center gap-3">
+                  <div className={`flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
+                    analysis ? "bg-emerald-600 text-white" : "bg-slate-300 text-slate-600"
+                  }`}>
+                    {analysis ? "✓" : "3"}
+                  </div>
+                  <span className={analysis ? "text-slate-900 font-semibold" : "text-slate-600"}>Ready</span>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </>
       ) : null}
 
-      {props.sourceMethod === "git" && gitStep === 1 ? (
+      {props.sourceMethod === "git" ? (
         <Card>
           <CardHeader>
-            <CardTitle>Project Folder Structure</CardTitle>
-            <CardDescription>Browse repository folders and files before discovery.</CardDescription>
+            <CardTitle>Project Folder Structure & Objects</CardTitle>
+            <CardDescription>Browse repository folders and discovered objects.</CardDescription>
           </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="flex items-center justify-between">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Path</p>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setGitPath(gitPath.split("/").slice(0, -1).join("/"))}
-                disabled={!gitPath}
-              >
-                Up
-              </Button>
-            </div>
-            <div className="rounded-xl border border-slate-200 bg-white p-3">
-              <p className="text-xs text-slate-500">{gitPath || "/"}</p>
-              {gitTreeError ? <p className="mt-2 text-sm text-rose-600">{gitTreeError}</p> : null}
-              {isLoadingTree ? (
-                <p className="mt-3 inline-flex items-center gap-2 text-sm text-slate-600">
-                  <LoaderCircle className="h-4 w-4 animate-spin" />
-                  Loading folders...
-                </p>
-              ) : (
-                <div className="mt-3 space-y-1">
-                  {gitEntries.map((entry) =>
-                    entry.name !== ".git" ? (
-                      <button
-                        key={entry.path}
-                        onClick={() => {
-                          if (entry.type === "dir") {
-                            setGitPath(entry.path)
-                          }
-                        }}
-                        className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-sm text-slate-700 transition hover:bg-slate-50"
-                      >
-                        {entry.type === "dir" ? (
-                          <Folder className="h-4 w-4 text-cyan-600" />
-                        ) : (
-                          <FileCode2 className="h-4 w-4 text-slate-400" />
-                        )}
-                        <span>{entry.name}</span>
-                      </button>
-                    ) : null,
-                  )}
-                  {gitEntries.length === 0 ? <p className="text-sm text-slate-500">No files found.</p> : null}
+          <CardContent>
+            <div className="grid gap-6 lg:grid-cols-[1fr_1.2fr]">
+              {/* Left: Folder Structure */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-semibold text-slate-900">Repository Files</p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setGitPath(gitPath.split("/").slice(0, -1).join("/"))}
+                    disabled={!gitPath}
+                  >
+                    Up
+                  </Button>
                 </div>
-              )}
+                <div className="rounded-xl border border-slate-200 bg-white p-3 max-h-96 overflow-y-auto">
+                  <p className="text-xs uppercase tracking-wide text-slate-500 mb-2">Path</p>
+                  <p className="text-xs text-slate-500 mb-3">{gitPath || "/"}</p>
+                  {gitTreeError ? <p className="mt-2 text-sm text-rose-600">{gitTreeError}</p> : null}
+                  {isLoadingTree ? (
+                    <p className="mt-3 inline-flex items-center gap-2 text-sm text-slate-600">
+                      <LoaderCircle className="h-4 w-4 animate-spin" />
+                      Loading folders...
+                    </p>
+                  ) : (
+                    <div className="space-y-1">
+                      {gitEntries.map((entry) =>
+                        entry.name !== ".git" ? (
+                          <button
+                            key={entry.path}
+                            onClick={() => {
+                              if (entry.type === "dir") {
+                                setGitPath(entry.path)
+                              }
+                            }}
+                            className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-sm text-slate-700 transition hover:bg-slate-50"
+                          >
+                            {entry.type === "dir" ? (
+                              <Folder className="h-4 w-4 text-cyan-600" />
+                            ) : (
+                              <FileCode2 className="h-4 w-4 text-slate-400" />
+                            )}
+                            <span>{entry.name}</span>
+                          </button>
+                        ) : null,
+                      )}
+                      {gitEntries.length === 0 ? <p className="text-sm text-slate-500">No files found.</p> : null}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Right: Discovered Objects Grid */}
+              <div className="space-y-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Discovered Objects</p>
+                  <p className="text-xs text-slate-600 mt-1">Click to select objects for conversion</p>
+                </div>
+                {analysis ? (
+                  <div className="space-y-4 max-h-96 overflow-y-auto">
+                    {/* Procedures Section */}
+                    {((analysis?.objects ?? []).filter((obj) => obj.objectType.toUpperCase() === "PROCEDURE")).length > 0 && (
+                      <div className="space-y-2">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-sky-600">Procedures</p>
+                        <div className="grid grid-cols-2 lg:grid-cols-3 gap-2">
+                          {(analysis?.objects ?? [])
+                            .filter((obj) => obj.objectType.toUpperCase() === "PROCEDURE")
+                            .map((item) => {
+                              const itemKey = `${item.objectType}::${item.procedureName}`
+                              const isSelected = selectedObjectKey === itemKey
+                              return (
+                                <button
+                                  key={itemKey}
+                                  onClick={() => setSelectedObjectKey(itemKey)}
+                                  className={`flex flex-col items-center gap-1.5 rounded-lg border-2 p-2 text-center transition-all hover:shadow-md ${
+                                    isSelected
+                                      ? "border-sky-500 bg-sky-100 shadow-sm"
+                                      : "border-sky-200 bg-sky-50 hover:bg-sky-100"
+                                  }`}
+                                >
+                                  <div className={`rounded-full p-1 ${
+                                    isSelected ? "bg-sky-200 text-sky-700" : "bg-sky-100 text-sky-600"
+                                  }`}>
+                                    <FileCode2 className="h-3 w-3" />
+                                  </div>
+                                  <span className="text-xs font-medium text-slate-800 line-clamp-2">{item.procedureName}</span>
+                                </button>
+                              )
+                            })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Functions Section */}
+                    {((analysis?.objects ?? []).filter((obj) => obj.objectType.toUpperCase() === "FUNCTION")).length > 0 && (
+                      <div className="space-y-2">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-emerald-600">Functions</p>
+                        <div className="grid grid-cols-2 lg:grid-cols-3 gap-2">
+                          {(analysis?.objects ?? [])
+                            .filter((obj) => obj.objectType.toUpperCase() === "FUNCTION")
+                            .map((item) => {
+                              const itemKey = `${item.objectType}::${item.procedureName}`
+                              const isSelected = selectedObjectKey === itemKey
+                              return (
+                                <button
+                                  key={itemKey}
+                                  onClick={() => setSelectedObjectKey(itemKey)}
+                                  className={`flex flex-col items-center gap-1.5 rounded-lg border-2 p-2 text-center transition-all hover:shadow-md ${
+                                    isSelected
+                                      ? "border-emerald-500 bg-emerald-100 shadow-sm"
+                                      : "border-emerald-200 bg-emerald-50 hover:bg-emerald-100"
+                                  }`}
+                                >
+                                  <div className={`rounded-full p-1 ${
+                                    isSelected ? "bg-emerald-200 text-emerald-700" : "bg-emerald-100 text-emerald-600"
+                                  }`}>
+                                    <FileCode2 className="h-3 w-3" />
+                                  </div>
+                                  <span className="text-xs font-medium text-slate-800 line-clamp-2">{item.procedureName}</span>
+                                </button>
+                              )
+                            })}
+                        </div>
+                      </div>
+                    )}
+
+                    {((analysis?.objects ?? []).filter((obj) => obj.objectType.toUpperCase() === "PROCEDURE" || obj.objectType.toUpperCase() === "FUNCTION")).length === 0 && (
+                      <p className="text-xs text-slate-500">No procedures or functions found.</p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-center">
+                    <p className="text-xs text-slate-600">Discovered objects will appear here after analysis.</p>
+                  </div>
+                )}
+              </div>
             </div>
           </CardContent>
         </Card>
       ) : null}
 
-      {isLoading && (props.sourceMethod !== "git" || gitStep === 2) ? (
-        <Card>
+      {isLoading && props.sourceMethod === "git" ? (
+        <Card className="border-sky-200 bg-sky-50">
           <CardContent className="p-4">
-            <p className="inline-flex items-center gap-2 text-sm text-slate-600">
-              <LoaderCircle className="h-4 w-4 animate-spin" />
-              Analyzing SQL file...
+            <div className="space-y-2">
+              <p className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
+                <LoaderCircle className="h-5 w-5 animate-spin text-sky-600" />
+                Analyzing Git Repository...
+              </p>
+              <p className="text-xs text-slate-600">
+                Scanning for SQL files, procedures, and functions. This may take a moment.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {!isLoading && analysis && props.sourceMethod === "git" ? (
+        <Card className="border-emerald-200 bg-emerald-50">
+          <CardContent className="p-4">
+            <p className="inline-flex items-center gap-2 text-sm font-semibold text-emerald-900">
+              ✓ Analysis Complete
+            </p>
+            <p className="mt-2 text-xs text-emerald-700">
+              Found {(analysis?.objects ?? []).length} procedure(s)/function(s). Select objects above to proceed to conversion.
             </p>
           </CardContent>
         </Card>
       ) : null}
 
-      {error && (props.sourceMethod !== "git" || gitStep === 2) ? (
+      {error && props.sourceMethod === "git" ? (
         <Card>
           <CardContent className="p-4">
             <p className="text-sm font-medium text-rose-700">{error}</p>
@@ -1530,35 +1963,8 @@ function SqlSourceDiscovery(props: {
         </Card>
       ) : null}
 
-      {analysis && (props.sourceMethod !== "git" || gitStep === 2) ? (
+      {analysis && props.sourceMethod === "git" ? (
         <>
-          {(analysis?.objects ?? []).length > 1 ? (
-            <Card>
-              <CardHeader>
-                <CardTitle>Active Object</CardTitle>
-                <CardDescription>Select which procedure/function drives the schema view.</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="flex flex-wrap items-center gap-3">
-                  <label className="text-xs uppercase tracking-wide text-slate-500">Object</label>
-                  <select
-                    className="h-9 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-800 shadow-sm"
-                    value={selectedObjectKey ?? ""}
-                    onChange={(event) => setSelectedObjectKey(event.target.value)}
-                  >
-                    {(analysis?.objects ?? []).map((item) => {
-                      const key = `${item.objectType}::${item.procedureName}`
-                      return (
-                        <option key={key} value={key}>
-                          {item.procedureName} ({item.objectType})
-                        </option>
-                      )
-                    })}
-                  </select>
-                </div>
-              </CardContent>
-            </Card>
-          ) : null}
 
           {globalSchema ? (
             <GlobalSchemaPanel
@@ -1568,7 +1974,12 @@ function SqlSourceDiscovery(props: {
             />
           ) : null}
 
-          <ProcedureBehaviorPanel activeProcedure={activeProcedure} activeAnalysis={activeAnalysis} />
+          <ProcedureBehaviorPanel 
+            activeProcedure={activeProcedure} 
+            activeAnalysis={activeAnalysis}
+            globalSchema={globalSchema}
+            fullAnalysis={analysis}
+          />
 
           <Card>
             <CardHeader>
@@ -3445,7 +3856,7 @@ export function StepPanels({
   }, [isStep1Ready, isStep2Ready, isStep3Ready, isStep4Ready, onStepAccessChange])
 
   return (
-    <section className="space-y-4">
+    <section className="space-y-4 w-full">
       {hideSpringConfig ? null : (
         <div className="rounded-2xl border border-slate-200/80 bg-white/90 p-4 shadow-lg shadow-slate-200/40 backdrop-blur">
           <p className="text-xs uppercase tracking-[0.12em] text-slate-500">Step {step.id} of {workflowSteps.length}</p>

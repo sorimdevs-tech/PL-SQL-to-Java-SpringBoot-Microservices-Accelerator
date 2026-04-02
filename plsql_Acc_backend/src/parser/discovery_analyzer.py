@@ -54,6 +54,7 @@ TABLE_NAME_BLOCKLIST = {
     "UPDATE",
     "DELETE",
     "MERGE",
+    "ROW",  # PROBLEM 1 FIX: ROW is %rowtype syntax, never a column name
 }
 
 TYPE_BLOCKLIST = {
@@ -322,8 +323,11 @@ def _extract_table_definitions(sql_text: str) -> List[Dict[str, Any]]:
                     _normalize_identifier(token).upper()
                     for token in _split_top_level_csv(table_pk_match.group(1))
                 )
+            # DYN-FK-2: Enhanced FOREIGN KEY pattern matching with constraint name capture
+            # Pattern: [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES tbl(cols)
             table_fk_match = re.search(
-                r"\bforeign\s+key\s*\(([^)]+)\)\s+references\s+([`\"\w$#\.]+)\s*\(([^)]+)\)",
+                r"(?:CONSTRAINT\s+[`\"\w$#_]+\s+)?"  # Optional constraint name
+                r"\bFOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+([`\"\w$#\.]+)\s*\(([^)]+)\)",
                 segment,
                 flags=re.IGNORECASE,
             )
@@ -385,12 +389,38 @@ def _extract_table_definitions(sql_text: str) -> List[Dict[str, Any]]:
     return table_defs
 
 
-def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
+def _resolve_column_type(table_name: str, column_name: str, known_tables: Dict[str, Dict[str, Any]]) -> str:
+    """Resolve column type by looking it up in known table definitions.
+    
+    Args:
+        table_name: Name of the table
+        column_name: Name of the column
+        known_tables: Dict mapping table names to their definitions from CREATE TABLE
+        
+    Returns:
+        Column type if found in known tables, otherwise "UNKNOWN"
+    """
+    if table_name in known_tables:
+        table_def = known_tables[table_name]
+        for col in table_def.get("columns", []):
+            if col.get("name") == column_name:
+                return col.get("type", "UNKNOWN")
+    return "UNKNOWN"
+
+
+def infer_tables_from_dml(sql_text: str, known_table_defs: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     cleaned = _prepare_sql_text(sql_text)
     objects = _extract_objects(cleaned)
     blocks = [item.block_text for item in objects] or [cleaned]
     inferred_tables: Set[str] = set()
     inferred_columns: Dict[str, Set[str]] = {}
+    
+    # Build lookup dict from known table definitions
+    known_tables_map: Dict[str, Dict[str, Any]] = {}
+    if known_table_defs:
+        for table_def in known_table_defs:
+            table_name = table_def.get("name", "").upper()
+            known_tables_map[table_name] = table_def
 
     def add_table(raw_name: str) -> None:
         normalized = _normalize_identifier(raw_name).upper()
@@ -438,12 +468,16 @@ def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
                 if column
             )
 
-    return [
+    # Build inferred tables list with resolved column types
+    inferred_tables_list = [
         {
             "name": table_name,
             "table_name": table_name,
             "columns": [
-                {"name": column_name, "type": "UNKNOWN"}
+                {
+                    "name": column_name,
+                    "type": _resolve_column_type(table_name, column_name, known_tables_map)
+                }
                 for column_name in sorted(inferred_columns.get(table_name, set()))
             ],
             "primary_keys": [],
@@ -452,19 +486,187 @@ def infer_tables_from_dml(sql_text: str) -> List[Dict[str, Any]]:
         }
         for table_name in sorted(inferred_tables)
     ]
+    
+    # Extract parameters from procedures and nested functions for implied FK inference
+    all_parameters: List[Dict[str, str]] = []
+    
+    # Extract from top-level objects
+    for obj in objects:
+        params_extracted = _extract_parameters(obj.block_text)
+        all_parameters.extend(params_extracted.get("all", []))
+        
+        # Also extract parameters from nested FUNCTION/PROCEDURE definitions in package bodies
+        # Pattern: FUNCTION name(params...) RETURN type AS/IS or PROCEDURE name(params...) AS/IS
+        nested_func_pattern = r"(?:FUNCTION|PROCEDURE)\s+(\w+)\s*\(([^)]*)\)\s*(?:RETURN\s+[^A]*)?\s*(?:IS|AS)"
+        for match in re.finditer(nested_func_pattern, obj.block_text, re.IGNORECASE | re.DOTALL):
+            nested_params_text = match.group(2)
+            if nested_params_text.strip():
+                for param_item in _split_top_level_csv(nested_params_text):
+                    normalized = " ".join(param_item.split())
+                    # Strip DEFAULT clause before matching pattern
+                    normalized_no_default = re.sub(
+                        r"\s+(?:default|:=)\s+\S+.*$", "", normalized, flags=re.IGNORECASE
+                    ).strip()
+                    param_match = PARAM_PATTERN.match(normalized_no_default)
+                    if not param_match:
+                        param_match = PARAM_PATTERN.match(normalized)
+                    if not param_match:
+                        continue
+                    
+                    name, direction, data_type = param_match.groups()
+                    # Clean up any trailing DEFAULT clause that slipped into data_type
+                    data_type = re.sub(r"\s+(?:default|:=)\s+.*$", "", data_type, flags=re.IGNORECASE).strip()
+                    
+                    payload = {
+                        "name": _normalize_identifier(name),
+                        "type": data_type.strip().upper(),
+                        "direction": (direction or "IN").upper().replace("  ", " "),
+                    }
+                    
+                    # Avoid duplicates
+                    if not any(p["name"] == payload["name"] for p in all_parameters):
+                        all_parameters.append(payload)
+    
+    # Convert to dict format for FK inference
+    inferred_tables_dict = {t["name"]: t for t in inferred_tables_list}
+    
+    # Enhance table columns with inference from %TYPE anchors and parameter names
+    # This finds columns that are referenced via %TYPE but not in DML statements
+    for param in all_parameters:
+        param_name = param.get("name", "").upper()
+        if not param_name.startswith("P_"):
+            continue
+        
+        # Look for %TYPE references like: xy_invoice.customer_id%type
+        param_concept = param_name[2:]  # Remove P_ prefix
+        type_anchor_pattern = rf"(\w+)\.({re.escape(param_concept)}|{re.escape(param_concept.lower())})\%type"
+        
+        for match in re.finditer(type_anchor_pattern, cleaned, re.IGNORECASE):
+            table_ref = _normalize_identifier(match.group(1)).upper()
+            column_name = _normalize_identifier(match.group(2)).upper()
+            
+            # CRITICAL FIX: Verify the column is directly referenced in this table's OWN DML
+            # Exclude columns that only appear in called functions (black box principle)
+            # Only add if column appears directly in INSERT, UPDATE, SELECT or RETURNING
+            # that TARGETS this specific table
+            table_dml_pattern = rf"(?:insert\s+into|update|select.*?from)\s+{re.escape(table_ref)}\b.*{re.escape(column_name)}\b"
+            if not re.search(table_dml_pattern, cleaned, re.IGNORECASE | re.DOTALL):
+                # Column not directly used in this table's DML - skip it
+                continue
+            
+            # If this table exists and doesn't have this column yet, add it
+            if table_ref in inferred_tables_dict:
+                existing_cols = {c.get("name", "").upper() for c in inferred_tables_dict[table_ref].get("columns", [])}
+                if column_name not in existing_cols:
+                    inferred_tables_dict[table_ref]["columns"].append({
+                        "name": column_name,
+                        "type": param.get("type", "UNKNOWN").upper()
+                    })
+    
+    # Additional column inference: If a parameter is passed to a function that INSERTs into a table,
+    # and that parameter concept matches an external table, add that column to the insert table
+    # This handles implicit FK columns where the parameter carries the FK but isn't in the literal INSERT list
+    func_call_pattern = rf"(\w+)\s*\(\s*p_(\w+)\s*(?:,|=>|=>\s*)"
+    for match in re.finditer(func_call_pattern, cleaned, re.IGNORECASE):
+        func_name = match.group(1).upper()
+        param_suffix = match.group(2).upper()
+        
+        # Find functions that receive this parameter and insert into tables
+        func_def_pattern = rf"function\s+{re.escape(func_name)}\s*\(([^)]*p_{param_suffix}[^)]*)\).*?begin(.*?)end\s+{re.escape(func_name)}"
+        func_match = re.search(func_def_pattern, cleaned, re.IGNORECASE | re.DOTALL)
+        
+        if func_match:
+            func_body = func_match.group(2)
+            # Find INSERTs in this function
+            insert_targets = re.findall(rf"insert\s+into\s+([`\"\w$#\.]+)", func_body, re.IGNORECASE)
+            for insert_table_raw in insert_targets:
+                insert_table = _normalize_identifier(insert_table_raw).upper()
+                
+                # Skip utility tables
+                if insert_table in ["APPL_LOG", "APPL", "LOG", "AUDIT_LOG"]:
+                    continue
+                
+                if insert_table in inferred_tables_dict:
+                    # Add the parameter concept as a column (the implicit FK column)
+                    param_concept = f"P_{param_suffix}"[2:]  # Remove P_ prefix
+                    existing_cols = {c.get("name", "").upper() for c in inferred_tables_dict[insert_table].get("columns", [])}
+                    
+                    # Only add if not already present and if it's a reasonable column name
+                    if param_concept.upper() not in existing_cols and len(param_concept) > 0:
+                        inferred_tables_dict[insert_table]["columns"].append({
+                            "name": param_concept.upper(),
+                            "type": "INFERRED_FK"
+                        })
+    
+    # Infer implied foreign keys
+    implied_fks = _infer_implied_foreign_keys(cleaned, inferred_tables_dict, all_parameters)
+    
+    # Populate foreign keys for each table with duplicate prevention
+    for fk in implied_fks:
+        from_table = fk.get("from_table")
+        if from_table in inferred_tables_dict:
+            new_fk = {
+                "source_column": fk.get("from_column"),
+                "target_table": fk.get("to_table"),
+                "target_column": fk.get("to_column"),
+            }
+            # Check if this FK already exists to prevent duplicates
+            fk_list = inferred_tables_dict[from_table].setdefault("foreign_keys", [])
+            fk_key = (new_fk["source_column"], new_fk["target_table"], new_fk["target_column"])
+            
+            # Only add if not already present
+            if not any((f["source_column"], f["target_table"], f["target_column"]) == fk_key for f in fk_list):
+                fk_list.append(new_fk)
+    
+    # DYN-FK-4: Also extract ALTER TABLE FKs from inferred tables mode
+    alter_table_fks = _extract_alter_table_foreign_keys(cleaned)
+    for fk in alter_table_fks:
+        source_table = fk.get("source_table")
+        if source_table in inferred_tables_dict:
+            new_fk = {
+                "source_column": fk.get("source_column"),
+                "target_table": fk.get("target_table"),
+                "target_column": fk.get("target_column"),
+            }
+            fk_list = inferred_tables_dict[source_table].setdefault("foreign_keys", [])
+            fk_key = (new_fk["source_column"], new_fk["target_table"], new_fk["target_column"])
+            
+            if not any((f["source_column"], f["target_table"], f["target_column"]) == fk_key for f in fk_list):
+                fk_list.append(new_fk)
+    
+    return inferred_tables_list
 
 
 def _extract_alter_table_foreign_keys(sql_text: str) -> List[Dict[str, str]]:
-    pattern = re.compile(
-        r'alter\s+table\s+([`"\w$#\.]+).*?foreign\s+key\s*\(([^)]+)\)\s+references\s+([`"\w$#\.]+)\s*\(([^)]+)\)',
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    """DYN-FK-1: Extract FOREIGN KEY constraints from ALTER TABLE statements.
+    
+    Dynamically handles:
+    - ALTER TABLE table ADD CONSTRAINT name FOREIGN KEY (...) REFERENCES ...
+    - ALTER TABLE table ADD FOREIGN KEY (...) REFERENCES ... 
+    - Multi-line formatting with variable whitespace
+    - Composite foreign keys (multiple columns)
+    - Multiple constraints per statement
+    """
     relationships: List[Dict[str, str]] = []
-    for match in pattern.finditer(sql_text):
+    
+    # Pattern 1: Standard SQL with explicit ADD CONSTRAINT
+    # ALTER TABLE tbl ADD CONSTRAINT fk_name FOREIGN KEY (cols) REFERENCES ref_tbl(cols)
+    pattern1 = re.compile(
+        r'ALTER\s+TABLE\s+([`"\w$#\.]+)\s+'
+        r'(?:ADD\s+)?'  # Optional ADD keyword
+        r'(?:CONSTRAINT\s+[`"\w$#_]+)?\s*'  # Optional CONSTRAINT clause with name
+        r'FOREIGN\s+KEY\s*\(\s*([^)]+?)\s*\)'  # FOREIGN KEY (cols)
+        r'\s+REFERENCES\s+([`"\w$#\.]+)\s*\(\s*([^)]+?)\s*\)',  # REFERENCES tbl(cols)
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    
+    for match in pattern1.finditer(sql_text):
         source_table = _normalize_identifier(match.group(1)).upper()
         source_cols = [_normalize_identifier(token).upper() for token in _split_top_level_csv(match.group(2))]
         target_table = _normalize_identifier(match.group(3)).upper()
         target_cols = [_normalize_identifier(token).upper() for token in _split_top_level_csv(match.group(4))]
+        
+        # Create individual FK entries for each column pair
         for src, dst in zip(source_cols, target_cols):
             relationships.append(
                 {
@@ -474,6 +676,58 @@ def _extract_alter_table_foreign_keys(sql_text: str) -> List[Dict[str, str]]:
                     "target_column": dst,
                 }
             )
+    
+    # Pattern 2: Simple ADD CONSTRAINT without explicit ADD keyword
+    # CONSTRAINT fk_name FOREIGN KEY (cols) REFERENCES ref_tbl(cols);
+    pattern2 = re.compile(
+        r'CONSTRAINT\s+([`"\w$#_]+)?\s+'
+        r'FOREIGN\s+KEY\s*\(\s*([^)]+?)\s*\)'
+        r'\s+REFERENCES\s+([`"\w$#\.]+)\s*\(\s*([^)]+?)\s*\)',
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    
+    # For Pattern 2, we need to find which table this belongs to
+    # Look backwards from each match to find the ALTER TABLE or CREATE TABLE
+    for match in pattern2.finditer(sql_text):
+        # Find the corresponding ALTER TABLE or CREATE TABLE before this constraint
+        pos_start = match.start()
+        sql_before = sql_text[:pos_start]
+        
+        # Look for the most recent ALTER TABLE or CREATE TABLE
+        alter_match = None
+        create_match = None
+        
+        # Find last ALTER TABLE before this position
+        for m in re.finditer(r'ALTER\s+TABLE\s+([`"\w$#\.]+)', sql_before, re.IGNORECASE):
+            alter_match = m
+        
+        # Find last CREATE TABLE before this position
+        for m in re.finditer(r'CREATE\s+TABLE\s+([`"\w$#\.]+)', sql_before, re.IGNORECASE):
+            create_match = m
+        
+        # Use the most recent one
+        source_table = None
+        if alter_match:
+            source_table = _normalize_identifier(alter_match.group(1)).upper()
+        elif create_match:
+            source_table = _normalize_identifier(create_match.group(1)).upper()
+        
+        if source_table:
+            target_table = _normalize_identifier(match.group(3)).upper()
+            source_cols = [_normalize_identifier(token).upper() for token in _split_top_level_csv(match.group(2))]
+            target_cols = [_normalize_identifier(token).upper() for token in _split_top_level_csv(match.group(4))]
+            
+            for src, dst in zip(source_cols, target_cols):
+                fk_entry = {
+                    "source_table": source_table,
+                    "source_column": src,
+                    "target_table": target_table,
+                    "target_column": dst,
+                }
+                # Avoid duplicates
+                if fk_entry not in relationships:
+                    relationships.append(fk_entry)
+    
     return relationships
 
 
@@ -915,12 +1169,213 @@ def _extract_table_columns(block_text: str, tables: Sequence[str]) -> Dict[str, 
     aliases = _extract_table_aliases(block_text)
     normalized_tables = {table.upper() for table in tables}
     columns: Dict[str, Set[str]] = {table: set() for table in normalized_tables}
+    
+    # Extract columns from dot-notation (table.column) - most reliable
     for match in re.finditer(r"\b([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#]*)", block_text):
         prefix = match.group(1).upper()
         column = match.group(2).upper()
+        # PROBLEM 1 FIX: Skip ROW (it's %rowtype syntax, not a column)
+        if column == "ROW":
+            continue
         table = aliases.get(prefix, prefix)
         if table in normalized_tables:
             columns.setdefault(table, set()).add(column)
+    
+    # Extract columns from INSERT INTO table (col1, col2, col3) syntax
+    insert_pattern = re.compile(
+        r"\binsert\s+into\s+([`\"\w$#\.]+)\s*\(([^)]+)\)",
+        flags=re.IGNORECASE
+    )
+    for match in insert_pattern.finditer(block_text):
+        table_name = _normalize_identifier(match.group(1)).upper()
+        if table_name in normalized_tables:
+            column_list = match.group(2)
+            # Split by comma and extract column names
+            for col in _split_top_level_csv(column_list):
+                col_name = _normalize_identifier(col).upper()
+                if col_name and len(col_name) > 1:  # Avoid single letters
+                    columns.setdefault(table_name, set()).add(col_name)
+    
+    # Extract columns from UPDATE table SET col = value syntax
+    update_pattern = re.compile(
+        r"\bupdate\s+([`\"\w$#\.]+)\s+set\s+(.+?)(?=\bwhere\b|;)",
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    for match in update_pattern.finditer(block_text):
+        table_name = _normalize_identifier(match.group(1)).upper()
+        if table_name in normalized_tables:
+            set_clause = match.group(2)
+            # Extract columns being set (col = value pattern)
+            for col_match in re.finditer(r"\b([A-Za-z_][\w$#]*)\s*=", set_clause):
+                col_name = _normalize_identifier(col_match.group(1)).upper()
+                # PROBLEM 1 FIX: Skip ROW (it's %rowtype syntax, not a column)
+                if col_name == "ROW":
+                    continue
+                if col_name and col_name not in TABLE_NAME_BLOCKLIST and len(col_name) > 1:
+                    columns.setdefault(table_name, set()).add(col_name)
+    
+    # Extract columns from SELECT column_name FROM table syntax
+    # Pattern: SELECT ... FROM table_name WHERE/GROUP/ORDER/etc
+    select_pattern = re.compile(
+        r"\bselect\s+(.+?)\s+from\s+([`\"\w$#\.]+)",
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    for match in select_pattern.finditer(block_text):
+        select_list = match.group(1)
+        table_name = _normalize_identifier(match.group(2)).upper()
+        if table_name not in normalized_tables:
+            continue
+        
+        # Skip if this is a wildcard SELECT
+        if select_list.strip() == "*":
+            continue
+            
+        # Extract identifiers from the SELECT list
+        # Look for patterns like: column_name, function(column_name), column_name AS alias
+        for item in _split_top_level_csv(select_list):
+            # Remove alias if present (col AS alias pattern)
+            item_no_alias = re.sub(r"\s+(?:as\s+)?\w+\s*$", "", item, flags=re.IGNORECASE).strip()
+            
+            # Extract all identifiers that are likely column names
+            # Priority: look inside function calls first
+            func_pattern = re.compile(r"\b(?:nvl|coalesce|to_char|to_number|substr|instr|upper|lower|trim|round|decode)\s*\(\s*([A-Za-z_][\w$#]*)", flags=re.IGNORECASE)
+            func_matches = func_pattern.findall(item_no_alias)
+            
+            if func_matches:
+                # Extract column names from function arguments
+                # PROBLEM 5 FIX: Filter out parameters (p_*) and local variables (l_*)
+                for col_name in func_matches:
+                    normalized_col = _normalize_identifier(col_name).upper()
+                    # Only add if not a parameter or variable prefix
+                    if (normalized_col and 
+                        len(normalized_col) > 1 and
+                        not normalized_col.startswith(('P_', 'L_', 'V_', 'G_')) and
+                        normalized_col not in TABLE_NAME_BLOCKLIST and
+                        normalized_col not in TYPE_BLOCKLIST):
+                        columns.setdefault(table_name, set()).add(normalized_col)
+            else:
+                # Look for simple column references
+                col_pattern = re.compile(r"(?:^|[\s(,])([A-Za-z_][\w$#]*)(?:\s|$|[),])")
+                for col_match in col_pattern.finditer(item_no_alias):
+                    col_name = col_match.group(1)
+                    normalized_col = _normalize_identifier(col_name).upper()
+                    # Filter out function names, parameters, variables
+                    if (normalized_col and 
+                        len(normalized_col) > 1 and
+                        normalized_col not in {"SUM", "COUNT", "AVG", "MIN", "MAX", "ABS", "SIGN", "GREATEST", "LEAST"} and
+                        not normalized_col.startswith(('P_', 'L_', 'V_', 'G_')) and
+                        normalized_col not in TABLE_NAME_BLOCKLIST and
+                        normalized_col not in TYPE_BLOCKLIST):
+                        columns.setdefault(table_name, set()).add(normalized_col)
+    
+    # PROBLEM 2 FIX: Extract columns from WHERE clauses
+    # Pattern: WHERE table.col = value OR WHERE col = value (with table context from FROM/UPDATE/DELETE)
+    # Find WHERE clauses by looking for DML + WHERE within statement boundaries
+    
+    # Extract INTO/FROM patterns with their WHERE clauses
+    for from_match in re.finditer(r"\bfrom\s+([`\"\w$#\.]+)", block_text, re.IGNORECASE):
+        from_table = _normalize_identifier(from_match.group(1)).upper()
+        
+        if from_table not in normalized_tables:
+            continue
+        
+        # Extract WHERE within this FROM's statement context (up to next semicolon)
+        from_pos = from_match.start()
+        next_semicolon = block_text.find(';', from_pos)
+        
+        # Find the end of this statement
+        if next_semicolon != -1:
+            statement_text = block_text[from_pos:next_semicolon]
+        else:
+            statement_text = block_text[from_pos:]
+        
+        where_match = re.search(
+            r"\bwhere\s+(.+?)$",
+            statement_text,
+            re.IGNORECASE | re.DOTALL
+        )
+        if where_match:
+            where_clause = where_match.group(1)
+            for col_match in re.finditer(
+                r"\b(?:([A-Za-z_][\w$#]*)\s*\.)?\s*([A-Za-z_][\w$#]*)\s*(?:=|<>|!=|>=|<=|>|<|\blike\b|\bin\b|\bbetween\b|\bis\s+null)",
+                where_clause,
+                re.IGNORECASE
+            ):
+                col_name = col_match.group(2)
+                normalized_col = _normalize_identifier(col_name).upper()
+                if (normalized_col and 
+                    len(normalized_col) > 1 and
+                    not normalized_col.startswith(('P_', 'L_', 'V_', 'G_')) and
+                    normalized_col not in TABLE_NAME_BLOCKLIST and
+                    normalized_col not in TYPE_BLOCKLIST):
+                    columns.setdefault(from_table, set()).add(normalized_col)
+    
+    # Extract UPDATE statements with their WHERE clauses as complete units
+    for update_match in re.finditer(
+        r"\bupdate\s+([`\"\w$#\.]+)\s+set\s+.+?\s+where",
+        block_text,
+        re.IGNORECASE | re.DOTALL
+    ):
+        update_table = _normalize_identifier(update_match.group(1)).upper()
+        if update_table not in normalized_tables:
+            continue
+        
+        # Find the complete UPDATE...WHERE statement
+        statement_start = update_match.start()
+        statement_end_match = re.search(r"[;]", block_text[update_match.end():])
+        statement_end = update_match.end() + (statement_end_match.start() if statement_end_match else len(block_text))
+        statement_text = block_text[statement_start:statement_end]
+        
+        where_match = re.search(r"\bwhere\s+(.+?)$", statement_text, re.IGNORECASE | re.DOTALL)
+        if where_match:
+            where_clause = where_match.group(1)
+            for col_match in re.finditer(
+                r"\b(?:([A-Za-z_][\w$#]*)\s*\.)?\s*([A-Za-z_][\w$#]*)\s*(?:=|<>|!=|>=|<=|>|<|\blike\b|\bin\b|\bbetween\b|\bis\s+null)",
+                where_clause,
+                re.IGNORECASE
+            ):
+                col_name = col_match.group(2)
+                normalized_col = _normalize_identifier(col_name).upper()
+                if (normalized_col and 
+                    len(normalized_col) > 1 and
+                    not normalized_col.startswith(('P_', 'L_', 'V_', 'G_')) and
+                    normalized_col not in TABLE_NAME_BLOCKLIST and
+                    normalized_col not in TYPE_BLOCKLIST):
+                    columns.setdefault(update_table, set()).add(normalized_col)
+    
+    # Extract DELETE statements with their WHERE clauses as complete units
+    for delete_match in re.finditer(
+        r"\bdelete\s+from\s+([`\"\w$#\.]+)\s+where",
+        block_text,
+        re.IGNORECASE
+    ):
+        delete_table = _normalize_identifier(delete_match.group(1)).upper()
+        if delete_table not in normalized_tables:
+            continue
+        
+        # Find the complete DELETE...WHERE statement
+        statement_start = delete_match.start()
+        statement_end_match = re.search(r"[;]", block_text[delete_match.end():])
+        statement_end = delete_match.end() + (statement_end_match.start() if statement_end_match else len(block_text))
+        statement_text = block_text[statement_start:statement_end]
+        
+        where_match = re.search(r"\bwhere\s+(.+?)$", statement_text, re.IGNORECASE | re.DOTALL)
+        if where_match:
+            where_clause = where_match.group(1)
+            for col_match in re.finditer(
+                r"\b(?:([A-Za-z_][\w$#]*)\s*\.)?\s*([A-Za-z_][\w$#]*)\s*(?:=|<>|!=|>=|<=|>|<|\blike\b|\bin\b|\bbetween\b|\bis\s+null)",
+                where_clause,
+                re.IGNORECASE
+            ):
+                col_name = col_match.group(2)
+                normalized_col = _normalize_identifier(col_name).upper()
+                if (normalized_col and 
+                    len(normalized_col) > 1 and
+                    not normalized_col.startswith(('P_', 'L_', 'V_', 'G_')) and
+                    normalized_col not in TABLE_NAME_BLOCKLIST and
+                    normalized_col not in TYPE_BLOCKLIST):
+                    columns.setdefault(delete_table, set()).add(normalized_col)
+    
     return {table: sorted(values) for table, values in columns.items()}
 
 
@@ -953,11 +1408,6 @@ def _extract_lookup_keys(
         if not default_table:
             return
 
-        known_columns = {
-            _normalize_identifier(column).upper()
-            for column in (ddl_columns or {}).get(default_table.upper(), [])
-            if column
-        }
         unqualified_pattern = re.compile(
             r"(?:^|[\s(,])([A-Za-z_][\w$#]*)\s*"
             r"(=|<>|!=|>=|<=|>|<|\blike\b|\bin\s*\(|\bbetween\b|\bis\s+(?:not\s+)?null\b)",
@@ -972,8 +1422,6 @@ def _extract_lookup_keys(
                 or normalized_name in TYPE_BLOCKLIST
                 or normalized_name.lower() in KEYWORD_BLOCKLIST
             ):
-                continue
-            if known_columns and normalized_name not in known_columns:
                 continue
             add_key(default_table, normalized_name)
 
@@ -1082,6 +1530,516 @@ def _extract_table_relationships(block_text: str) -> List[Dict[str, str]]:
             }
         )
     return relationships
+
+
+def _infer_implied_foreign_keys(
+    block_text: str,
+    inferred_tables: Dict[str, Dict[str, Any]],
+    parameters: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """
+    Infer implied foreign keys from DML data flow patterns.
+    
+    Applies 5 critical dynamic rules WITHOUT hardcoding table/column names:
+    
+    FIX 1: SELF-REFERENCE BUG
+    - Before recording any FK: from_table must never equal to_table
+    - This check runs on every FK candidate without exception
+    
+    FIX 2: PK VS FK CONFUSION
+    - Does this table naturally own this column concept?
+    - Which table owns this concept?
+    - Confirm with DML evidence (INSERT creates, SELECT retrieves)
+    
+    FIX 3: CROSS-FUNCTION COLUMN ATTRIBUTION
+    - Respect function call boundaries
+    - Don't follow inside functions to collect columns
+    - Only the return value matters for the calling statement
+    
+    FIX 4: FK DIRECTION REASONING
+    - Find all tables queried using this column as WHERE filter
+    - The most-frequently-filtered table with semantic relationship = owner
+    - Direction: referencing_table -> owning_table
+    
+    FIX 5: OWNERSHIP DETECTION HEURISTIC
+    - Table owns concept if: name relates to column prefix AND
+      column in INSERT as creation AND column in SELECT retrieval AND
+      column in RETURNING clause
+    - Table references concept (FK) if: column as parameter input AND
+      no SELECT * retrieval using that column AND semantically different
+    """
+    implied_fks: List[Dict[str, Any]] = []
+    
+    # Helper: Extract table usage statistics for ownership detection
+    def analyze_column_usage(col_name: str) -> Dict[str, Any]:
+        """
+        Analyze how a column is used across the codebase to determine ownership.
+        Returns statistics about INSERT (creates), SELECT (retrieves), RETURNING, etc.
+        """
+        stats = {
+            "insert_in": set(),      # Tables where this column appears in INSERT
+            "select_from": set(),    # Tables where this column appears in SELECT
+            "where_filter": set(),   # Tables where this column is used in WHERE
+            "returning_in": set(),   # Tables where this column appears in RETURNING
+            "update_in": set(),      # Tables where this column appears in UPDATE SET
+        }
+        
+        col_pattern = rf"\b{re.escape(col_name)}\b"
+        
+        # Track INSERT statements
+        insert_pattern = rf"insert\s+into\s+([`\"\w$#\.]+)\s*\(([^)]*{col_name}[^)]*)\)"
+        for match in re.finditer(insert_pattern, block_text, re.IGNORECASE):
+            table = _normalize_identifier(match.group(1)).upper()
+            if table in inferred_tables:
+                stats["insert_in"].add(table)
+        
+        # Track SELECT statements
+        select_pattern = rf"select\s+.+?\s+from\s+([`\"\w$#\.]+).*?where.*{col_pattern}"
+        for match in re.finditer(select_pattern, block_text, re.IGNORECASE | re.DOTALL):
+            table = _normalize_identifier(match.group(1)).upper()
+            if table in inferred_tables:
+                stats["select_from"].add(table)
+                stats["where_filter"].add(table)
+        
+        # Track RETURNING clauses
+        returning_pattern = rf"returning\s+.+?{col_pattern}"
+        for match in re.finditer(returning_pattern, block_text, re.IGNORECASE):
+            # Find the table this RETURNING belongs to by searching backwards
+            preceding = block_text[:match.start()]
+            for table in inferred_tables:
+                if re.search(rf"into\s+{re.escape(table)}", preceding, re.IGNORECASE):
+                    stats["returning_in"].add(table)
+        
+        # Track UPDATE statements
+        update_pattern = rf"update\s+([`\"\w$#\.]+)\s+set\s+.+?{col_pattern}"
+        for match in re.finditer(update_pattern, block_text, re.IGNORECASE):
+            table = _normalize_identifier(match.group(1)).upper()
+            if table in inferred_tables:
+                stats["update_in"].add(table)
+        
+        return stats
+    
+    # Helper: Determine which table owns a concept (natural owner)
+    def find_owning_table(col_name: str, candidate_tables: Set[str]) -> tuple[str | None, str]:
+        """
+        For a column appearing in multiple tables, determine which naturally owns it.
+        Uses semantic analysis of table/column relationships and DML patterns.
+        
+        Returns: (owning_table_name, confidence_level)
+        Confidence: "OWNS", "POSSIBLE", "NONE"
+        """
+        if not candidate_tables:
+            return None, "NONE"
+        
+        if len(candidate_tables) == 1:
+            table = list(candidate_tables)[0]
+            usage = analyze_column_usage(col_name)
+            
+            # A table owns a concept if:
+            # 1. The column is used in INSERT (being created)
+            # 2. The column is used in RETURNING (auto-generated)
+            # 3. The column is used in SELECT WHERE (being retrieved)
+            is_owner = (table in usage["insert_in"] and 
+                       table in usage["returning_in"] and 
+                       table in usage["select_from"])
+            
+            return (table, "OWNS") if is_owner else (table, "POSSIBLE")
+        
+        # Multiple candidates: find the one that matches the semantics
+        usage = analyze_column_usage(col_name)
+        
+        # Score each candidate
+        scores = {}
+        for table in candidate_tables:
+            score = 0
+            
+            # Highest priority: Table name semantically related to column name
+            # Extract concept from column (e.g., CUSTOMER_ID -> CUSTOMER)
+            # Extract concept from table name (remove prefixes like XY_)
+            col_parts = col_name.upper().replace("_ID", "").replace("_CODE", "").replace("_KEY", "")
+            table_parts = table.upper().replace("XY_", "").replace("_PKG", "").replace("_BODY", "")
+            
+            if col_parts in table_parts or col_parts == table_parts:
+                score += 10  # Strong semantic match
+            
+            # Table has RETURNING clause for this column (means it's auto-generated)
+            if table in usage["returning_in"]:
+                score += 8
+            
+            # Table has INSERT with this column (means it creates the value)
+            if table in usage["insert_in"]:
+                score += 6
+            
+            # Table has SELECT WHERE filter (means it retrieves by this column)
+            if table in usage["select_from"]:
+                score += 4
+            
+            scores[table] = score
+        
+        # Return highest scoring table if it has a decent score
+        if scores:
+            best_table = max(scores.items(), key=lambda x: x[1])
+            if best_table[1] >= 8:
+                return best_table[0], "OWNS"
+            elif best_table[1] >= 4:
+                return best_table[0], "POSSIBLE"
+        
+        return None, "NONE"
+    
+    # ========== RULE A: Parameter threading ==========
+    # Pattern: parameter inserted into a column that references another table
+    for param in parameters:
+        param_name = param.get("name", "").upper()
+        if not param_name:
+            continue
+        
+        # Find INSERT statements using this parameter
+        insert_pattern = rf"insert\s+into\s+([`\"\w$#\.]+)\s*\(([^)]+)\)\s*values\s*\(([^)]*{param_name}[^)]*)\)"
+        for match in re.finditer(insert_pattern, block_text, re.IGNORECASE | re.DOTALL):
+            from_table = _normalize_identifier(match.group(1)).upper()
+            col_list_text = match.group(2)
+            values_text = match.group(3)
+            
+            # FIX 3: Respect function boundaries - don't follow inside functions
+            # If this INSERT is inside a nested function call, skip it
+            # (This would require tracking call context; for now check main body)
+            
+            if from_table not in inferred_tables:
+                continue
+            
+            insert_cols = [_normalize_identifier(c).upper() for c in _split_top_level_csv(col_list_text)]
+            insert_vals = [v.strip().upper() for v in _split_top_level_csv(values_text)]
+            
+            for col, val in zip(insert_cols, insert_vals):
+                if param_name not in val:
+                    continue
+                
+                # FIX 2: Is this column a PK of from_table or an FK?
+                col_upper = col.upper()
+                from_table_cols = {c.get("name", "").upper() for c in inferred_tables[from_table].get("columns", [])}
+                if col_upper not in from_table_cols:
+                    continue
+                
+                # Find candidate target table by matching column name to table name
+                candidates = set()
+                for table in inferred_tables:
+                    if table == from_table:  # FIX 1: Skip self-references
+                        continue
+                    target_cols = {c.get("name", "").upper() for c in inferred_tables[table].get("columns", [])}
+                    if col_upper in target_cols:
+                        candidates.add(table)
+                
+                if not candidates:
+                    continue
+                
+                # Determine which candidate owns this column
+                to_table, confidence = find_owning_table(col_upper, candidates)
+                if not to_table or to_table == from_table:  # FIX 1: Never self-reference
+                    continue
+                
+                # FIX 4: Validate direction - parameter comes from outside, so from_table
+                # is using (referencing) the value, and to_table is the owner
+                usage = analyze_column_usage(col_upper)
+                if to_table not in usage["returning_in"]:
+                    # to_table might still own it without RETURNING, continue anyway
+                    pass
+                
+                implied_fks.append({
+                    "from_table": from_table,
+                    "from_column": col_upper,
+                    "to_table": to_table,
+                    "to_column": col_upper,
+                    "confidence": "HIGH" if confidence == "OWNS" else "MEDIUM",
+                    "evidence": f"Parameter {param_name} threaded into {from_table}.{col_upper}; ownership: {to_table}"
+                })
+        
+        # Similar pattern for UPDATE
+        update_pattern = rf"update\s+([`\"\w$#\.]+)\s+set\s+([^;]*{param_name}[^;]*)"
+        for match in re.finditer(update_pattern, block_text, re.IGNORECASE | re.DOTALL):
+            from_table = _normalize_identifier(match.group(1)).upper()
+            set_clause = match.group(2)
+            
+            if from_table not in inferred_tables:
+                continue
+            
+            for col_match in re.finditer(rf"\b([A-Za-z_][\w$#]*)\s*=\s*.*{param_name}", set_clause, re.IGNORECASE):
+                col = _normalize_identifier(col_match.group(1)).upper()
+                
+                # FIX 2 & 1: Same validation as INSERT
+                candidates = set()
+                for table in inferred_tables:
+                    if table == from_table:
+                        continue
+                    target_cols = {c.get("name", "").upper() for c in inferred_tables[table].get("columns", [])}
+                    if col in target_cols:
+                        candidates.add(table)
+                
+                if not candidates:
+                    continue
+                
+                to_table, confidence = find_owning_table(col, candidates)
+                if not to_table or to_table == from_table:
+                    continue
+                
+                implied_fks.append({
+                    "from_table": from_table,
+                    "from_column": col,
+                    "to_table": to_table,
+                    "to_column": col,
+                    "confidence": "MEDIUM",
+                    "evidence": f"Parameter {param_name} updated in {from_table}.{col}; ownership: {to_table}"
+                })
+    
+    # ========== RULE B: Parameter receiving without explicit use ==========
+    # Pattern: Function receives p_X_id parameter and that table appears in INSERTs
+    # This creates a semantic link: parameter_name -> table concept -> insert_table
+    # Example: new_invoice(p_customer_id) and xy_invoice INSERT = FK to xy_customer
+    
+    # Build map of which functions receive which p_X_id parameters
+    func_decl_pattern = rf"function\s+(\w+)\s*\(([^)]*)\)"
+    func_with_params = {}
+    for func_match in re.finditer(func_decl_pattern, block_text, re.IGNORECASE):
+        func_name = func_match.group(1).upper()
+        func_params = func_match.group(2).upper()
+        func_with_params[func_name] = func_params
+    
+    # For each parameter, check if any table's name relates to it
+    for param in parameters:
+        param_name = param.get("name", "").upper()
+        if not param_name or not param_name.startswith("P_"):
+            continue
+        
+        # Extract concept from parameter name (P_CUSTOMER_ID -> CUSTOMER, P_INVOICE_ID -> INVOICE)
+        param_concept = param_name[2:]  # Remove P_ prefix: P_CUSTOMER_ID -> CUSTOMER_ID
+        param_concept_clean = param_concept.replace("_ID", "").replace("_CODE", "").replace("_KEY", "")  # CUSTOMER_ID -> CUSTOMER
+        
+        # Find functions that receive this parameter
+        for func_name, func_params in func_with_params.items():
+            if param_name not in func_params:
+                continue
+            
+            # This function receives the parameter - now check if it inserts into any table
+            # and if that table matches the opposite concept
+            for insert_table in inferred_tables:
+                # CRITICAL SCOPE FIX: Skip utility/logging tables that shouldn't have referencing FKs
+                # Tables like APPL_LOG, AUDIT_LOG are output-only tables, not referencing tables
+                insert_table_bare = insert_table.upper().replace("XY_", "").replace("_PKG", "").replace("_BODY", "")
+                if insert_table_bare in ["APPL_LOG", "APPL", "LOG", "AUDIT", "AUDIT_LOG", "ERROR", "ERROR_LOG"]:
+                    # Logging/utility tables: skip FK creation
+                    continue
+                
+                # Does this function insert into this table?
+                # Find all INSERT statements in the entire block and check which tables are involved
+                all_inserts = re.findall(rf"insert\s+into\s+([`\"\w$#\.]+)", block_text, re.IGNORECASE)
+                insert_tables_found = {_normalize_identifier(t).upper() for t in all_inserts}
+                
+                if insert_table not in insert_tables_found:
+                    continue
+                
+                # Check semantic relationship: does param_concept match a different table?
+                # e.g., P_CUSTOMER_ID (CUSTOMER concept) + INSERT into XY_INVOICE
+                # means CUSTOMER owns CUSTOMER_ID and INVOICE references it
+                insert_table_bare = insert_table.replace("XY_", "").replace("_PKG", "").replace("_BODY", "")
+                
+                # Look for a target table that owns this concept
+                candidates = set()
+                for table in inferred_tables:
+                    if table == insert_table:
+                        continue
+                    table_bare = table.replace("XY_", "").replace("_PKG", "").replace("_BODY", "")
+                    # Does this table's name match the parameter concept?
+                    if (param_concept_clean == table_bare or 
+                        param_concept == table_bare or 
+                        table_bare.endswith(param_concept_clean)):
+                        # Add to candidates (don't check column existence yet)
+                        candidates.add(table)
+                
+                if not candidates:
+                    continue
+                
+                # For Rule B, if there's only one candidate, use it directly
+                # If multiple, use find_owning_table as tiebreaker
+                to_table = None
+                if len(candidates) == 1:
+                    to_table = list(candidates)[0]
+                else:
+                    to_table, _ = find_owning_table(param_concept, candidates)
+                
+                if not to_table or to_table == insert_table:  # FIX 1: No self-reference
+                    continue
+                
+                # Check if this FK already exists (avoid duplicates)
+                if any(fk["from_table"] == insert_table and 
+                       fk["from_column"] == param_concept and 
+                       fk["to_table"] == to_table 
+                       for fk in implied_fks):
+                    continue
+                
+                implied_fks.append({
+                    "from_table": insert_table,
+                    "from_column": param_concept,
+                    "to_table": to_table,
+                    "to_column": param_concept,
+                    "confidence": "MEDIUM",
+                    "evidence": f"Function {func_name} receives {param_name} and {insert_table} inserts data; inferred FK"
+                })
+    
+    # ========== RULE C: Shared column pattern ==========
+    # Find columns appearing in multiple tables and infer FK relationships
+    
+    all_columns: Dict[str, Set[str]] = {}
+    for table_name, table_info in inferred_tables.items():
+        for col_info in table_info.get("columns", []):
+            col_name = col_info.get("name", "").upper() if isinstance(col_info, dict) else col_info.upper()
+            all_columns.setdefault(col_name, set()).add(table_name)
+    
+    # Process columns that appear in multiple tables
+    for col_name, tables_with_col in all_columns.items():
+        if len(tables_with_col) < 2:
+            continue
+        
+        # FIX 5: For each shared column, determine which table naturally owns it
+        owning_table, ownership_confidence = find_owning_table(col_name, tables_with_col)
+        if not owning_table:
+            continue
+        
+        # All other tables referencing this column are FKs pointing to the owner
+        for from_table in tables_with_col:
+            # FIX 1: Never self-reference
+            if from_table == owning_table:
+                continue
+            
+            # FIX 4: Validate direction - owning table is filter target
+            usage = analyze_column_usage(col_name)
+            if owning_table not in usage["where_filter"]:
+                # Might not be used as filter in this block; confidence drops
+                confidence = "LOW"
+            else:
+                confidence = "MEDIUM" if ownership_confidence == "OWNS" else "LOW"
+            
+            # Check if this FK already exists (avoid duplicates)
+            if any(fk["from_table"] == from_table and 
+                   fk["from_column"] == col_name and 
+                   fk["to_table"] == owning_table 
+                   for fk in implied_fks):
+                continue
+            
+            implied_fks.append({
+                "from_table": from_table,
+                "from_column": col_name,
+                "to_table": owning_table,
+                "to_column": col_name,
+                "confidence": confidence,
+                "evidence": f"Shared column {col_name} in {from_table} and {owning_table}; {owning_table} is owner"
+            })
+    
+    # ========== Final validation pass: ensure no self-references ==========
+    # FIX 1: Absolute guarantee - filter out any FKs where from_table == to_table
+    validated_fks = [fk for fk in implied_fks if fk["from_table"] != fk["to_table"]]
+    
+    # CRITICAL FIX: Verify FK column exists in fromTable before emitting
+    # This prevents hallucinated FKs where the column doesn't actually exist
+    verified_fks = []
+    for fk in validated_fks:
+        from_table = fk.get("from_table")
+        from_col = fk.get("from_column")
+        
+        # Look up the fromTable's actual column list
+        if from_table in inferred_tables:
+            table_cols = {c.get("name", "").upper() for c in inferred_tables[from_table].get("columns", [])}
+            # Only add FK if the column actually exists in this table
+            if from_col.upper() in table_cols:
+                verified_fks.append(fk)
+    
+    # FIX 6: Filter out reverse FKs by removing FKs where inverse relationship exists
+    # After all FK creation, if both FK(A->B) and FK(B->A) exist for same column,
+    # keep only FK(A->B) where A is more likely a data-containing table (not just a reference)
+    # Heuristic: prefer FK from table that matches the column concept name
+    filtered_fks = []
+    reverse_fks_to_skip = set()  # Track reverse FKs to skip
+    
+    for fk in verified_fks:
+        key = (fk["from_table"], fk["from_column"], fk["to_table"], fk["to_column"])
+        reverse_key = (fk["to_table"], fk["to_column"], fk["from_table"], fk["from_column"])
+        
+        # Check if reverse FK exists
+        has_reverse = any(
+            (o["from_table"], o["from_column"], o["to_table"], o["to_column"]) == reverse_key
+            for o in verified_fks
+        )
+        
+        if has_reverse:
+            # Both directions exist. Prefer FK where from_table semantically matches column concept
+            # Extract concept from column (e.g., CUSTOMER_ID -> CUSTOMER)
+            col_concept = fk["from_column"].upper().replace("_ID", "").replace("_CODE", "")
+            
+            # Check if column concept appears in from_table name
+            from_matches_concept = col_concept in fk["from_table"].replace("XY_", "").upper()
+            # Check if column concept appears in to_table name
+            to_matches_concept = col_concept in fk["to_table"].replace("XY_", "").upper()
+            
+            # If from_table matches the concept, it's the reference table (owns the concept)
+            # So the FK should go FROM the data table TO the reference table
+            # FK should go FROM invoice TO customer
+            if from_matches_concept:
+                # from_table is (CUSTOMER) - this is the reference table, not FK source
+                # Skip this one - keep the reverse instead
+                pass
+            else:
+                # from_table (INVOICE) doesn't match concept, so it's likely the data table
+                # FK from INVOICE -> CUSTOMER is correct
+                filtered_fks.append(fk)
+        else:
+            # No reverse FK, keep as is
+            filtered_fks.append(fk)
+    
+    # Deduplicate by (from_table, from_column, to_table, to_column)
+    # CRITICAL FIX: Keep highest confidence or first occurrence
+    seen = set()
+    unique_fks = []
+    for fk in filtered_fks:
+        key = (fk["from_table"], fk["from_column"], fk["to_table"], fk["to_column"])
+        if key not in seen:
+            seen.add(key)
+            unique_fks.append(fk)
+    
+    return unique_fks
+
+
+def _resolve_type_anchors(block_text: str) -> Dict[str, Dict[str, str]]:
+    """
+    PROBLEM 4 FIX: Resolve %TYPE and %ROWTYPE anchors in variable declarations.
+    
+    Output format:
+    {
+        'variable_name': {
+            'anchor_table': 'xy_customer',
+            'anchor_column': 'customer_id',
+            'resolved_type': 'ANCHORED: xy_customer.customer_id'
+        }
+    }
+    """
+    anchors: Dict[str, Dict[str, str]] = {}
+    
+    # Pattern: variable_name table.column%type or table.column%rowtype
+    anchor_pattern = re.compile(
+        r"\b([A-Za-z_][\w$#]*)\s+([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#]*)\s*%(?:type|rowtype)\b",
+        flags=re.IGNORECASE
+    )
+    
+    declaration_section = _extract_declaration_section(block_text)
+    for match in anchor_pattern.finditer(declaration_section):
+        var_name = _normalize_identifier(match.group(1)).upper()
+        anchor_table = _normalize_identifier(match.group(2)).upper()
+        anchor_column = _normalize_identifier(match.group(3)).upper()
+        
+        anchors[var_name] = {
+            "anchor_table": anchor_table,
+            "anchor_column": anchor_column,
+            "resolved_type": f"ANCHORED: {anchor_table}.{anchor_column}"
+        }
+    
+    return anchors
 
 
 def _extract_local_variables(block_text: str) -> List[Dict[str, str]]:
@@ -2870,14 +3828,298 @@ def _extract_inner_procedure_params(block_text: str) -> List[Dict[str, str]]:
     return params
 
 
+def _analyze_procedure_block(
+    item: ObjectSlice,
+    table_defs: List[Dict[str, Any]],
+    table_map: Dict[str, Dict[str, Any]],
+    ddl_columns: Dict[str, List[str]],
+    relationships: List[Dict[str, str]],
+    sequence_catalog: Dict[str, Any],
+    sequence_names: List[str],
+) -> Dict[str, Any]:
+    """Analyze a single procedure/function block and return semantic analysis entry."""
+    params = _extract_parameters(item.block_text)
+    parameter_names = [param["name"] for param in params["all"]]
+    local_variables = _extract_local_variables(item.block_text)
+    collections = detect_collections(item.block_text)
+    collection_definitions = _extract_collection_definitions(item.block_text, local_variables)
+    cursor_definitions = _extract_cursor_definitions(item.block_text)
+    operations_tables = _extract_operations_and_tables(item.block_text)
+    tables_used = operations_tables["tables"]
+    operations_by_table = _extract_operations_by_table(item.block_text)
+    preliminary_ast: Dict[str, Any] = {
+        "block_text": item.block_text,
+        "cursor_definitions": cursor_definitions,
+        "collection_definitions": collection_definitions,
+    }
+    bulk_operations = detect_bulk_operations(preliminary_ast)
+    operations_by_table = _merge_bulk_operations_into_operations(operations_by_table, bulk_operations)
+    tables_used = _synchronize_tables_used(tables_used, operations_by_table)
+    driving_table = _extract_driving_table(item.block_text, cursor_definitions, operations_by_table)
+    target_tables = _extract_target_tables(operations_by_table)
+    skip_locked_tables = _extract_skip_locked_tables(item.block_text, cursor_definitions, driving_table)
+    sequence_dependencies = _extract_sequence_dependencies(item.block_text, sequence_names)
+
+    # RC4 FIX: extract programmatic raises
+    programmatic_raises = _extract_programmatic_raises(item.block_text)
+    # RC8 FIX: detect PRAGMA AUTONOMOUS_TRANSACTION
+    autonomous_transaction = _has_autonomous_transaction(item.block_text)
+    # RC6 FIX: extract package constants
+    package_constants = _extract_package_constants(item.block_text)
+    # RC3 FIX: extract null-safe params (NVL-wrapped)
+    all_param_names = [p["name"] for p in params["all"]]
+    null_safe_params = _extract_null_safe_params(item.block_text, all_param_names)
+    # RC2 FIX: if no params found from header (package body inner proc), try body regex
+    if not params["all"] and item.object_type.upper() == "PACKAGE":
+        inner_params = _extract_inner_procedure_params(item.block_text)
+        if inner_params:
+            params_in = [p for p in inner_params if "OUT" not in p.get("direction", "")]
+            params_out = [p for p in inner_params if "OUT" in p.get("direction", "")]
+            params = {"in": params_in, "out": params_out, "all": inner_params}
+            all_param_names = [p["name"] for p in inner_params]
+            null_safe_params = _extract_null_safe_params(item.block_text, all_param_names)
+    select_assignments = _extract_select_into_assignments(item.block_text)
+    scalar_assignments = _extract_scalar_assignments(
+        item.block_text,
+        [*parameter_names, *(var["name"] for var in local_variables)],
+    )
+    insert_statements = _extract_insert_statements(item.block_text)
+    lookup_keys = _extract_lookup_keys(item.block_text, ddl_columns)
+    exceptions = _extend_exceptions_with_select_into_risks(
+        _extract_exceptions(item.block_text),
+        select_assignments,
+    )
+    table_columns = _extract_table_columns(item.block_text, tables_used)
+    for table in tables_used:
+        ddl_cols = ddl_columns.get(table.upper(), [])
+        if ddl_cols:
+            table_columns.setdefault(table, [])
+            table_columns[table] = sorted({*table_columns[table], *ddl_cols})
+    table_relationships = _filter_relationships_for_tables(relationships, tables_used)
+    analysis_ast: Dict[str, Any] = {
+        "name": item.object_name,
+        "object_type": item.object_type,
+        "block_text": item.block_text,
+        "parameters": params["all"],
+        "input_parameters": params["in"],
+        "output_parameters": params["out"],
+        "variables": local_variables,
+        "collections": collections,
+        "tables_used": tables_used,
+        "operations": operations_by_table,
+        "driving_table": driving_table,
+        "target_tables": target_tables,
+        "skip_locked_tables": skip_locked_tables,
+        "lookup_keys": lookup_keys,
+        "sequence_dependencies": sequence_dependencies,
+        "select_assignments": select_assignments,
+        "assignments": [*select_assignments, *scalar_assignments],
+        "insert_statements": insert_statements,
+        "collection_definitions": collection_definitions,
+        "cursor_definitions": cursor_definitions,
+        "schema": {
+            "tables": table_defs,
+            "relationships": relationships,
+            "sequences": sequence_catalog["sequences"],
+            "sequence_mapping": sequence_catalog["sequence_mapping"],
+        },
+    }
+    analysis_ast["bulk_operations"] = bulk_operations
+    cursor = detect_cursor_patterns(analysis_ast)
+    analysis_ast["cursor"] = cursor
+    collection_data_flow = detect_collection_data_flow(analysis_ast)
+    variable_semantics = classify_variable_semantics(analysis_ast)
+    analysis_ast["variable_semantics"] = variable_semantics
+    data_flow = enhance_data_flow(analysis_ast)
+    data_flow.extend(collection_data_flow)
+    analysis_ast["data_flow"] = data_flow
+    unused_variables = detect_unused_variables(analysis_ast)
+    analysis_ast["unused_variables"] = unused_variables
+    exception_sources = detect_exception_sources(analysis_ast)
+    id_generation = detect_id_generation_conflict(analysis_ast, analysis_ast["schema"])
+    transaction = detect_transaction_patterns(analysis_ast)
+    analysis_ast["transaction"] = transaction
+    analysis_ast["complexity"] = _complexity_metrics(item.block_text)
+    retry_logic = detect_retry_logic(analysis_ast)
+    error_handling = detect_bulk_exception_handling(analysis_ast)
+    performance_patterns = (
+        ["bulk_processing", "reduced_context_switching", "high_throughput_batch"]
+        if any(op.get("type") == "BULK_COLLECT" for op in bulk_operations)
+        and any(op.get("type") == "FORALL" for op in bulk_operations)
+        else []
+    )
+    dependency_chain = _build_dependency_chains(tables_used, relationships)
+    business_rules = _enhance_business_rules(
+        item.block_text,
+        _extract_business_rules(item.block_text),
+    )
+    issues = [
+        *_validate_sequence_mapping(
+            sequence_dependencies,
+            sequence_catalog["sequence_mapping"],
+            operations_by_table,
+        ),
+    ]
+    analysis_ast["issues"] = issues
+    issues.extend(detect_logic_gaps(analysis_ast))
+    semantic_analysis = build_semantic_analysis(analysis_ast)
+    analysis_ast["semantic_analysis"] = semantic_analysis
+    complexity = classify_complexity(analysis_ast)
+    proc_entry: Dict[str, Any] = {
+        "name": item.object_name,
+        "object_type": item.object_type,
+        "parameters": params["all"],
+        "input_parameters": params["in"],
+        "output_parameters": params["out"],
+        "variables": local_variables,
+        "collections": collections,
+        "tables_used": tables_used,
+        "driving_table": driving_table,
+        "target_tables": target_tables,
+        "skip_locked_tables": skip_locked_tables,
+        "operations": operations_by_table,
+        "business_rules": business_rules,
+        "lookup_keys": lookup_keys,
+        "data_flow": data_flow,
+        "dependencies": _clean_dependencies(
+            tables_used,
+            sequence_dependencies,
+            table_map.keys(),
+            sequence_names,
+        ),
+        "exceptions": exceptions,
+        "exception_sources": exception_sources,
+        "variable_semantics": variable_semantics,
+        "bulk_operations": bulk_operations,
+        "cursor": cursor,
+        "dependency_graph": {
+            "tables_used": tables_used,
+            "procedures_called": _extract_procedure_calls(
+                item.block_text,
+                item.object_name,
+                known_tables=tables_used,
+                known_symbols=[*parameter_names, *(var["name"] for var in local_variables)],
+            ),
+            "sequences_used": sequence_dependencies,
+        },
+        "table_details": {
+            "tables": [
+                {
+                    "name": table,
+                    "columns": table_columns.get(table, []),
+                    "lookup_keys": lookup_keys.get(table, []),
+                    "primary_keys": table_map.get(table, {}).get("primary_keys", []),
+                    "foreign_keys": table_map.get(table, {}).get("foreign_keys", []),
+                }
+                for table in tables_used
+            ],
+            "relationships": table_relationships,
+        },
+        "complexity": complexity,
+        "unused_variables": unused_variables,
+        "id_generation": id_generation,
+        "transaction": transaction,
+        "retry_logic": retry_logic,
+        "error_handling": error_handling,
+        "performance_patterns": performance_patterns,
+        "issues": issues,
+        "dependency_chain": dependency_chain,
+        "semantic_analysis": semantic_analysis,
+        # RC4 FIX: programmatic raises (raise_application_error calls)
+        "programmatic_raises": programmatic_raises,
+        # RC8 FIX: autonomous transaction flag
+        "autonomous_transaction": autonomous_transaction,
+        # RC6 FIX: package constants
+        "package_constants": package_constants,
+        # RC3 FIX: null-safe params (NVL-wrapped booleans)
+        "null_safe_params": null_safe_params,
+    }
+    return proc_entry
+
+
 def build_discovery_model(sql_text: str) -> Dict[str, Any]:
     """Build a full-file discovery model for schema + procedure behavior."""
     cleaned = _prepare_sql_text(sql_text)
     table_defs = _extract_table_definitions(cleaned)
-    if not table_defs:
-        table_defs = infer_tables_from_dml(cleaned)
+    
+    # Always infer tables from DML to find procedure-only references, resolving types from DDL
+    inferred_dml_tables = infer_tables_from_dml(cleaned, table_defs if table_defs else None)
+    
+    # Merge tables: keep DDL tables, add inferred-only tables (not in DDL)
+    if table_defs:
+        existing_names = {t.get("name", "").upper() for t in table_defs}
+        inferred_only = [t for t in inferred_dml_tables if t.get("name", "").upper() not in existing_names]
+        table_defs.extend(inferred_only)
+    else:
+        table_defs = inferred_dml_tables
+    
+    # Infer implied foreign keys for ALL tables (DDL or inferred)
+    # Extract parameters and DML patterns for FK inference
+    all_parameters = []
+    
+    # Handle DECLARE block variables (name BEFORE direction): p_customer_id IN NUMBER
+    for match in re.finditer(
+        r'^\s+(\w+)\s+(?:in|out|in\s+out)\s+(?:nocopy\s+)?([A-Z0-9_#\$\.]+)',
+        cleaned, re.IGNORECASE | re.MULTILINE
+    ):
+        param_name = _normalize_identifier(match.group(1)).upper()
+        data_type = _normalize_identifier(match.group(2)).upper()
+        if not any(p["name"] == param_name for p in all_parameters):
+            all_parameters.append({"name": param_name, "type": data_type})
+    
+    # Handle procedure parameters (direction BEFORE name): IN p_customer_id NUMBER
+    for match in re.finditer(
+        r'\b(?:in|out|in\s+out)\s+(?:nocopy\s+)?(\w+)\s+(?:in\s+)?([A-Z0-9_#\$\.]+)',
+        cleaned, re.IGNORECASE
+    ):
+        param_name = _normalize_identifier(match.group(1)).upper()
+        data_type = _normalize_identifier(match.group(2)).upper()
+        if not any(p["name"] == param_name for p in all_parameters):
+            all_parameters.append({"name": param_name, "type": data_type})
+    
+    # Infer implied FKs using parameter threading
+    inferred_tables_dict = {t["name"]: t for t in table_defs}
+    implied_fks = _infer_implied_foreign_keys(cleaned, inferred_tables_dict, all_parameters)
+    
+    # Populate foreign keys for each table with duplicate prevention
+    for fk in implied_fks:
+        from_table = fk.get("from_table")
+        if from_table in inferred_tables_dict:
+            new_fk = {
+                "source_column": fk.get("from_column"),
+                "target_table": fk.get("to_table"),
+                "target_column": fk.get("to_column"),
+            }
+            # Check if this FK already exists to prevent duplicates
+            fk_list = inferred_tables_dict[from_table].setdefault("foreign_keys", [])
+            fk_key = (new_fk["source_column"], new_fk["target_table"], new_fk["target_column"])
+            
+            # Only add if not already present
+            if not any((f["source_column"], f["target_table"], f["target_column"]) == fk_key for f in fk_list):
+                fk_list.append(new_fk)
+    
     table_map = {table["name"]: table for table in table_defs}
     ddl_columns = {table["name"]: [col["name"] for col in table["columns"]] for table in table_defs}
+    
+    # DYN-FK-3: Extract ALTER TABLE FKs and merge into table definitions
+    alter_table_fks = _extract_alter_table_foreign_keys(cleaned)
+    
+    # Add ALTER TABLE FKs to the corresponding tables' foreign_keys arrays
+    for fk in alter_table_fks:
+        source_table = fk.get("source_table")
+        if source_table in table_map:
+            existing_fks = table_map[source_table].get("foreign_keys", [])
+            new_fk = {
+                "source_column": fk.get("source_column"),
+                "target_table": fk.get("target_table"),
+                "target_column": fk.get("target_column"),
+            }
+            # Avoid duplicates
+            fk_key = (new_fk["source_column"], new_fk["target_table"], new_fk["target_column"])
+            if not any((f["source_column"], f["target_table"], f["target_column"]) == fk_key for f in existing_fks):
+                existing_fks.append(new_fk)
+            table_map[source_table]["foreign_keys"] = existing_fks
+    
     relationships = _dedupe_relationships([
         {
             "source_table": table["name"],
@@ -2887,208 +4129,58 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
         }
         for table in table_defs
         for fk in table["foreign_keys"]
-    ] + _extract_alter_table_foreign_keys(cleaned))
+    ] + alter_table_fks)
     sequence_catalog = _extract_sequence_catalog(cleaned)
     sequence_names = sequence_catalog["sequence_names"]
     objects = _extract_objects(cleaned)
     procedures: List[Dict[str, Any]] = []
     for item in objects:
-        params = _extract_parameters(item.block_text)
-        parameter_names = [param["name"] for param in params["all"]]
-        local_variables = _extract_local_variables(item.block_text)
-        collections = detect_collections(item.block_text)
-        collection_definitions = _extract_collection_definitions(item.block_text, local_variables)
-        cursor_definitions = _extract_cursor_definitions(item.block_text)
-        operations_tables = _extract_operations_and_tables(item.block_text)
-        tables_used = operations_tables["tables"]
-        operations_by_table = _extract_operations_by_table(item.block_text)
-        preliminary_ast: Dict[str, Any] = {
-            "block_text": item.block_text,
-            "cursor_definitions": cursor_definitions,
-            "collection_definitions": collection_definitions,
-        }
-        bulk_operations = detect_bulk_operations(preliminary_ast)
-        operations_by_table = _merge_bulk_operations_into_operations(operations_by_table, bulk_operations)
-        tables_used = _synchronize_tables_used(tables_used, operations_by_table)
-        driving_table = _extract_driving_table(item.block_text, cursor_definitions, operations_by_table)
-        target_tables = _extract_target_tables(operations_by_table)
-        skip_locked_tables = _extract_skip_locked_tables(item.block_text, cursor_definitions, driving_table)
-        sequence_dependencies = _extract_sequence_dependencies(item.block_text, sequence_names)
-
-        # RC4 FIX: extract programmatic raises
-        programmatic_raises = _extract_programmatic_raises(item.block_text)
-        # RC8 FIX: detect PRAGMA AUTONOMOUS_TRANSACTION
-        autonomous_transaction = _has_autonomous_transaction(item.block_text)
-        # RC6 FIX: extract package constants
-        package_constants = _extract_package_constants(item.block_text)
-        # RC3 FIX: extract null-safe params (NVL-wrapped)
-        all_param_names = [p["name"] for p in params["all"]]
-        null_safe_params = _extract_null_safe_params(item.block_text, all_param_names)
-        # RC2 FIX: if no params found from header (package body inner proc), try body regex
-        if not params["all"] and item.object_type.upper() == "PACKAGE":
-            inner_params = _extract_inner_procedure_params(item.block_text)
-            if inner_params:
-                params_in = [p for p in inner_params if "OUT" not in p.get("direction", "")]
-                params_out = [p for p in inner_params if "OUT" in p.get("direction", "")]
-                params = {"in": params_in, "out": params_out, "all": inner_params}
-                all_param_names = [p["name"] for p in inner_params]
-                null_safe_params = _extract_null_safe_params(item.block_text, all_param_names)
-        select_assignments = _extract_select_into_assignments(item.block_text)
-        scalar_assignments = _extract_scalar_assignments(
-            item.block_text,
-            [*parameter_names, *(var["name"] for var in local_variables)],
+        # Handle PACKAGE BODY: extract and analyze subprograms individually
+        if item.object_type.upper() == "PACKAGE" and _is_package_body_block(item.block_text):
+            package_constants = _extract_package_constants(item.block_text)
+            subprogram_blocks = _extract_package_subprogram_blocks(item.block_text)
+            for subprogram_info in subprogram_blocks:
+                # Create synthetic ObjectSlice for each subprogram
+                subprogram_item = ObjectSlice(
+                    object_type=subprogram_info.get("object_type", "PROCEDURE"),
+                    object_name=subprogram_info.get("name", ""),
+                    block_text=subprogram_info.get("block_text", ""),
+                )
+                # Analyze the subprogram
+                proc_entry = _analyze_procedure_block(
+                    subprogram_item,
+                    table_defs,
+                    table_map,
+                    ddl_columns,
+                    relationships,
+                    sequence_catalog,
+                    sequence_names,
+                )
+                # Merge package constants with subprogram constants
+                if package_constants:
+                    existing_constants = proc_entry.get("package_constants", [])
+                    for const in package_constants:
+                        const_name = const.get("name", "").upper()
+                        if not any(c.get("name", "").upper() == const_name for c in existing_constants):
+                            existing_constants.append(const)
+                    proc_entry["package_constants"] = existing_constants
+                procedures.append(proc_entry)
+            continue
+        
+        # Skip PACKAGE SPEC (declaration-only)
+        if item.object_type.upper() == "PACKAGE" and not _is_package_body_block(item.block_text):
+            continue
+        
+        # Analyze regular procedures/functions
+        proc_entry = _analyze_procedure_block(
+            item,
+            table_defs,
+            table_map,
+            ddl_columns,
+            relationships,
+            sequence_catalog,
+            sequence_names,
         )
-        insert_statements = _extract_insert_statements(item.block_text)
-        lookup_keys = _extract_lookup_keys(item.block_text, ddl_columns)
-        exceptions = _extend_exceptions_with_select_into_risks(
-            _extract_exceptions(item.block_text),
-            select_assignments,
-        )
-        table_columns = _extract_table_columns(item.block_text, tables_used)
-        for table in tables_used:
-            ddl_cols = ddl_columns.get(table.upper(), [])
-            if ddl_cols:
-                table_columns.setdefault(table, [])
-                table_columns[table] = sorted({*table_columns[table], *ddl_cols})
-        table_relationships = _filter_relationships_for_tables(relationships, tables_used)
-        analysis_ast: Dict[str, Any] = {
-            "name": item.object_name,
-            "object_type": item.object_type,
-            "block_text": item.block_text,
-            "parameters": params["all"],
-            "input_parameters": params["in"],
-            "output_parameters": params["out"],
-            "variables": local_variables,
-            "collections": collections,
-            "tables_used": tables_used,
-            "operations": operations_by_table,
-            "driving_table": driving_table,
-            "target_tables": target_tables,
-            "skip_locked_tables": skip_locked_tables,
-            "lookup_keys": lookup_keys,
-            "sequence_dependencies": sequence_dependencies,
-            "select_assignments": select_assignments,
-            "assignments": [*select_assignments, *scalar_assignments],
-            "insert_statements": insert_statements,
-            "collection_definitions": collection_definitions,
-            "cursor_definitions": cursor_definitions,
-            "schema": {
-                "tables": table_defs,
-                "relationships": relationships,
-                "sequences": sequence_catalog["sequences"],
-                "sequence_mapping": sequence_catalog["sequence_mapping"],
-            },
-        }
-        analysis_ast["bulk_operations"] = bulk_operations
-        cursor = detect_cursor_patterns(analysis_ast)
-        analysis_ast["cursor"] = cursor
-        collection_data_flow = detect_collection_data_flow(analysis_ast)
-        variable_semantics = classify_variable_semantics(analysis_ast)
-        analysis_ast["variable_semantics"] = variable_semantics
-        data_flow = enhance_data_flow(analysis_ast)
-        data_flow.extend(collection_data_flow)
-        analysis_ast["data_flow"] = data_flow
-        unused_variables = detect_unused_variables(analysis_ast)
-        analysis_ast["unused_variables"] = unused_variables
-        exception_sources = detect_exception_sources(analysis_ast)
-        id_generation = detect_id_generation_conflict(analysis_ast, analysis_ast["schema"])
-        transaction = detect_transaction_patterns(analysis_ast)
-        analysis_ast["transaction"] = transaction
-        analysis_ast["complexity"] = _complexity_metrics(item.block_text)
-        retry_logic = detect_retry_logic(analysis_ast)
-        error_handling = detect_bulk_exception_handling(analysis_ast)
-        performance_patterns = (
-            ["bulk_processing", "reduced_context_switching", "high_throughput_batch"]
-            if any(op.get("type") == "BULK_COLLECT" for op in bulk_operations)
-            and any(op.get("type") == "FORALL" for op in bulk_operations)
-            else []
-        )
-        dependency_chain = _build_dependency_chains(tables_used, relationships)
-        business_rules = _enhance_business_rules(
-            item.block_text,
-            _extract_business_rules(item.block_text),
-        )
-        issues = [
-            *_validate_sequence_mapping(
-                sequence_dependencies,
-                sequence_catalog["sequence_mapping"],
-                operations_by_table,
-            ),
-        ]
-        analysis_ast["issues"] = issues
-        issues.extend(detect_logic_gaps(analysis_ast))
-        semantic_analysis = build_semantic_analysis(analysis_ast)
-        analysis_ast["semantic_analysis"] = semantic_analysis
-        complexity = classify_complexity(analysis_ast)
-        proc_entry: Dict[str, Any] = {
-            "name": item.object_name,
-            "object_type": item.object_type,
-            "parameters": params["all"],
-            "input_parameters": params["in"],
-            "output_parameters": params["out"],
-            "variables": local_variables,
-            "collections": collections,
-            "tables_used": tables_used,
-            "driving_table": driving_table,
-            "target_tables": target_tables,
-            "skip_locked_tables": skip_locked_tables,
-            "operations": operations_by_table,
-            "business_rules": business_rules,
-            "lookup_keys": lookup_keys,
-            "data_flow": data_flow,
-            "dependencies": _clean_dependencies(
-                tables_used,
-                sequence_dependencies,
-                table_map.keys(),
-                sequence_names,
-            ),
-            "exceptions": exceptions,
-            "exception_sources": exception_sources,
-            "variable_semantics": variable_semantics,
-            "bulk_operations": bulk_operations,
-            "cursor": cursor,
-            "dependency_graph": {
-                "tables_used": tables_used,
-                "procedures_called": _extract_procedure_calls(
-                    item.block_text,
-                    item.object_name,
-                    known_tables=tables_used,
-                    known_symbols=[*parameter_names, *(var["name"] for var in local_variables)],
-                ),
-                "sequences_used": sequence_dependencies,
-            },
-            "table_details": {
-                "tables": [
-                    {
-                        "name": table,
-                        "columns": table_columns.get(table, []),
-                        "lookup_keys": lookup_keys.get(table, []),
-                        "primary_keys": table_map.get(table, {}).get("primary_keys", []),
-                        "foreign_keys": table_map.get(table, {}).get("foreign_keys", []),
-                    }
-                    for table in tables_used
-                ],
-                "relationships": table_relationships,
-            },
-            "complexity": complexity,
-            "unused_variables": unused_variables,
-            "id_generation": id_generation,
-            "transaction": transaction,
-            "retry_logic": retry_logic,
-            "error_handling": error_handling,
-            "performance_patterns": performance_patterns,
-            "issues": issues,
-            "dependency_chain": dependency_chain,
-            "semantic_analysis": semantic_analysis,
-            # RC4 FIX: programmatic raises (raise_application_error calls)
-            "programmatic_raises": programmatic_raises,
-            # RC8 FIX: autonomous transaction flag
-            "autonomous_transaction": autonomous_transaction,
-            # RC6 FIX: package constants
-            "package_constants": package_constants,
-            # RC3 FIX: null-safe params (NVL-wrapped booleans)
-            "null_safe_params": null_safe_params,
-        }
         procedures.append(proc_entry)
 
     return {

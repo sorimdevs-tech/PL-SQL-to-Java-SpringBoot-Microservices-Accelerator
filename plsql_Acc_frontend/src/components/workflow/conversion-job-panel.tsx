@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { Download, FileText, LoaderCircle, Play } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
@@ -107,8 +107,106 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
   const [conversionStartAt, setConversionStartAt] = useState<number | null>(null)
   const [conversionDurationMs, setConversionDurationMs] = useState<number | null>(null)
   const [conversionElapsedMs, setConversionElapsedMs] = useState(0)
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set())
 
   const isPolling = job?.status === "queued" || job?.status === "running"
+
+  interface TreeNode {
+    name: string
+    path: string
+    type: "file" | "folder"
+    children?: TreeNode[]
+    size?: number
+  }
+
+  function buildFileTree(files: GeneratedFile[]): TreeNode[] {
+    const pathMap: { [key: string]: TreeNode } = {}
+
+    // First pass: create all nodes with proper paths
+    files.forEach((file) => {
+      const parts = file.path.split("/").filter((p) => p.length > 0)
+
+      parts.forEach((part, index) => {
+        const currentPath = parts.slice(0, index + 1).join("/")
+
+        if (!pathMap[currentPath]) {
+          const isFile = index === parts.length - 1
+          pathMap[currentPath] = {
+            name: part,
+            path: currentPath,
+            type: isFile ? "file" : "folder",
+            size: isFile ? file.size : undefined,
+            children: isFile ? undefined : [],
+          }
+        }
+      })
+    })
+
+    // Second pass: link children to their parents
+    Object.values(pathMap).forEach((node) => {
+      if (node.type === "folder" && node.children) {
+        const childNodes = Object.values(pathMap).filter((other) => {
+          if (other.path.startsWith(node.path + "/")) {
+            const remainder = other.path.substring(node.path.length + 1)
+            return !remainder.includes("/") // Direct children only
+          }
+          return false
+        })
+        node.children = childNodes.sort((a, b) => {
+          if (a.type !== b.type) return a.type === "folder" ? -1 : 1
+          return a.name.localeCompare(b.name)
+        })
+      }
+    })
+
+    // Return only top-level nodes
+    const topLevel = Object.values(pathMap).filter((node) => !node.path.includes("/"))
+    return topLevel.sort((a, b) => {
+      if (a.type !== b.type) return a.type === "folder" ? -1 : 1
+      return a.name.localeCompare(b.name)
+    })
+  }
+
+  function toggleFolder(path: string) {
+    setExpandedFolders((prev) => {
+      const next = new Set(prev)
+      if (next.has(path)) {
+        next.delete(path)
+      } else {
+        next.add(path)
+      }
+      return next
+    })
+  }
+
+  function getFileIcon(path: string): string {
+    const ext = path.split(".").pop()?.toLowerCase() ?? ""
+    switch (ext) {
+      case "ts":
+      case "tsx":
+        return "TS"
+      case "js":
+      case "jsx":
+        return "JS"
+      case "java":
+        return "J"
+      case "xml":
+        return "X"
+      case "json":
+        return "{ }"
+      case "yaml":
+      case "yml":
+        return "Y"
+      case "properties":
+        return "P"
+      case "css":
+        return "C"
+      case "html":
+        return "H"
+      default:
+        return "F"
+    }
+  }
 
   function hasValidOracleCredentials() {
     return (
@@ -119,7 +217,50 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
       props.dbPassword.trim().length > 0
     )
   }
+  function renderTreeNode(node: TreeNode, depth: number = 0): ReactNode {
+    const isExpanded = expandedFolders.has(node.path)
+    const isFolder = node.type === "folder"
 
+    if (isFolder) {
+      return (
+        <div key={node.path}>
+          <button
+            onClick={() => toggleFolder(node.path)}
+            className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs text-slate-200 hover:bg-white/10 transition-colors"
+            style={{ paddingLeft: `${depth * 16 + 8}px` }}
+          >
+            <span className="inline-flex w-4 items-center justify-center text-slate-400 transition-transform" style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}>
+              ▶
+            </span>
+            <span className="text-slate-300">📁</span>
+            <span className="font-medium">{node.name}</span>
+          </button>
+          {isExpanded && node.children && (
+            <div>{node.children.map((child) => renderTreeNode(child, depth + 1))}</div>
+          )}
+        </div>
+      )
+    }
+
+    return (
+      <button
+        key={node.path}
+        onClick={() => void loadFileContent(node.path)}
+        className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs transition-colors ${
+          selectedFilePath === node.path
+            ? "border-l-2 border-cyan-400 bg-cyan-500/20 text-cyan-100"
+            : "text-slate-200 hover:bg-white/10"
+        }`}
+        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+      >
+        <span className="inline-flex h-5 w-5 items-center justify-center rounded text-[10px] font-semibold text-slate-400">
+          {getFileIcon(node.path)}
+        </span>
+        <span className="flex-1 truncate">{node.name}</span>
+        <span className="text-[10px] text-slate-400">{node.size ? `${node.size}B` : ""}</span>
+      </button>
+    )
+  }
   function extractRepoName(repoUrl: string): string {
     const normalized = repoUrl.trim().replace(/\/+$/, "")
     if (!normalized) {
@@ -661,32 +802,22 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
             </div>
 
             {generatedFiles.length > 0 ? (
-              <div className="grid gap-2">
-                {generatedFiles.map((file) => (
-                  <button
-                    key={file.path}
-                    onClick={() => void loadFileContent(file.path)}
-                    className="rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-left text-xs text-slate-100 transition-colors hover:bg-white/20"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span>{file.path}</span>
-                      <span className="text-slate-300">{file.size ? `${file.size} B` : ""}</span>
-                    </div>
-                  </button>
-                ))}
+              <div className="space-y-1">
+                <div className="max-h-96 overflow-y-auto rounded-lg border border-white/20 bg-slate-950/50 p-2">
+                  {buildFileTree(generatedFiles).map((node) => renderTreeNode(node, 0))}
+                </div>
+
+                {selectedFilePath ? (
+                  <div className="space-y-2">
+                    <pre className="max-h-72 overflow-auto rounded-lg border border-white/20 bg-slate-950/80 p-3 text-xs text-slate-100">
+                      {isLoadingFileContent ? "Loading file content..." : selectedFileContent}
+                    </pre>
+                  </div>
+                ) : null}
               </div>
             ) : (
               <p className="text-xs text-slate-300">No generated files available yet.</p>
             )}
-
-            {selectedFilePath ? (
-              <div className="space-y-2">
-                <p className="text-xs font-semibold text-slate-100">Preview: {selectedFilePath}</p>
-                <pre className="max-h-72 overflow-auto rounded-lg border border-white/20 bg-slate-950/80 p-3 text-xs text-slate-100">
-                  {isLoadingFileContent ? "Loading file content..." : selectedFileContent}
-                </pre>
-              </div>
-            ) : null}
           </div>
         ) : null}
 
