@@ -33,6 +33,7 @@ import logging
 from ..utils.logger import get_logger
 from ..utils.config import get_config_value
 from ..utils.naming import normalize_column_name, to_pascal_case
+from ..validator.service_code_corrector import ServiceCodeCorrector
 
 logger = get_logger(__name__)
 
@@ -1579,6 +1580,27 @@ class LLMConversionEngine:
                     unit=unit,
                     all_units=source_units,
                 )
+            # FIX #2: Route complex packages to LLM for better conversion
+            elif self._should_use_llm(unit):
+                try:
+                    service_code = await self._generate_service_with_llm(
+                        unit=unit,
+                        entities=entities,
+                        repositories=repositories,
+                        all_units=source_units,
+                        metadata_provider=metadata_provider,
+                    )
+                    services[filename] = service_code
+                except Exception as e:
+                    logger.warning(f"LLM generation failed for {filename}: {e}. Falling back to deterministic.")
+                    services[filename] = self._generate_deterministic_service_from_unit(
+                        unit=unit,
+                        entities=entities,
+                        repositories=repositories,
+                        all_units=source_units,
+                        metadata_provider=metadata_provider,
+                        validation_feedback=service_feedback,
+                    )
             else:
                 services[filename] = self._generate_deterministic_service_from_unit(
                     unit=unit,
@@ -1588,11 +1610,121 @@ class LLMConversionEngine:
                     metadata_provider=metadata_provider,
                     validation_feedback=service_feedback,
                 )
+            
+            # FIX #1: Wire corrector to clean PL/SQL syntax from generated Java
+            services[filename] = ServiceCodeCorrector.correct_plsql_syntax(services[filename])
+        
         return services
 
     def _is_utility_unit(self, unit: Dict[str, Any]) -> bool:
         """RC1 FIX: True when the procedure/package has no SQL operations — pure control-flow logic."""
         return not bool(unit.get('operations_by_table'))
+
+    def _should_use_llm(self, unit: Dict[str, Any]) -> bool:
+        """FIX #2: Detect if unit is complex enough to warrant LLM generation instead of deterministic."""
+        if not self.provider:
+            return False
+        
+        # Check complexity indicators
+        raw_plsql = str(unit.get('raw_plsql', ''))
+        operations_by_table = unit.get('operations_by_table', {}) or {}
+        semantic = unit.get('semantic_analysis', {}) or {}
+        transaction = unit.get('transaction', {}) or {}
+        
+        complexity_score = 0
+        
+        # Multiple tables involved
+        if len(operations_by_table) > 2:
+            complexity_score += 3
+        
+        # Has joins/complex queries
+        if 'JOIN' in raw_plsql.upper() or 'UNION' in raw_plsql.upper():
+            complexity_score += 2
+        
+        # Has conditional logic (CASE statements)
+        if re.search(r'\bCASE\b.*\bWHEN\b', raw_plsql, re.IGNORECASE | re.DOTALL):
+            complexity_score += 2
+        
+        # Has exception handling
+        if re.search(r'\bEXCEPTION\b', raw_plsql, re.IGNORECASE):
+            complexity_score += 2
+        
+        # Has nested transactions/savepoints
+        if transaction.get('has_savepoint') or transaction.get('has_partial_rollback'):
+            complexity_score += 2
+        
+        # Has aggregations
+        if semantic.get('aggregation'):
+            complexity_score += 2
+        
+        # Has upsert operations (MERGE)
+        if semantic.get('upsert_operations'):
+            complexity_score += 2
+        
+        # Has autonomous transactions
+        if unit.get('autonomous_transaction'):
+            complexity_score += 1
+        
+        # Use LLM if complexity score >= 3
+        return complexity_score >= 3
+
+    async def _generate_service_with_llm(
+        self,
+        unit: Dict[str, Any],
+        entities: Dict[str, str],
+        repositories: Dict[str, str],
+        all_units: Optional[List[Dict[str, Any]]] = None,
+        metadata_provider: Optional[Any] = None,
+    ) -> str:
+        """FIX #2: Generate service using LLM for complex packages."""
+        raw_plsql = str(unit.get('raw_plsql', '')).strip()
+        
+        # Build a comprehensive prompt with context
+        prompt = f"""Convert the following PL/SQL package/procedure to a Spring Boot Java service.
+
+CRITICAL RULES (MUST FOLLOW ALL):
+1. Strip ALL Oracle SQL functions: NVL, INSTR, SUBSTR, TO_CHAR, TRUNC, ROUND, SYSDATE, ROWNUM, DECODE
+2. Convert PL/SQL naming (p_*, l_*) to camelCase Java naming
+3. Remove named parameter syntax (key = value) - use positional only
+4. Remove single quotes outside strings
+5. Replace := with = or ==
+6. Replace apex_web_service calls with RestTemplate
+7. Convert CASE/WHEN to switch or ternary operator
+8. Remove package-qualified references (_pkg.*)
+9. Use proper JPA: findById().orElse() not findOne(null)
+10. Return specific types, NOT Object
+11. Include ALL validation steps, no skipping checks
+12. Use @Transactional(propagation = Propagation.REQUIRES_NEW) for autonomous transactions
+
+PL/SQL Code:
+```plsql
+{raw_plsql}
+```
+
+Target Java Package: {self.config.get('output', {}).get('package_name', 'com.company.project')}
+Target Service Class: {self._derive_service_name(unit.get('name', 'Generated'))}
+
+Entities (available):
+{entities}
+
+Repositories (available):
+{repositories}
+
+Generate only the Java service class. Start with package declaration, include all necessary imports, 
+then the @Service class. Ensure code is compilable and follows Spring Boot best practices."""
+
+        try:
+            # Call LLM with retries
+            generated_code = await self._generate_with_retries(prompt)
+            # Clean and validate the result
+            cleaned = self._clean_java_code(generated_code)
+            errors = self._validate_java_code(cleaned)
+            if errors:
+                logger.warning(f"LLM-generated code has validation warnings: {errors}")
+            return cleaned
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            raise
 
     def _service_generation_score(self, unit: Dict[str, Any]) -> Tuple[int, ...]:
         """Rank duplicate units that map to the same service filename."""
@@ -2501,15 +2633,21 @@ class LLMConversionEngine:
             normalized = normalize_column_name(column_name)
             exact = param_name_map.get(str(column_name).upper())
             if exact:
-                return exact
+                # FIX #4: Strip named params (key = value) syntax, return only value
+                value = str(exact).split('=')[-1].strip() if '=' in str(exact) else exact
+                return value
             normalized_hit = param_name_map.get(normalized.upper())
             if normalized_hit:
-                return normalized_hit
+                # FIX #4: Strip named params syntax
+                value = str(normalized_hit).split('=')[-1].strip() if '=' in str(normalized_hit) else normalized_hit
+                return value
             if normalized in method_param_names:
                 return normalized
             for key_name, value_name in param_name_map.items():
                 if normalized and normalized.lower() in key_name.lower():
-                    return value_name
+                    # FIX #4: Strip named params syntax
+                    value = str(value_name).split('=')[-1].strip() if '=' in str(value_name) else value_name
+                    return value
             if join_var and normalized and normalized.lower() == join_var.lower():
                 return join_var
             return _default_literal(expected_type)
@@ -3047,6 +3185,57 @@ Return ONLY the corrected complete Java code. No markdown, no explanations.
             errors.append(
                 "Service uses EntityManager/createNativeQuery — MUST use injected @Autowired repository instead"
             )
+
+        # FIX #5: Expand validation to catch all 12 PL/SQL-to-Java conversion rules
+        oracle_functions = r'\b(NVL|INSTR|SUBSTR|TO_CHAR|TRUNC|ROUND|SYSDATE|ROWNUM|DECODE|SOUNDEX|LTRIM|RTRIM)\b'
+        if re.search(oracle_functions, code, re.IGNORECASE):
+            errors.append("RULE #1 VIOLATION: Oracle SQL functions detected (NVL, INSTR, SUBSTR, etc.)")
+        
+        # Rule #2: PL/SQL naming convention (p_*, l_*) should be stripped
+        if re.search(r'\b[pl]_\w+\b', code, re.IGNORECASE):
+            errors.append("RULE #2 VIOLATION: PL/SQL naming conventions (p_*, l_*) not converted to camelCase")
+        
+        # Rule #3: Named parameter syntax (key = value) in Java method calls
+        if re.search(r'\w+\s*=\s*\w+\s*[,)]', code):
+            errors.append("RULE #3 VIOLATION: Named parameter syntax (key = value) found in method calls")
+        
+        # Rule #4: Single quotes outside of strings
+        if re.search(r"[^\"']'[^\"']", code) and "'" in code and '"' not in code:
+            errors.append("RULE #4 VIOLATION: Single quotes used outside of strings")
+        
+        # Rule #5: := assignment operator (PL/SQL)
+        if ":=" in code:
+            errors.append("RULE #5 VIOLATION: := assignment operator found (should be = or ==)")
+        
+        # Rule #6: apex_web_service (should use RestTemplate)
+        if "apex_web_service" in code.lower():
+            errors.append("RULE #6 VIOLATION: apex_web_service found (should use RestTemplate)")
+        
+        # Rule #7: CASE/WHEN not converted to switch/ternary
+        if re.search(r'\b(CASE|WHEN|THEN|ELSE|END)\b', code, re.IGNORECASE) and 'switch' not in code:
+            errors.append("RULE #7 VIOLATION: CASE/WHEN not converted to switch or ternary operator")
+        
+        # Rule #8: Package-qualified references (pkg_name.procedure)
+        if re.search(r'\w+_pkg\.\w+', code, re.IGNORECASE):
+            errors.append("RULE #8 VIOLATION: Package-qualified references still present (_pkg.*)")
+        
+        # Rule #9: Invalid JPA calls (findOne without orElse, named params in repository)
+        if "findOne(null)" in code or re.search(r'findOne\(\s*[^)]*parameter[^)]*\)', code):
+            errors.append("RULE #9 VIOLATION: Invalid JPA pattern (findOne(null) should use findById().orElse())")
+        
+        # Rule #10: Return type should not be Object
+        if re.search(r'public\s+Object\s+\w+\(', code):
+            errors.append("RULE #10 VIOLATION: Method returns Object instead of specific type")
+        
+        # Rule #11: Validation steps should not be skipped
+        has_complex_logic = bool(re.search(r'(if|for|while|switch)\s*\(', code))
+        has_validation = bool(re.search(r'(throw|catch|validate|check|assert)\b', code, re.IGNORECASE))
+        if has_complex_logic and not has_validation:
+            errors.append("RULE #11 VIOLATION: Complex logic without proper validation/error handling")
+        
+        # Rule #12: Autonomous transactions should use @Transactional with REQUIRES_NEW
+        if "PRAGMA AUTONOMOUS_TRANSACTION" in code.upper():
+            errors.append("RULE #12 VIOLATION: PRAGMA AUTONOMOUS_TRANSACTION not converted to @Transactional(propagation = Propagation.REQUIRES_NEW)")
 
         return errors
 
