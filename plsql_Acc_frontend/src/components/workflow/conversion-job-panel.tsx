@@ -226,13 +226,13 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
         <div key={node.path}>
           <button
             onClick={() => toggleFolder(node.path)}
-            className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs text-slate-200 hover:bg-white/10 transition-colors"
+            className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs text-slate-700 hover:bg-slate-200 transition-colors"
             style={{ paddingLeft: `${depth * 16 + 8}px` }}
           >
-            <span className="inline-flex w-4 items-center justify-center text-slate-400 transition-transform" style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}>
+            <span className="inline-flex w-4 items-center justify-center text-slate-500 transition-transform" style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}>
               ▶
             </span>
-            <span className="text-slate-300">📁</span>
+            <span className="text-slate-600">📁</span>
             <span className="font-medium">{node.name}</span>
           </button>
           {isExpanded && node.children && (
@@ -248,16 +248,16 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
         onClick={() => void loadFileContent(node.path)}
         className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs transition-colors ${
           selectedFilePath === node.path
-            ? "border-l-2 border-cyan-400 bg-cyan-500/20 text-cyan-100"
-            : "text-slate-200 hover:bg-white/10"
+            ? "border-l-2 border-blue-600 bg-blue-100 text-blue-700"
+            : "text-slate-700 hover:bg-slate-200"
         }`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
       >
-        <span className="inline-flex h-5 w-5 items-center justify-center rounded text-[10px] font-semibold text-slate-400">
+        <span className="inline-flex h-5 w-5 items-center justify-center rounded text-[10px] font-semibold text-slate-500">
           {getFileIcon(node.path)}
         </span>
         <span className="flex-1 truncate">{node.name}</span>
-        <span className="text-[10px] text-slate-400">{node.size ? `${node.size}B` : ""}</span>
+        <span className="text-[10px] text-slate-500">{node.size ? `${node.size}B` : ""}</span>
       </button>
     )
   }
@@ -650,18 +650,18 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
   }
 
   return (
-    <Card className="border-none bg-gradient-to-br from-slate-900 via-slate-800 to-cyan-900 text-white">
+    <Card className="border-none bg-gradient-to-br from-slate-50 via-white to-blue-50 text-slate-900 shadow-sm">
       <CardHeader>
-        <CardTitle className="text-white">Ready to convert: {props.projectName}</CardTitle>
-        <CardDescription className="text-slate-200">
+        <CardTitle className="text-slate-900">Ready to convert: {props.projectName}</CardTitle>
+        <CardDescription className="text-slate-600">
           Start conversion and track job progress, generated files, preview, and download.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         {props.sourceMethod === "git" ? (
-          <div className="rounded-xl border border-white/20 bg-white/10 p-3">
-            <p className="text-xs uppercase tracking-wide text-slate-200">Git API Health</p>
-            <p className="mt-1 text-sm text-slate-100">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-600 font-medium">Git API Health</p>
+            <p className="mt-1 text-sm text-slate-700">
               {isCheckingHealth
                 ? "Checking /health ..."
                 : isBackendHealthy === true
@@ -675,17 +675,17 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
 
         <div className="flex flex-wrap items-center gap-2">
           {isStarting ? (
-            <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/30 bg-white/10 px-4 text-sm font-semibold text-white">
+            <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-slate-100 px-4 text-sm font-semibold text-slate-900">
               <LoaderCircle className="h-4 w-4 animate-spin" />
               Starting...
             </div>
           ): job?.status === "completed" ? (
-            <Badge className="inline-flex items-center gap-2 rounded-full border border-emerald-400/40 bg-emerald-500/15 px-4 py-1.5 text-sm font-semibold text-emerald-300 backdrop-blur-sm">
-              <span className="h-2 w-2 rounded-full bg-emerald-400"></span>
+            <Badge className="inline-flex items-center gap-2 rounded-full border border-emerald-300 bg-emerald-100 px-4 py-1.5 text-sm font-semibold text-emerald-700 backdrop-blur-sm">
+              <span className="h-2 w-2 rounded-full bg-emerald-500"></span>
               Completed
             </Badge>
           ) : conversionStarted && !isStarting ? (
-            <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/30 bg-white/10 px-4 text-sm font-semibold text-white">
+            <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-slate-100 px-4 text-sm font-semibold text-slate-900">
               <LoaderCircle className="h-4 w-4 animate-spin" />
               Converting...
             </div>
@@ -708,7 +708,7 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
           {job?.job_id && job.status === "completed" ? (
             <a
               href={getJobDownloadUrl(job.job_id)}
-              className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-emerald-500 px-4 text-sm font-semibold text-white shadow-md shadow-emerald-500/30 transition-all duration-200 hover:-translate-y-0.5 hover:bg-emerald-600"
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 px-4 text-sm font-semibold text-emerald-700 transition-all duration-200 hover:bg-emerald-100 hover:border-emerald-400 active:scale-95"
             >
               <Download className="h-4 w-4" />
               Download ZIP
@@ -717,17 +717,17 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
         </div>
 
         {progressStage !== "idle" ? (
-          <div className="rounded-xl border border-white/20 bg-white/10 p-3">
-            <div className="flex items-center justify-between text-xs text-slate-200">
-              <span>Application creation</span>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="flex items-center justify-between text-xs text-slate-700">
+              <span className="font-medium">Application creation</span>
               <span className="flex items-center gap-3">
-                <span className="text-[11px] text-slate-300">Elapsed: {formatDuration(conversionElapsedMs)}</span>
-                <span className="uppercase tracking-wide">{progressStage}</span>
+                <span className="text-[11px] text-slate-600">Elapsed: {formatDuration(conversionElapsedMs)}</span>
+                <span className="uppercase tracking-wide text-slate-600 font-medium">{progressStage}</span>
               </span>
             </div>
-            <div className="relative mt-2 h-2 overflow-hidden rounded-full bg-white/20">
+            <div className="relative mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
               {progressStage === "completed" ? (
-                <div className="h-full w-full bg-emerald-400" />
+                <div className="h-full w-full bg-emerald-500" />
               ) : progressStage === "failed" ? (
                 <div className="h-full w-full bg-rose-500" />
               ) : (
@@ -738,23 +738,23 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
         ) : null}
 
         {job ? (
-          <div className="rounded-xl border border-white/20 bg-white/10 p-3">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
             <div className="flex flex-wrap items-center gap-2">
-              <p className="text-sm font-semibold">Job ID: {job.job_id}</p>
+              <p className="text-sm font-semibold text-slate-900">Job ID: {job.job_id}</p>
               <Badge variant={statusVariant(job.status)}>{job.status}</Badge>
             </div>
-            <p className="mt-1 text-xs text-slate-200">Source: {job.source_type}</p>
+            <p className="mt-1 text-xs text-slate-600">Source: {job.source_type}</p>
             {job.result?.github_publish ? (
-              <p className="mt-1 text-xs text-emerald-200">
+              <p className="mt-1 text-xs text-emerald-700">
                 Published to {job.result.github_publish.repo_url} [{job.result.github_publish.branch}] at{" "}
                 {job.result.github_publish.target_path}
               </p>
             ) : null}
-            {job.error ? <p className="mt-2 text-xs font-medium text-rose-200">{job.error}</p> : null}
+            {job.error ? <p className="mt-2 text-xs font-medium text-rose-700">{job.error}</p> : null}
           </div>
         ) : null}
 
-        {logs.length > 0 ? (
+        {/* {logs.length > 0 ? (
           <div className="rounded-xl border border-white/20 bg-white/10 p-3">
             <p className="text-xs uppercase tracking-wide text-slate-200">Generation Stage</p>
             <div className="mt-2 space-y-2">
@@ -773,15 +773,15 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
               ))}
             </div>
           </div>
-        ) : null}
+        ) : null} */}
 
         {conversionStarted ? (
-          <div className="rounded-xl border border-white/20 bg-slate-950/90 p-3">
-            <div className="flex items-center justify-between text-xs text-slate-300">
-              <span className="uppercase tracking-wide">Backend Logs</span>
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            <div className="flex items-center justify-between text-xs text-slate-700">
+              <span className="uppercase tracking-wide font-medium">Backend Logs</span>
               {isLoadingBackendLogs ? <span>Loading…</span> : null}
             </div>
-            <pre className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs text-emerald-200">
+            <pre className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs text-emerald-200 bg-slate-900 p-2 rounded border border-slate-700">
               {backendLogs.length > 0
                 ? backendLogs.join("\n")
                 : backendLogsStatus === "missing"
@@ -792,9 +792,9 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
         ) : null}
 
         {job?.status === "completed" ? (
-          <div className="space-y-3 rounded-xl border border-white/20 bg-white/10 p-3">
+          <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
             <div className="flex items-center justify-between gap-2">
-              <p className="text-sm font-semibold text-white">Generated Files</p>
+              <p className="text-sm font-semibold text-slate-900">Generated Files</p>
               <Button variant="outline" size="sm" onClick={() => void loadGeneratedFiles(job.job_id)} disabled={isLoadingFiles}>
                 {isLoadingFiles ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
                 Refresh Files
@@ -803,25 +803,25 @@ export function ConversionJobPanel(props: ConversionJobPanelProps) {
 
             {generatedFiles.length > 0 ? (
               <div className="space-y-1">
-                <div className="max-h-96 overflow-y-auto rounded-lg border border-white/20 bg-slate-950/50 p-2">
+                <div className="max-h-96 overflow-y-auto rounded-lg border border-slate-200 bg-white p-2">
                   {buildFileTree(generatedFiles).map((node) => renderTreeNode(node, 0))}
                 </div>
 
                 {selectedFilePath ? (
                   <div className="space-y-2">
-                    <pre className="max-h-72 overflow-auto rounded-lg border border-white/20 bg-slate-950/80 p-3 text-xs text-slate-100">
+                    <pre className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs text-emerald-200 bg-slate-900 p-2 rounded border border-slate-700">
                       {isLoadingFileContent ? "Loading file content..." : selectedFileContent}
                     </pre>
                   </div>
                 ) : null}
               </div>
             ) : (
-              <p className="text-xs text-slate-300">No generated files available yet.</p>
+              <p className="text-xs text-slate-600">No generated files available yet.</p>
             )}
           </div>
         ) : null}
 
-        {error ? <p className="text-xs font-medium text-rose-200">{error}</p> : null}
+        {error ? <p className="text-xs font-medium text-rose-700">{error}</p> : null}
       </CardContent>
     </Card>
   )
