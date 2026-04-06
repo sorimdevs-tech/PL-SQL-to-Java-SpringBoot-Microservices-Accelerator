@@ -593,6 +593,17 @@ Rules:
   Preserve MERGE as findBy + if(existing.isPresent()) update else insert.
   Preserve BULK COLLECT as PageRequest-based batch loop.
   Preserve NVL(x, default) as Optional.ofNullable(x).orElse(default).
+- STATUS TRANSITIONS: If the PL/SQL sets a status column AND a timestamp column (approved_date, approved_at, etc.),
+  emit BOTH setStatus(...) and setApprovedDate(LocalDateTime.now()) followed by repository.save(entity).
+  A fetch with no subsequent mutation + save is always a bug.
+- BOOLEAN FLAG BRANCHING: Every PL/SQL IF p_flag = 'Y' / IF p_flag MUST become an if (flag) {{ ... }} else {{ ... }}
+  block in Java. Never silently drop a conditional branch.
+- NAMED PARAMETER CALLS: Always use positional Java arguments in repository calls.
+  repo.findByX(x = x) is a compile error. Write repo.findByX(x).
+- LOGGING: If the PL/SQL calls log_pkg.log_start / log_pkg.log_end / log_pkg.log_error,
+  emit logger.info("Starting ...") at method start, logger.info("Completed ...") before return,
+  and logger.error("Error: {}", e.getMessage()) in the catch block. Never leave the method body empty.
+- CASE/WHEN: Always convert CASE … END to Java ternary or switch. Never leave SQL CASE syntax in Java source.
 - Do not invent repository methods or entity fields not present in the source.
 - Output exactly one compilable Java class in package {package_name}.service.
 """
@@ -1689,12 +1700,24 @@ CRITICAL RULES (MUST FOLLOW ALL):
 4. Remove single quotes outside strings
 5. Replace := with = or ==
 6. Replace apex_web_service calls with RestTemplate
-7. Convert CASE/WHEN to switch or ternary operator
+7. Convert CASE/WHEN to switch or ternary operator - NEVER leave CASE/WHEN SQL syntax in Java
 8. Remove package-qualified references (_pkg.*)
-9. Use proper JPA: findById().orElse() not findOne(null)
+9. Use proper JPA: findById().orElseThrow() not findOne(null) or findOne(null)
 10. Return specific types, NOT Object
 11. Include ALL validation steps, no skipping checks
 12. Use @Transactional(propagation = Propagation.REQUIRES_NEW) for autonomous transactions
+13. STATUS TRANSITIONS: if the PL/SQL sets a status column and an approved_date/approved_at timestamp,
+    the Java MUST call entity.setStatus(...), entity.setApprovedDate(LocalDateTime.now()), then repository.save(entity).
+    NEVER fetch an entity and then do nothing — every fetch must be followed by the full set of mutations and a save().
+14. BOOLEAN FLAG BRANCHING: if the PL/SQL has an IF p_delete_audit_trail = 'Y' (or similar boolean/flag parameter),
+    the Java MUST emit a corresponding if (deleteAuditTrail) {{ ... }} else {{ ... }} block.
+    Never silently drop a branch that existed in PL/SQL.
+15. NAMED PARAMETER CALLS: repository method calls must use positional Java arguments, not SQL named-parameter
+    syntax like customerId = customerId. A call like repo.findByCustomerId(customerId = customerId) is a compile error.
+    Write repo.findByCustomerId(customerId) instead.
+16. LOGGING STUBS: if the PL/SQL procedure calls a logging package (e.g. log_pkg.log_start, log_pkg.log_end,
+    log_pkg.log_error), the Java method MUST emit corresponding logger.info/logger.error calls at the same
+    structural positions (start of method, before return, in catch block). Never emit an empty method body.
 
 PL/SQL Code:
 ```plsql
@@ -1895,25 +1918,64 @@ then the @Service class. Ensure code is compilable and follows Spring Boot best 
         if not body_lines:
             body_lines.append('// No SQL operations — pure utility/infrastructure logic preserved here.')
 
+        # FIX: always declare the SLF4J logger field — every generated service needs it
+        # so logger.info/logger.error calls compile.
+        imports.add('import org.slf4j.Logger;')
+        imports.add('import org.slf4j.LoggerFactory;')
+        logger_field = f'    private static final Logger logger = LoggerFactory.getLogger({service_name}.class);\n'
+
+        # FIX: emit structured logging hooks when the PL/SQL called a logging package
+        # (log_pkg.log_start / log_pkg.log_end / log_pkg.log_error).  Previously these were
+        # silently dropped, leaving empty method bodies that are functionally wrong.
+        raw_plsql_text = str(unit.get('raw_plsql', ''))
+        has_log_start = bool(re.search(r'\blog_pkg\s*\.\s*log_start\b', raw_plsql_text, re.IGNORECASE))
+        has_log_end   = bool(re.search(r'\blog_pkg\s*\.\s*log_end\b',   raw_plsql_text, re.IGNORECASE))
+        has_log_error = bool(re.search(r'\blog_pkg\s*\.\s*log_error\b', raw_plsql_text, re.IGNORECASE))
+        has_logging_calls = has_log_start or has_log_end or has_log_error or bool(unit.get('logging_calls'))
+
+        if has_logging_calls:
+            # Prepend start-hook
+            if has_log_start or (unit.get('logging_calls') and not body_lines):
+                body_lines.insert(0, f'logger.info("[{method_name}] Starting execution");')
+            # Append end-hook (before any trailing raise/return)
+            if has_log_end:
+                body_lines.append(f'logger.info("[{method_name}] Completed successfully");')
+
+        # Wrap in try/catch with error logging when exception block exists in PL/SQL
         transaction = unit.get('transaction') or {}
         has_exception_block = bool(re.search(r"\bexception\b", str(unit.get('raw_plsql', '')), flags=re.IGNORECASE))
         requires_row_level_try = bool(transaction.get('has_savepoint')) or has_exception_block
-        if requires_row_level_try:
+
+        if requires_row_level_try and has_log_error:
+            # Replace the bare try/continue with proper logging
             wrapped_lines: List[str] = [
+                'try {',
+            ]
+            wrapped_lines.extend(f'    {line}' for line in body_lines)
+            wrapped_lines.extend([
+                '} catch (BusinessException e) {',
+                f'    logger.error("[{method_name}] Business error {{}}: {{}}", e.getErrorCode(), e.getMessage());',
+                '    throw e;',
+                '} catch (Exception e) {',
+                f'    logger.error("[{method_name}] Unexpected error: {{}}", e.getMessage(), e);',
+                '    throw new RuntimeException(e);',
+                '}',
+            ])
+            body_lines = wrapped_lines
+        elif requires_row_level_try:
+            wrapped_lines = [
                 'for (int rowIndex = 0; rowIndex < 1; rowIndex++) {',
                 '    try {',
             ]
             wrapped_lines.extend(f'        {line}' for line in body_lines)
-            wrapped_lines.extend(
-                [
-                    '    } catch (BusinessException e) {',
-                    '        continue;',
-                    '    } catch (Exception e) {',
-                    '        continue;',
-                    '    }',
-                    '}',
-                ]
-            )
+            wrapped_lines.extend([
+                '    } catch (BusinessException e) {',
+                '        continue;',
+                '    } catch (Exception e) {',
+                '        continue;',
+                '    }',
+                '}',
+            ])
             body_lines = wrapped_lines
 
         method_body = '\n'.join(f'        {line}' for line in body_lines)
@@ -1932,7 +1994,7 @@ then the @Service class. Ensure code is compilable and follows Spring Boot best 
         )
 
         constants_block = ('\n' + '\n'.join(constants_lines) + '\n') if constants_lines else ''
-        fields_block = '\n'.join(cross_service_fields) + ('\n' if cross_service_fields else '')
+        fields_block = logger_field + '\n'.join(cross_service_fields) + ('\n' if cross_service_fields else '')
         constructor_args_str = ', '.join(cross_service_constructor_args)
         inits_block = '\n'.join(cross_service_inits) + ('\n' if cross_service_inits else '')
 
@@ -2799,7 +2861,12 @@ then the @Service class. Ensure code is compilable and follows Spring Boot best 
 
         method_body = "\n".join(f"        {line}" for line in body_lines)
         constructor_args = ", ".join(constructor_lines)
-        field_block = "\n".join(field_lines)
+        # FIX: always prepend the SLF4J logger field so logger.* calls in method bodies compile
+        imports.add('import org.slf4j.Logger;')
+        imports.add('import org.slf4j.LoggerFactory;')
+        db_logger_field = f'    private static final Logger logger = LoggerFactory.getLogger({service_name}.class);'
+        field_lines_with_logger = [db_logger_field] + field_lines
+        field_block = "\n".join(field_lines_with_logger)
         init_block = "\n".join(init_lines)
         helper_methods: List[str] = []
         if error_binding:

@@ -291,19 +291,41 @@ class PLSQLtoJavaConverter:
         Translate PL/SQL calculation to Java.
         Examples:
           v_total = p_amount * 1.15
-          l_vat = nvl(p_amount, 0) * vat_rate
+          l_vat = nvl(p_amount, 0) * vat_rate / 100
+
+        FIX: amount * rate / 100 VAT-style formulas are emitted as BigDecimal
+        multiply/divide chains so monetary precision is preserved.
         """
         java_var = PLSQLtoJavaConverter._to_camel_case(variable)
         java_expr = expression
-        
+
         # Replace parameter prefixes (p_, l_) with camelCase
-        java_expr = re.sub(r'\b[pl]_(\w+)', lambda m: PLSQLtoJavaConverter._to_camel_case('_' + m.group(1)), java_expr, flags=re.IGNORECASE)
-        
+        java_expr = re.sub(
+            r'\b[pl]_(\w+)',
+            lambda m: PLSQLtoJavaConverter._to_camel_case('_' + m.group(1)),
+            java_expr, flags=re.IGNORECASE
+        )
+
         # Replace PL/SQL functions with Java equivalents
         java_expr = re.sub(r'\bNVL\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)', r'(\1 != null ? \1 : \2)', java_expr, flags=re.IGNORECASE)
         java_expr = re.sub(r'\bTRUNC\s*\(\s*(\w+)\s*\)', r'Math.floor(\1)', java_expr, flags=re.IGNORECASE)
         java_expr = re.sub(r'\bROUND\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)', r'Math.round(\1 * Math.pow(10, \2)) / Math.pow(10, \2)', java_expr, flags=re.IGNORECASE)
-        
+
+        # FIX: VAT-style formula  <amount> * <rate> / 100
+        # Rewrite to BigDecimal.multiply().divide() so no precision is lost.
+        # Matches any:  expr * expr / 100   (the /100 is the discriminating marker)
+        vat_pattern = re.compile(
+            r'(\w[\w.()]*)\s*\*\s*(\w[\w.()]*)\s*/\s*100\b',
+            re.IGNORECASE
+        )
+        def _vat_to_bigdecimal(m: re.Match) -> str:
+            a, b = m.group(1).strip(), m.group(2).strip()
+            return (
+                f'{a}.multiply({b})'
+                f'.divide(java.math.BigDecimal.valueOf(100), 2, java.math.RoundingMode.HALF_UP)'
+            )
+        java_expr = vat_pattern.sub(_vat_to_bigdecimal, java_expr)
+
         return f"BigDecimal {java_var} = {java_expr};"
     
     @staticmethod
@@ -423,7 +445,76 @@ class PLSQLtoJavaConverter:
         
         # SYSDATE -> LocalDateTime.now() (current timestamp)
         expr = re.sub(r'\bSYSDATE\b', 'LocalDateTime.now()', expr, flags=re.IGNORECASE)
-        
+
+        # =========== CASE WHEN → Java ternary chain ===========
+        # Handles: CASE x WHEN v1 THEN r1 WHEN v2 THEN r2 ELSE rN END
+        # and:     CASE WHEN cond1 THEN r1 WHEN cond2 THEN r2 ELSE rN END
+        def _translate_case_when(m: re.Match) -> str:
+            """Convert a PL/SQL CASE expression to nested Java ternaries."""
+            inner = m.group(1).strip()
+
+            # Detect "simple CASE x WHEN …" vs "searched CASE WHEN …"
+            simple_match = re.match(r'^(.+?)\s+WHEN\b', inner, re.IGNORECASE)
+            searched = re.match(r'^WHEN\b', inner, re.IGNORECASE)
+
+            # Split on WHEN / THEN / ELSE tokens respecting nesting
+            tokens = re.split(r'\b(WHEN|THEN|ELSE)\b', inner, flags=re.IGNORECASE)
+
+            branches = []  # list of (condition_expr, result_expr)
+            else_expr = 'null'
+            i = 0
+            # For simple CASE, the subject is the first token before the first WHEN
+            subject = ''
+            if not searched and simple_match:
+                subject_raw = simple_match.group(1).strip()
+                # Remove it from the front before we parse tokens
+                inner_rest = inner[len(subject_raw):].strip()
+                tokens = re.split(r'\b(WHEN|THEN|ELSE)\b', inner_rest, flags=re.IGNORECASE)
+                subject = PLSQLtoJavaConverter._translate_plsql_expression(subject_raw)
+
+            i = 0
+            while i < len(tokens):
+                tok = tokens[i].strip().upper()
+                if tok == 'WHEN' and i + 2 < len(tokens):
+                    cond_raw = tokens[i + 1].strip() if i + 1 < len(tokens) else ''
+                    then_kw = tokens[i + 2].strip().upper() if i + 2 < len(tokens) else ''
+                    result_raw = tokens[i + 3].strip() if i + 3 < len(tokens) else ''
+                    if then_kw == 'THEN':
+                        if subject:
+                            # simple case: subject == cond_raw
+                            cond_java = f'{subject} == {PLSQLtoJavaConverter._translate_plsql_expression(cond_raw)}'
+                        else:
+                            cond_java = PLSQLtoJavaConverter._translate_plsql_expression(cond_raw)
+                        result_java = PLSQLtoJavaConverter._translate_plsql_expression(result_raw)
+                        branches.append((cond_java, result_java))
+                        i += 4
+                        continue
+                elif tok == 'ELSE' and i + 1 < len(tokens):
+                    else_expr = PLSQLtoJavaConverter._translate_plsql_expression(tokens[i + 1].strip())
+                    i += 2
+                    continue
+                i += 1
+
+            if not branches:
+                return expr  # Could not parse – return unchanged
+
+            # Build nested ternary right-to-left
+            result = else_expr
+            for cond, val in reversed(branches):
+                result = f'({cond} ? {val} : {result})'
+            return result
+
+        # Apply CASE…END translation (non-greedy, innermost first via loop)
+        prev = None
+        while prev != expr:
+            prev = expr
+            expr = re.sub(
+                r'\bCASE\b\s+(.*?)\s*\bEND\b',
+                _translate_case_when,
+                expr,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+
         # =========== STEP 3: Constants and package references ===========
         
         # Translate standalone constants (c_xxx to Java constant)
@@ -1119,18 +1210,48 @@ class PLSQLtoJavaConverter:
                 table = update.get('table', '')
                 entity_name = PLSQLtoJavaConverter._table_to_entity(table)
                 assignments = update.get('assignments', {})
+                where_clause = update.get('where', '')
                 repo_name = PLSQLtoJavaConverter._table_to_repository_name(table)
-                
-                body_lines.append(f"    Optional<{entity_name}> existingOpt = {repo_name}.findOne(...);")
+
+                # Derive the lookup expression from the WHERE clause
+                # e.g. "customer_id = p_customer_id" -> findById(customerId)
+                find_call = None
+                if where_clause:
+                    java_where = PLSQLtoJavaConverter._translate_plsql_expression(where_clause)
+                    id_match = re.search(r'=\s*([pl]_\w+)\b', java_where, re.IGNORECASE)
+                    if id_match:
+                        id_param_camel = PLSQLtoJavaConverter._to_camel_case(id_match.group(1))
+                        find_call = f"{repo_name}.findById({id_param_camel})"
+                    else:
+                        # Try to find a plain id reference like "= customerId"
+                        plain_id = re.search(r'=\s*(\w+)\b', java_where)
+                        if plain_id:
+                            find_call = f"{repo_name}.findById({plain_id.group(1)})"
+
+                if find_call is None:
+                    # Fallback: derive parameter name from assignments values
+                    # e.g. assignments has value p_customer_id somewhere
+                    id_from_assignments = None
+                    for val in assignments.values():
+                        m = re.search(r'\b([pl]_\w*id\w*)\b', val, re.IGNORECASE)
+                        if m:
+                            id_from_assignments = PLSQLtoJavaConverter._to_camel_case(m.group(1))
+                            break
+                    if id_from_assignments:
+                        find_call = f"{repo_name}.findById({id_from_assignments})"
+                    else:
+                        find_call = f"{repo_name}.findById(id)"  # last-resort placeholder
+
+                body_lines.append(f"    Optional<{entity_name}> existingOpt = {find_call};")
                 body_lines.append(f"    if (existingOpt.isPresent()) {{")
                 body_lines.append(f"        var existing = existingOpt.get();")
-                
+
                 for col, val in assignments.items():
                     col_camel = PLSQLtoJavaConverter._to_camel_case(col)
                     setter = 'set' + col_camel[0].upper() + col_camel[1:] if col_camel else ''
                     val_java = PLSQLtoJavaConverter._translate_plsql_expression(val)
                     body_lines.append(f"        existing.{setter}({val_java});")
-                
+
                 body_lines.append(f"        {repo_name}.save(existing);")
                 body_lines.append(f"    }}")
             
@@ -1158,20 +1279,40 @@ class PLSQLtoJavaConverter:
         if logic.returns and return_type != 'void':
             # Determine what variable to return
             return_var = None
-            
+
             # If there's an INSERT with RETURNING, return that ID
             for insert in logic.inserts:
                 if insert.get('returning_into'):
                     return_var = PLSQLtoJavaConverter._to_camel_case(insert.get('returning_into', 'resultId'))
                     break
-            
+
             # If no INSERT RETURNING, use the first RETURN statement
             if not return_var and logic.returns:
                 first_return = logic.returns[0]
                 return_var = PLSQLtoJavaConverter._to_camel_case(first_return)
-            
-            # Generate the return statement
-            if return_var:
+
+            # FIX: When the return type is a scalar (String, Long, BigDecimal …) but the
+            # body fetched an entity via SELECT, we must project the right field out of
+            # the entity instead of returning the whole entity object.
+            #
+            # Heuristic: if `return_var` matches a SELECT into-variable (i.e. an entity
+            # opt), emit entity.getField() using the into-variable name as a getter suffix.
+            if return_var and return_type not in ('Object', 'void'):
+                # Check whether return_var is actually an entity variable (ends with 'Opt'
+                # or is a SELECT into var)
+                entity_vars = {PLSQLtoJavaConverter._to_camel_case(s.get('into_variables', ''))
+                               for s in logic.selects if s.get('into_variables')}
+                is_entity_var = (return_var + 'Opt') in declared_vars or return_var in entity_vars
+
+                if is_entity_var:
+                    # The SELECT used return_var as into-variable; the getter is
+                    # entity.get<ReturnVar>(), e.g. customer.getCustomerName()
+                    getter = 'get' + return_var[0].upper() + return_var[1:]
+                    body_lines.append(f"    if ({return_var} == null) return null;")
+                    body_lines.append(f"    return {return_var}.{getter}();")
+                else:
+                    body_lines.append(f"    return {return_var};")
+            elif return_var:
                 body_lines.append(f"    return {return_var};")
         
         # Build final method

@@ -326,11 +326,13 @@ class ImprovedPLSQLExtractor:
         Extract UPDATE statements.
         Pattern: UPDATE table SET column=value WHERE condition;
         """
-        pattern = r"UPDATE\s+(\w+)\s+SET\s+(.+?)\s+(?:WHERE|;)"
+        # FIX: capture optional WHERE clause so the code generator can use findById
+        pattern = r"UPDATE\s+(\w+)\s+SET\s+(.+?)\s+(?:WHERE\s+(.+?)\s*)?;"
         
-        for match in re.finditer(pattern, body, re.IGNORECASE):
+        for match in re.finditer(pattern, body, re.IGNORECASE | re.DOTALL):
             table = match.group(1).strip()
             assignments_str = match.group(2)
+            where_clause = match.group(3).strip() if match.group(3) else None
             
             # Split assignments respecting nested parens
             assignment_parts = ImprovedPLSQLExtractor._split_respecting_parens(assignments_str, ',')
@@ -343,7 +345,8 @@ class ImprovedPLSQLExtractor:
             
             logic.updates.append({
                 'table': table,
-                'assignments': assignments
+                'assignments': assignments,
+                'where': where_clause
             })
     
     @staticmethod

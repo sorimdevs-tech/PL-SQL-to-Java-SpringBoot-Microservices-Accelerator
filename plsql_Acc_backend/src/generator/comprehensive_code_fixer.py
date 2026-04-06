@@ -134,11 +134,54 @@ class ComprehensiveServiceFixer:
             code = re.sub(r':\w+', lambda m: m.group(0)[1:], code)
             count += 1
         
-        # Fix CASE/WHEN blocks - these are typically PL/SQL
-        if re.search(r'\bcase\s+\w+\s+when', code, re.IGNORECASE):
-            # Flag for manual review - can't reliably auto-convert
+        # Fix CASE/WHEN blocks — translate simple CASE x WHEN v THEN r … END to ternary chain
+        # This is a post-processing safety net for any CASE that slipped past the expression
+        # translator (e.g. multi-line CASE that was stored verbatim as a string literal comment).
+        if re.search(r'\bCASE\b.+?\bEND\b', code, re.IGNORECASE | re.DOTALL):
+            def _replace_case_when(m: re.Match) -> str:
+                inner = m.group(1).strip()
+                # Split into WHEN/THEN/ELSE tokens
+                tokens = re.split(r'\b(WHEN|THEN|ELSE)\b', inner, flags=re.IGNORECASE)
+                branches = []
+                else_expr = 'null'
+                # Detect simple-case subject (text before first WHEN)
+                subject = ''
+                sm = re.match(r'^(.+?)\s+WHEN\b', inner, re.IGNORECASE)
+                if sm and not re.match(r'^\s*WHEN\b', inner, re.IGNORECASE):
+                    subject = sm.group(1).strip()
+                    tokens = re.split(r'\b(WHEN|THEN|ELSE)\b', inner[len(subject):].strip(), flags=re.IGNORECASE)
+                i = 0
+                while i < len(tokens):
+                    tok = tokens[i].strip().upper()
+                    if tok == 'WHEN' and i + 3 < len(tokens) and tokens[i + 2].strip().upper() == 'THEN':
+                        cond = tokens[i + 1].strip()
+                        val  = tokens[i + 3].strip()
+                        cond_java = f'{subject} == {cond}' if subject else cond
+                        branches.append((cond_java, val))
+                        i += 4
+                    elif tok == 'ELSE' and i + 1 < len(tokens):
+                        else_expr = tokens[i + 1].strip()
+                        i += 2
+                    else:
+                        i += 1
+                if not branches:
+                    return m.group(0)
+                result = else_expr
+                for c, v in reversed(branches):
+                    result = f'({c} ? {v} : {result})'
+                return result
+
+            prev = None
+            while prev != code:
+                prev = code
+                code = re.sub(
+                    r'\bCASE\b\s+(.*?)\s*\bEND\b',
+                    _replace_case_when,
+                    code,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
             count += 1
-        
+
         # Fix named parameter syntax (PL/SQL: p_var => value becomes value)
         # Pattern: customerId = customerId, -> customerId, (remove assignment)
         original = code
@@ -156,10 +199,13 @@ class ComprehensiveServiceFixer:
             code = re.sub(r'\w+_pkg\.(\w+Constants\.\w+)', r'\1', code)
             count += 1
         
-        # Fix ellipsis placeholders
-        if 'findOne(...)' in code or re.search(r'\w+\(\.\.\.\)', code):
-            code = code.replace('findOne(...)', 'findOne(null)')
-            code = re.sub(r'(\w+)\(\.\.\.\)', r'\1(null)', code)
+        # Fix ellipsis placeholders — findOne(...) / repo(...) are invalid; replace with findById
+        # Also catch the downstream case where they became findOne(null) from an earlier pass.
+        if 'findOne(...)' in code or 'findOne(null)' in code or re.search(r'\w+\(\.\.\.\)', code):
+            # Replace findOne(...) / findOne(null) with findById(id) — 'id' is a reasonable
+            # placeholder; the calling context should supply the real variable name.
+            code = re.sub(r'\.findOne\s*\(\s*(?:\.\.\.|null)\s*\)', '.findById(id)', code)
+            code = re.sub(r'(\w+)\(\.\.\.\)', r'\1(id)', code)
             count += 1
         
         # Fix IS NOT NULL becoming proper Java null check
@@ -271,14 +317,26 @@ class ComprehensiveServiceFixer:
         if code != original:
             count += 1
         
-        # Fix 5: Fix field access using repository instead of variable
-        # Pattern: if (!(customer.getCustomerId() != null)) should use customerService/customerRepository
-        if 'customer.getCustomer' in code:
+        # Fix 5: Replace hallucinated customer.getCustomer*() checks with real repository calls.
+        # The generator sometimes emits:
+        #   if (true)  /* TODO: Add proper customer validation */
+        # or:
+        #   if (!(customer.getCustomerId() != null))
+        # Both must become an actual customerId null + existence check.
+        if 'customer.getCustomer' in code or 'if (true)' in code:
             original = code
-            # These are likely hallucinated - replace with null checks on injected fields
-            code = re.sub(r'if\s*\(\s*!\s*\(customer\.get\w+\(\)[^)]*\)', 
-                         r'if (true)  /* TODO: Add proper customer validation */',
-                         code)
+            # Step A: rewrite the source hallucination before it becomes if(true)
+            code = re.sub(
+                r'if\s*\(\s*!\s*\(customer\.get\w+\(\)[^)]*\)',
+                r'if (customerId == null || !customerRepository.existsById(customerId))',
+                code
+            )
+            # Step B: rewrite the already-collapsed if(true) placeholder
+            code = re.sub(
+                r'if\s*\(\s*true\s*\)\s*/\*\s*TODO[^*]*\*/',
+                r'if (customerId == null || !customerRepository.existsById(customerId))',
+                code
+            )
             if code != original:
                 count += 1
         
@@ -321,44 +379,45 @@ class ComprehensiveServiceFixer:
     ) -> Tuple[str, int]:
         """Fix 4: Replace placeholder repository methods with valid ones"""
         count = 0
-        
-        # Fix findOne(...) placeholders
+
+        # Fix findOne(...) placeholders — try to resolve the lookup key from metadata
         if 'findOne(...)' in code:
-            # Extract entity/repository info
             entity_name = metadata.get('entity_name', '')
             lookup_keys = metadata.get('lookup_keys', [])
-            
+
             if lookup_keys:
                 key = lookup_keys[0]
-                # Generate proper method name
-                method_name = f'findBy{key[0].upper()}{key[1:]}' if len(key) > 1 else f'findBy{key}'
-                var_name = '_'.join(key.split('_')[1:]) if key.startswith('p_') else key
-                
-                # Replace placeholder
-                code = code.replace(
-                    'findOne(...)',
-                    f'{method_name}({var_name})'
-                )
-                count += 1
-        
-        # Fix deleteByCondition
-        if 'deleteByCondition' in code:
-            # Replace with proper Spring Data method
-            code = code.replace('deleteByCondition(', 'delete(')
+                # camelCase the key name, strip p_/l_ prefix
+                raw_key = key.lstrip('p_').lstrip('l_') if key.startswith(('p_', 'l_')) else key
+                parts = raw_key.split('_')
+                var_name = parts[0] + ''.join(p.capitalize() for p in parts[1:])
+                code = code.replace('findOne(...)', f'findById({var_name})')
+            else:
+                # No metadata: use a safe findById(id) placeholder that at least compiles
+                code = code.replace('findOne(...)', 'findById(id)')
             count += 1
-        
+
+        # Fix any remaining findOne(null) that slipped through (invalid Spring Data call)
+        if 'findOne(null)' in code:
+            code = re.sub(r'\.findOne\s*\(\s*null\s*\)', '.findById(id)', code)
+            count += 1
+
+        # Fix deleteByCondition — not a real Spring Data method
+        if 'deleteByCondition' in code:
+            code = code.replace('deleteByCondition(', 'deleteById(')
+            count += 1
+
         # Fix other invalid repository methods
         invalid_methods = {
-            r'\.findOne\(\s*\)': '.findById()',
-            r'\.getOne\(\s*\)': '.getReferenceById()',
-            r'\.saveAndFlush\(\s*\)': '.saveAndFlush()',
+            r'\.findOne\(\s*\)': '.findById(id)',       # findOne() with no arg → findById(id)
+            r'\.getOne\(\s*\)': '.getReferenceById(id)',
         }
-        
+
         for pattern, replacement in invalid_methods.items():
             if re.search(pattern, code):
                 code = re.sub(pattern, replacement, code)
                 count += 1
-        
+
         return code, count
     
     def _fix_repository_variable_names(self, code: str, metadata: Dict[str, Any]) -> Tuple[str, int]:
