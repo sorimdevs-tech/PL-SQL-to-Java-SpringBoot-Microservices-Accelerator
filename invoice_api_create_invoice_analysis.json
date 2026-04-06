@@ -1,0 +1,537 @@
+{
+  "procedure_analysis": {
+    "name": "create_invoice",
+    "plsql_package": "invoice_api_pkg",
+    "source_file": "invoice_api_pkg.pkb",
+    "line_range_spec": "1-31 (in .pks)",
+    "line_range_impl": "1-72 (in .pkb)",
+    "type": "FUNCTION",
+    "language": "PL/SQL"
+  },
+  "signature": {
+    "plsql": "function create_invoice(p_customer_id in number, p_amount in number, p_description in varchar2 := null, p_vat_code in varchar2 := null) return number",
+    "java": "public Long createInvoice(Long customerId, BigDecimal amount, String description, String vatCode) throws ApplicationException",
+    "parameters": [
+      {
+        "name": "p_customer_id",
+        "plsql_type": "NUMBER",
+        "java_type": "Long",
+        "required": true,
+        "default": null,
+        "description": "Unique identifier of the customer"
+      },
+      {
+        "name": "p_amount",
+        "plsql_type": "NUMBER",
+        "java_type": "BigDecimal",
+        "required": true,
+        "default": null,
+        "description": "Invoice amount (must be > 0)"
+      },
+      {
+        "name": "p_description",
+        "plsql_type": "VARCHAR2",
+        "java_type": "String",
+        "required": false,
+        "default": null,
+        "description": "Invoice description"
+      },
+      {
+        "name": "p_vat_code",
+        "plsql_type": "VARCHAR2",
+        "java_type": "String",
+        "required": false,
+        "default": null,
+        "description": "VAT code for tax calculation"
+      }
+    ],
+    "return_type": {
+      "plsql": "NUMBER (xy_invoice.invoice_id%type)",
+      "java": "Long",
+      "description": "ID of newly created invoice"
+    }
+  },
+  "validations": [
+    {
+      "id": "VAL_001",
+      "section": "INPUT_VALIDATION",
+      "order": 1,
+      "type": "NULL_CHECK",
+      "plsql_code": "appl_error_pkg.assert (p_customer_id is not null, 'Customer ID must be specified!');",
+      "condition": "p_customer_id is not null",
+      "plsql_logic": "assert(condition, error_message) => if NOT condition then raise_application_error(-20000, error_message)",
+      "java_translation": "if (customerId == null || customerId <= 0) { throw new ApplicationException(\"Customer ID must be specified!\"); }",
+      "error_message": "Customer ID must be specified!",
+      "error_code": "-20000",
+      "severity": "ERROR",
+      "database_query": false,
+      "verification": "Ensure customerId is not null and not <= 0"
+    },
+    {
+      "id": "VAL_002",
+      "section": "INPUT_VALIDATION",
+      "order": 2,
+      "type": "NULL_CHECK",
+      "plsql_code": "appl_error_pkg.assert (p_amount is not null, 'Amount must be specified!');",
+      "condition": "p_amount is not null",
+      "plsql_logic": "Null check - amount parameter cannot be null",
+      "java_translation": "if (amount == null) { throw new ApplicationException(\"Amount must be specified!\"); }",
+      "error_message": "Amount must be specified!",
+      "error_code": "-20000",
+      "severity": "ERROR",
+      "database_query": false,
+      "verification": "Ensure amount is not null"
+    },
+    {
+      "id": "VAL_003",
+      "section": "INPUT_VALIDATION",
+      "order": 3,
+      "type": "NUMERIC_COMPARISON",
+      "plsql_code": "appl_error_pkg.assert (p_amount > 0, 'Amount must be greater than zero!');",
+      "condition": "p_amount > 0",
+      "operator": ">",
+      "comparison_value": 0,
+      "plsql_logic": "Strict positive check - amount must be greater than (not equal to) zero",
+      "java_translation": "if (amount.compareTo(BigDecimal.ZERO) <= 0) { throw new ApplicationException(\"Amount must be greater than zero!\"); }",
+      "error_message": "Amount must be greater than zero!",
+      "error_code": "-20000",
+      "severity": "ERROR",
+      "database_query": false,
+      "verification": "Ensure amount > 0, NOT >= 0"
+    },
+    {
+      "id": "VAL_004",
+      "section": "INPUT_VALIDATION",
+      "order": 4,
+      "type": "ENTITY_EXISTENCE",
+      "plsql_code": "l_customer := customer_pkg.get_customer (p_customer_id);\nappl_error_pkg.assert (l_customer.customer_id is not null, 'Customer not found!');",
+      "condition": "l_customer.customer_id is not null",
+      "database_query": true,
+      "sql_operation": "SELECT * FROM xy_customer WHERE customer_id = p_customer_id",
+      "sql_operation_type": "SELECT",
+      "sql_table": "xy_customer",
+      "sql_where_clause": "customer_id = p_customer_id",
+      "exception_handling": "exception when no_data_found then l_returnvalue := null; (in called procedure)",
+      "plsql_logic": "Fetch customer record and check if exists",
+      "java_translation": "Customer customer = customerRepository.findById(customerId).orElse(null);\nif (customer == null) { throw new ApplicationException(\"Customer not found!\"); }",
+      "error_message": "Customer not found!",
+      "error_code": "-20000",
+      "severity": "ERROR",
+      "verification": "Ensure customer exists in database before proceeding"
+    },
+    {
+      "id": "VAL_005",
+      "section": "INPUT_VALIDATION",
+      "order": 5,
+      "type": "ENTITY_ATTRIBUTE_CHECK",
+      "plsql_code": "appl_error_pkg.assert (l_customer.customer_status = customer_pkg.c_status_active, 'Customer not active!');",
+      "condition": "l_customer.customer_status = customer_pkg.c_status_active",
+      "operator": "=",
+      "comparison_type": "STRING_EQUALITY",
+      "constant_name": "customer_pkg.c_status_active",
+      "constant_value": "'ACTIVE'",
+      "plsql_logic": "String equality comparison - must match constant exactly",
+      "java_translation": "if (!customer.getCustomerStatus().equals(\"ACTIVE\")) { throw new ApplicationException(\"Customer not active!\"); }",
+      "error_message": "Customer not active!",
+      "error_code": "-20000",
+      "severity": "ERROR",
+      "database_query": false,
+      "case_sensitive": true,
+      "verification": "Ensure customer status exactly equals 'ACTIVE' (case-sensitive)"
+    },
+    {
+      "id": "VAL_006",
+      "section": "OUTPUT_VALIDATION",
+      "order": 6,
+      "type": "OPERATION_SUCCESS",
+      "plsql_code": "appl_error_pkg.assert (l_returnvalue is not null, 'Failed to create invoice!');",
+      "condition": "l_returnvalue is not null",
+      "plsql_logic": "Verify that INSERT operation returned a valid invoice_id",
+      "java_translation": "if (invoiceId == null || invoiceId <= 0) { throw new ApplicationException(\"Failed to create invoice!\"); }",
+      "error_message": "Failed to create invoice!",
+      "error_code": "-20000",
+      "severity": "ERROR",
+      "database_query": false,
+      "verification": "Ensure database insert was successful and returned valid ID"
+    }
+  ],
+  "calculations": [
+    {
+      "id": "CALC_001",
+      "section": "BUSINESS_LOGIC",
+      "order": 1,
+      "variable": "l_description",
+      "type": "COALESCING",
+      "plsql_code": "l_description := coalesce (p_description, invoice_pkg.get_default_invoice_description (invoice_pkg.c_type_standard), 'Untitled');",
+      "plsql_logic": "Three-level null coalescing with function call",
+      "steps": [
+        {
+          "level": 1,
+          "value": "p_description",
+          "description": "User-provided description"
+        },
+        {
+          "level": 2,
+          "value": "invoice_pkg.get_default_invoice_description('STANDARD')",
+          "description": "System default description if user didn't provide one",
+          "function_call": true,
+          "parameter": "invoice_pkg.c_type_standard = 'STANDARD'"
+        },
+        {
+          "level": 3,
+          "value": "'Untitled'",
+          "description": "Hardcoded fallback"
+        }
+      ],
+      "java_translation": "String description = p_description != null ? p_description : (getDefaultInvoiceDescription(\"STANDARD\") != null ? getDefaultInvoiceDescription(\"STANDARD\") : \"Untitled\");",
+      "java_translation_alternative": "String description = StringUtils.defaultString(p_description, StringUtils.defaultString(getDefaultInvoiceDescription(\"STANDARD\"), \"Untitled\"));",
+      "result_type": "VARCHAR2 / String",
+      "verification": "Ensure three-level fallback logic is preserved"
+    },
+    {
+      "id": "CALC_002",
+      "section": "BUSINESS_LOGIC",
+      "order": 2,
+      "variable": "l_vat_amount",
+      "type": "CONDITIONAL_CALCULATION",
+      "plsql_code": "if p_vat_code is not null then\n    l_vat_amount := nvl (invoice_pkg.get_vat_amount (p_amount, p_vat_code), 0);\nelse\n    l_vat_amount := 0;\nend if;",
+      "plsql_logic": "Conditional if-then-else with function call and null coalescing",
+      "condition": "p_vat_code is not null",
+      "true_branch": {
+        "operation": "invoke function",
+        "function": "invoice_pkg.get_vat_amount",
+        "parameters": ["p_amount", "p_vat_code"],
+        "null_handling": "nvl(result, 0)",
+        "description": "Calculate VAT, default to 0 if null"
+      },
+      "false_branch": {
+        "operation": "assign constant",
+        "value": 0,
+        "description": "No VAT code means zero VAT"
+      },
+      "java_translation": "BigDecimal vatAmount;\nif (vatCode != null) {\n    BigDecimal calculatedVat = getVatAmount(amount, vatCode);\n    vatAmount = calculatedVat != null ? calculatedVat : BigDecimal.ZERO;\n} else {\n    vatAmount = BigDecimal.ZERO;\n}",
+      "result_type": "NUMBER / BigDecimal",
+      "verification": "Ensure conditional logic is exactly replicated with proper null handling"
+    }
+  ],
+  "sql_operations": [
+    {
+      "id": "SQL_001",
+      "section": "CUSTOMER_LOOKUP",
+      "operation_type": "SELECT",
+      "plsql_code": "l_customer := customer_pkg.get_customer (p_customer_id);",
+      "underlying_sql": "SELECT * FROM xy_customer WHERE customer_id = p_customer_id",
+      "sql_details": {
+        "statement": "SELECT",
+        "table": "xy_customer",
+        "columns": "*",
+        "where_clause": "customer_id = :customerId",
+        "parameter_binding": "positional",
+        "exception_handling": "WHEN no_data_found THEN return null"
+      },
+      "called_procedure": "customer_pkg.get_customer",
+      "java_translation": "Customer customer = customerRepository.findById(customerId).orElse(null);",
+      "row_type_mapping": "xy_customer%rowtype -> Customer (entity class)",
+      "verification": "SELECT should return single row or null"
+    },
+    {
+      "id": "SQL_002",
+      "section": "VAT_LOOKUP",
+      "operation_type": "SELECT",
+      "plsql_code": "l_vat_amount := nvl (invoice_pkg.get_vat_amount (p_amount, p_vat_code), 0);",
+      "underlying_sql": "SELECT nvl(vat_rate, 0) FROM xy_vat WHERE vat_code = :vatCode",
+      "sql_details": {
+        "statement": "SELECT",
+        "table": "xy_vat",
+        "columns": ["vat_rate"],
+        "where_clause": "vat_code = :vatCode",
+        "exception_handling": "WHEN no_data_found THEN vat_rate := 0",
+        "calculation": "(amount * vat_rate) / 100"
+      },
+      "called_procedure": "invoice_pkg.get_vat_amount",
+      "parameters": [
+        {"name": "p_amount", "type": "NUMBER", "description": "Base amount for VAT calculation"},
+        {"name": "p_vat_code", "type": "VARCHAR2", "description": "VAT code lookup"}
+      ],
+      "return_calculation": "(nvl(p_amount, 0) * l_vat_rate) / 100",
+      "java_translation": "BigDecimal vat = vatService.calculateVat(amount, vatCode);",
+      "verification": "VAT calculation must use correct formula and handle null rates"
+    },
+    {
+      "id": "SQL_003",
+      "section": "INVOICE_CREATION",
+      "operation_type": "INSERT",
+      "plsql_code": "l_returnvalue := invoice_pkg.new_invoice (\n    p_customer_id => p_customer_id,\n    p_amount => p_amount,\n    p_vat_amount => l_vat_amount,\n    p_invoice_description => p_description\n);",
+      "underlying_sql": "INSERT INTO xy_invoice (invoice_amount, vat_amount, invoice_description, invoice_status)\nVALUES (:amount, :vatAmount, COALESCE(:description, 'Standard Invoice'), 'DRAFT')\nRETURNING invoice_id INTO :invoiceId",
+      "sql_details": {
+        "statement": "INSERT",
+        "table": "xy_invoice",
+        "returning_clause": "RETURNING invoice_id",
+        "columns": [
+          {
+            "name": "invoice_amount",
+            "value": "p_amount",
+            "source": "parameter"
+          },
+          {
+            "name": "vat_amount",
+            "value": "l_vat_amount",
+            "source": "calculated"
+          },
+          {
+            "name": "invoice_description",
+            "value": "nvl(p_invoice_description, 'Standard Invoice')",
+            "source": "parameter_or_default"
+          },
+          {
+            "name": "invoice_status",
+            "value": "'DRAFT'",
+            "source": "constant",
+            "note": "Always 'DRAFT' for new invoices"
+          }
+        ],
+        "auto_generated": [
+          {
+            "column": "invoice_id",
+            "type": "NUMBER",
+            "retrieved_via": "RETURNING clause"
+          }
+        ]
+      },
+      "called_procedure": "invoice_pkg.new_invoice",
+      "parameters": [
+        {"name": "p_customer_id", "mapping": "NOT USED in insert - handled separately"},
+        {"name": "p_amount", "mapping": "invoice_amount"},
+        {"name": "l_vat_amount", "mapping": "vat_amount"},
+        {"name": "p_description", "mapping": "invoice_description (with default)"}
+      ],
+      "java_translation": "Invoice invoice = new Invoice();\ninvoice.setInvoiceAmount(amount);\ninvoice.setVatAmount(vatAmount);\ninvoice.setInvoiceDescription(description);\ninvoice.setInvoiceStatus(\"DRAFT\");\nInvoice saved = invoiceRepository.save(invoice);\nlong invoiceId = saved.getInvoiceId();",
+      "note_missing_field": "p_customer_id is NOT used in the INSERT (potential bug or design issue)",
+      "verification": "INSERT must include all 4 columns, status must be 'DRAFT', description must have fallback"
+    }
+  ],
+  "business_logic_flow": {
+    "phase_1": {
+      "name": "INPUT_VALIDATION",
+      "description": "Validate all input parameters",
+      "steps": [
+        "Check p_customer_id is not null",
+        "Check p_amount is not null",
+        "Check p_amount > 0"
+      ]
+    },
+    "phase_2": {
+      "name": "ENTITY_VALIDATION",
+      "description": "Fetch and validate related entities from database",
+      "steps": [
+        "SELECT customer from database",
+        "Check customer exists (not null)",
+        "Check customer status = 'ACTIVE'"
+      ]
+    },
+    "phase_3": {
+      "name": "CALCULATIONS",
+      "description": "Calculate derived values",
+      "steps": [
+        "Coalesce description (3-level)",
+        "Conditionally calculate VAT"
+      ]
+    },
+    "phase_4": {
+      "name": "INSERT",
+      "description": "Persist new invoice to database",
+      "steps": [
+        "INSERT into xy_invoice with calculated values",
+        "Return generated invoice_id"
+      ]
+    },
+    "phase_5": {
+      "name": "OUTPUT_VALIDATION",
+      "description": "Verify operation success",
+      "steps": [
+        "Check returned invoice_id is not null"
+      ]
+    }
+  },
+  "execution_flow": {
+    "entry_point": "create_invoice(p_customer_id, p_amount, p_description, p_vat_code)",
+    "exit_point": "RETURN invoice_id",
+    "transaction_scope": "Single transaction",
+    "sequence": [
+      {
+        "step": 1,
+        "type": "VALIDATION",
+        "description": "validate p_customer_id IS NOT NULL"
+      },
+      {
+        "step": 2,
+        "type": "VALIDATION",
+        "description": "validate p_amount IS NOT NULL"
+      },
+      {
+        "step": 3,
+        "type": "VALIDATION",
+        "description": "validate p_amount > 0"
+      },
+      {
+        "step": 4,
+        "type": "DATABASE_READ",
+        "description": "SELECT customer FROM xy_customer WHERE customer_id = p_customer_id"
+      },
+      {
+        "step": 5,
+        "type": "VALIDATION",
+        "description": "validate customer_id IS NOT NULL (existence)"
+      },
+      {
+        "step": 6,
+        "type": "VALIDATION",
+        "description": "validate customer_status = 'ACTIVE'"
+      },
+      {
+        "step": 7,
+        "type": "CALCULATION",
+        "description": "COALESCE(p_description, get_default(), 'Untitled')"
+      },
+      {
+        "step": 8,
+        "type": "CALCULATION",
+        "description": "IF p_vat_code IS NOT NULL THEN calculate_vat() ELSE 0"
+      },
+      {
+        "step": 9,
+        "type": "DATABASE_WRITE",
+        "description": "INSERT into xy_invoice RETURNING invoice_id"
+      },
+      {
+        "step": 10,
+        "type": "VALIDATION",
+        "description": "validate invoice_id IS NOT NULL"
+      },
+      {
+        "step": 11,
+        "type": "FUNCTION_RETURN",
+        "description": "RETURN invoice_id"
+      }
+    ]
+  },
+  "error_conditions": [
+    {
+      "error_id": "ERR_001",
+      "message": "Customer ID must be specified!",
+      "condition": "p_customer_id IS NULL",
+      "http_status": 400,
+      "java_exception": "ApplicationException / BadRequestException"
+    },
+    {
+      "error_id": "ERR_002",
+      "message": "Amount must be specified!",
+      "condition": "p_amount IS NULL",
+      "http_status": 400,
+      "java_exception": "ApplicationException / BadRequestException"
+    },
+    {
+      "error_id": "ERR_003",
+      "message": "Amount must be greater than zero!",
+      "condition": "p_amount <= 0",
+      "http_status": 400,
+      "java_exception": "ApplicationException / BadRequestException"
+    },
+    {
+      "error_id": "ERR_004",
+      "message": "Customer not found!",
+      "condition": "No row in xy_customer for given customer_id",
+      "http_status": 404,
+      "java_exception": "ApplicationException / EntityNotFoundException"
+    },
+    {
+      "error_id": "ERR_005",
+      "message": "Customer not active!",
+      "condition": "customer_status != 'ACTIVE'",
+      "http_status": 409,
+      "java_exception": "ApplicationException / InvalidStateException"
+    },
+    {
+      "error_id": "ERR_006",
+      "message": "Failed to create invoice!",
+      "condition": "INSERT returned NULL invoice_id",
+      "http_status": 500,
+      "java_exception": "ApplicationException / DataAccessException"
+    }
+  ],
+  "testing_checklist": {
+    "unit_tests": [
+      {
+        "test_id": "UT_001",
+        "description": "Null customer_id should raise error",
+        "input": {"customerId": null, "amount": 100, "description": null, "vatCode": null},
+        "expected": "ApplicationException: Customer ID must be specified!"
+      },
+      {
+        "test_id": "UT_002",
+        "description": "Invalid customer_id (<=0) should raise error",
+        "input": {"customerId": 0, "amount": 100, "description": null, "vatCode": null},
+        "expected": "ApplicationException: Customer ID must be specified!"
+      },
+      {
+        "test_id": "UT_003",
+        "description": "Null amount should raise error",
+        "input": {"customerId": 1, "amount": null, "description": null, "vatCode": null},
+        "expected": "ApplicationException: Amount must be specified!"
+      },
+      {
+        "test_id": "UT_004",
+        "description": "Zero amount should raise error",
+        "input": {"customerId": 1, "amount": 0, "description": null, "vatCode": null},
+        "expected": "ApplicationException: Amount must be greater than zero!"
+      },
+      {
+        "test_id": "UT_005",
+        "description": "Negative amount should raise error",
+        "input": {"customerId": 1, "amount": -100, "description": null, "vatCode": null},
+        "expected": "ApplicationException: Amount must be greater than zero!"
+      },
+      {
+        "test_id": "UT_006",
+        "description": "Non-existent customer should raise error",
+        "input": {"customerId": 999999, "amount": 100, "description": null, "vatCode": null},
+        "expected": "ApplicationException: Customer not found!"
+      },
+      {
+        "test_id": "UT_007",
+        "description": "Inactive customer should raise error",
+        "input": {"customerId": 2, "amount": 100, "description": null, "vatCode": null},
+        "expected": "ApplicationException: Customer not active!",
+        "setup": "Create customer with status = 'INACTIVE'"
+      },
+      {
+        "test_id": "UT_008",
+        "description": "Valid input with no description should use default",
+        "input": {"customerId": 1, "amount": 100, "description": null, "vatCode": null},
+        "expected": "invoiceId > 0",
+        "verify": "invoice.description should be default or 'Untitled'"
+      },
+      {
+        "test_id": "UT_009",
+        "description": "Valid input with description should use provided value",
+        "input": {"customerId": 1, "amount": 100, "description": "My Invoice", "vatCode": null},
+        "expected": "invoiceId > 0",
+        "verify": "invoice.description == 'My Invoice'"
+      },
+      {
+        "test_id": "UT_010",
+        "description": "Valid input with VAT code should calculate VAT",
+        "input": {"customerId": 1, "amount": 100, "description": null, "vatCode": "HIGH_VAT"},
+        "expected": "invoiceId > 0",
+        "verify": "invoice.vatAmount should be calculated (typically 100 * 0.21 = 21)"
+      },
+      {
+        "test_id": "UT_011",
+        "description": "Successful invoice creation should return valid ID",
+        "input": {"customerId": 1, "amount": 100, "description": "Test Invoice", "vatCode": "LOW_VAT"},
+        "expected": "invoiceId > 0",
+        "verify": "invoice.status should be 'DRAFT', all values persisted correctly"
+      }
+    ]
+  }
+}

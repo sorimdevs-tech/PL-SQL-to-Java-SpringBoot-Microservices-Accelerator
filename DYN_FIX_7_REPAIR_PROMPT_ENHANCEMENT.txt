@@ -1,0 +1,99 @@
+=============================================================================
+DYN-FIX-7: SERVICE REPAIR PROMPT ENHANCEMENT
+=============================================================================
+
+PROBLEM IDENTIFIED:
+- Services calling methods on wrong entities (e.g., BookEntity.getVideoid())
+- Job 86ae5c79560844f5a1e38a6352a83a0c failed with 3 identical validation errors
+- Root cause: Repair prompt lacked entity-field mapping context for LLM
+
+VALIDATION ERRORS FROM LOGS:
+1. ViewitemLibraryService calls row.getVideoid() but BookEntity does not define it
+2. HandlereturnsLibraryService calls row.getCardid() but BookEntity does not define it
+3. HandlereturnsLibraryService calls row.getItemid() but BookEntity does not define it
+4. HandlereturnsLibraryService calls row.getVideoid() but BookEntity does not define it
+5. RemoveitemLibraryService calls row.getVideoid() but BookEntity does not define it
+
+ROOT CAUSE ANALYSIS:
+Location: src/converter/llm_engine.py lines 3481-3495
+Issue: _build_service_repair_prompt() showed only first 3 entities with 100-char truncation
+       - list(entities.items())[:3]  # Only 3 of possibly many entities
+       - code[:100]                   # Truncated entity definitions
+Impact: LLM lacked complete entity schema to distinguish field ownership
+Result: LLM generated code calling methods on wrong entity types
+
+SOLUTION: DYN-FIX-7 - Dynamic Entity Field Mapping Extraction
+=============================================================================
+
+FILES MODIFIED:
+1. src/converter/llm_engine.py
+
+NEW METHOD: _extract_entity_field_mapping()
+- Extracts all field names and types from provided entity code
+- Regex pattern: r'private\s+([a-zA-Z<>?,\s]+?)\s+(\w+)\s*;'
+- Returns Dict[str, Dict[str, str]]: {EntityName: {fieldName: fieldType}}
+- Scans ALL entities, not just first 3
+
+ENHANCED METHOD: _build_service_repair_prompt()
+- Calls _extract_entity_field_mapping() to get complete field mappings
+- Formats output showing all entities and their fields
+- Example output:
+  ENTITY FIELD MAPPINGS (DYN-FIX-7):
+    BookEntity has fields:
+      - bookId: Long
+      - title: String
+      - author: String
+      - isbn: String
+    VideoEntity has fields:
+      - videoId: Long
+      - title: String
+      - duration: Integer
+      - releaseDate: LocalDate
+
+PROMPT IMPROVEMENTS:
+1. Added explicit "ENTITY FIELD MAPPINGS" section with all fields listed
+2. Enhanced REPAIR RULES section with 10 specific constraints:
+   - Rule 3: "For getter/setter calls, check the ENTITY FIELD MAPPINGS section"
+   - Rule 4: "Only use methods/fields that actually exist in each entity"
+   - Rule 5: "If a field doesn't exist, it's a semantic error - fix the reference"
+   - Rule 6: "Each field belongs to exactly ONE entity type. Don't call across types"
+3. Changed entity context display from 100 chars to full code (3 entities)
+4. Made field ownership explicit and clear to LLM
+
+HOW THIS FIXES THE ERRORS:
+- ViewitemLibraryService will see that VideoId belongs to VideoEntity, not BookEntity
+- HandlereturnsLibraryService will see CardId belongs to CardEntity, ItemId belongs to ItemEntity
+- LLM now has explicit mapping to reference when generating row.getX() calls
+- Repair prompt clearly indicates which methods exist on which entities
+
+IMPLEMENTATION APPROACH:
+- Fully DYNAMIC (no hardcoded entity lists)
+- Uses actual provided entity code definitions
+- Scans all provided entities (not limited to first 3)
+- Automatically extracts field types from entity declarations
+- No special configuration required
+- No .md files created (constraint satisfied)
+
+TESTING STRATEGY:
+When conversion project (https://github.com/victorst79/PL-SQL-project) is re-run:
+1. Services will attempt repair with enhanced prompt
+2. Repair prompt now shows complete entity-field mapping
+3. LLM can correctly determine which entity owns which field
+4. Expected outcome: All 3 validation attempts pass
+5. Services call methods on correct entity types
+6. No "does not define it" errors
+
+INTEGRATION POINT:
+- _build_service_repair_prompt() is called from service repair flow
+- Used when semantic validation detects field access errors
+- Triggered during conversion job processing via repair_services() method
+- No changes needed in calling code (backward compatible)
+
+CONSTRAINT SATISFACTION:
+✓ Dynamic fix (not hardcoded entity names)
+✓ Extracted from provided code (uses actual entities)
+✓ Automatically scalable (works with any number of entities)
+✓ No .md documentation files created
+✓ Modular (new method can be unit tested separately)
+
+=============================================================================

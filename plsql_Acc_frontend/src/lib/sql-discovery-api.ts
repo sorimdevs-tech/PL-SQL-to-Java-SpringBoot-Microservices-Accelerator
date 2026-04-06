@@ -1,0 +1,92 @@
+import type {
+  DependencySuggestionRequest,
+  DependencySuggestionResponse,
+  GitRepoTreeResponse,
+  SqlDiscoveryAnalyzeResponse,
+  SqlDiscoveryUploadResponse,
+} from "@/types/sql-discovery-api"
+
+const API_BASE_URL = "http://127.0.0.1:8001"
+
+function toApiUrl(path: string): string {
+  return `${API_BASE_URL}${path}`
+}
+
+async function parseJsonResponse<T>(response: Response): Promise<T> {
+  if (response.ok) {
+    return (await response.json()) as T
+  }
+
+  const message = await response.text()
+  throw new Error(message || `Request failed with status ${response.status}`)
+}
+
+export async function uploadSqlDiscoveryFile(file: File): Promise<SqlDiscoveryUploadResponse> {
+  const formData = new FormData()
+  formData.append("source_file", file)
+
+  const response = await fetch(toApiUrl("/api/discovery/upload"), {
+    method: "POST",
+    body: formData,
+  })
+
+  return parseJsonResponse<SqlDiscoveryUploadResponse>(response)
+}
+
+export async function analyzeUploadedSqlFile(fileId: string): Promise<SqlDiscoveryAnalyzeResponse> {
+  const response = await fetch(toApiUrl("/api/discovery/analyze"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_id: fileId }),
+  })
+
+  return parseJsonResponse<SqlDiscoveryAnalyzeResponse>(response)
+}
+
+export async function analyzeGitSqlSource(
+  repoUrl: string,
+  branch?: string,
+  pathFilters: string[] = [],
+): Promise<SqlDiscoveryAnalyzeResponse> {
+  const response = await fetch(toApiUrl("/api/discovery/analyze"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      repo_url: repoUrl,
+      branch,
+      path_filters: pathFilters,
+    }),
+  })
+
+  return parseJsonResponse<SqlDiscoveryAnalyzeResponse>(response)
+}
+
+export async function getGitRepoTree(
+  repoUrl: string,
+  branch?: string,
+  path?: string,
+): Promise<GitRepoTreeResponse> {
+  const response = await fetch(toApiUrl("/api/discovery/git/tree"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      repo_url: repoUrl,
+      branch,
+      path,
+    }),
+  })
+
+  return parseJsonResponse<GitRepoTreeResponse>(response)
+}
+
+export async function getDependencySuggestions(
+  payload: DependencySuggestionRequest,
+): Promise<DependencySuggestionResponse> {
+  const response = await fetch(toApiUrl("/api/discovery/dependency-suggestions"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+
+  return parseJsonResponse<DependencySuggestionResponse>(response)
+}

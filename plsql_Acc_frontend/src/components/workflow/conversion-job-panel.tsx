@@ -1,0 +1,828 @@
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import { Download, FileText, LoaderCircle, Play } from "lucide-react"
+
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { parseGitHubRepoInput } from "@/lib/github-url"
+import {
+  createFileJob,
+  createGitJob,
+  getBackendHealth,
+  getJobLogs,
+  getJobDownloadUrl,
+  getJobFileContent,
+  getJobFiles,
+  getJobStatus,
+} from "@/lib/jobs-api"
+import { startOracleConvert } from "@/lib/oracle-api"
+import type { ConfigOverrides, ConversionJob, GeneratedFile, GitHubOutputConfig } from "@/types/jobs-api"
+
+type SourceMethod = "git" | "oracle" | "sqlfile"
+type OutputDestination = "local" | "github"
+type OutputBranchMode = "existing" | "new"
+
+export interface ConversionSnapshot {
+  jobId: string
+  status: string
+  outputDirectory: string
+  outputDisplayName: string
+  generatedFiles: string[]
+  backendSummary?: string
+  backendSummaryData?: Record<string, unknown>
+  conversionDurationMs?: number
+}
+
+interface ConversionJobPanelProps {
+  sourceMethod: SourceMethod
+  projectName: string
+  gitRepoUrl: string
+  sourceFile: File | null
+  dbHost: string
+  dbPort: string
+  dbServiceName: string
+  dbUsername: string
+  dbPassword: string
+  dbConfigPath: string
+  springBootVersion: string
+  javaVersion: string
+  buildTool: "mvn" | "gradle"
+  packaging: "jar" | "war"
+  springConfigFormat: "properties" | "yaml"
+  projectGroup: string
+  projectArtifact: string
+  projectDisplayName: string
+  projectDescription: string
+  projectPackageName: string
+  outputDestination: OutputDestination
+  outputDirectory: string
+  githubOutputRepoUrl: string
+  githubBranchMode: OutputBranchMode
+  githubOutputBranch: string
+  githubBaseBranch: string
+  githubNewBranchName: string
+  githubOutputPath: string
+  githubOutputToken: string
+  githubOutputUsername: string
+  githubCommitMessage: string
+  targetDatabase?: "mysql" | "oracle" | "postgresql" | "sqlserver" | "mongodb" | null
+  optionalDependencies: string[]
+  onConversionStart: () => void
+  onSnapshotChange: (snapshot: ConversionSnapshot | null) => void
+  onBackendLogsChange?: (lines: string[], status?: string | null) => void
+}
+
+function statusVariant(status: string) {
+  switch (status) {
+    case "completed":
+      return "success"
+    case "failed":
+      return "danger"
+    case "running":
+      return "info"
+    default:
+      return "warning"
+  }
+}
+
+export function ConversionJobPanel(props: ConversionJobPanelProps) {
+  const { onSnapshotChange } = props
+  const [job, setJob] = useState<ConversionJob | null>(null)
+  const [generatedFiles, setGeneratedFiles] = useState<GeneratedFile[]>([])
+  const [selectedFilePath, setSelectedFilePath] = useState("")
+  const [selectedFileContent, setSelectedFileContent] = useState("")
+  const [isStarting, setIsStarting] = useState(false)
+  const [isLoadingFiles, setIsLoadingFiles] = useState(false)
+  const [isLoadingFileContent, setIsLoadingFileContent] = useState(false)
+  const [isLoadingBackendLogs, setIsLoadingBackendLogs] = useState(false)
+  const [isCheckingHealth, setIsCheckingHealth] = useState(false)
+  const [isBackendHealthy, setIsBackendHealthy] = useState<boolean | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [logs, setLogs] = useState<{ id: string; message: string; time: string }[]>([])
+  const [backendLogs, setBackendLogs] = useState<string[]>([])
+  const [backendLogsStatus, setBackendLogsStatus] = useState<string | null>(null)
+  const [progressStage, setProgressStage] = useState<"idle" | "queued" | "running" | "completed" | "failed">("idle")
+  const lastStatusRef = useRef<string | null>(null)
+  const [conversionStarted, setConversionStarted] = useState(false)
+  const [conversionStartAt, setConversionStartAt] = useState<number | null>(null)
+  const [conversionDurationMs, setConversionDurationMs] = useState<number | null>(null)
+  const [conversionElapsedMs, setConversionElapsedMs] = useState(0)
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set())
+
+  const isPolling = job?.status === "queued" || job?.status === "running"
+
+  interface TreeNode {
+    name: string
+    path: string
+    type: "file" | "folder"
+    children?: TreeNode[]
+    size?: number
+  }
+
+  function buildFileTree(files: GeneratedFile[]): TreeNode[] {
+    const pathMap: { [key: string]: TreeNode } = {}
+
+    // First pass: create all nodes with proper paths
+    files.forEach((file) => {
+      const parts = file.path.split("/").filter((p) => p.length > 0)
+
+      parts.forEach((part, index) => {
+        const currentPath = parts.slice(0, index + 1).join("/")
+
+        if (!pathMap[currentPath]) {
+          const isFile = index === parts.length - 1
+          pathMap[currentPath] = {
+            name: part,
+            path: currentPath,
+            type: isFile ? "file" : "folder",
+            size: isFile ? file.size : undefined,
+            children: isFile ? undefined : [],
+          }
+        }
+      })
+    })
+
+    // Second pass: link children to their parents
+    Object.values(pathMap).forEach((node) => {
+      if (node.type === "folder" && node.children) {
+        const childNodes = Object.values(pathMap).filter((other) => {
+          if (other.path.startsWith(node.path + "/")) {
+            const remainder = other.path.substring(node.path.length + 1)
+            return !remainder.includes("/") // Direct children only
+          }
+          return false
+        })
+        node.children = childNodes.sort((a, b) => {
+          if (a.type !== b.type) return a.type === "folder" ? -1 : 1
+          return a.name.localeCompare(b.name)
+        })
+      }
+    })
+
+    // Return only top-level nodes
+    const topLevel = Object.values(pathMap).filter((node) => !node.path.includes("/"))
+    return topLevel.sort((a, b) => {
+      if (a.type !== b.type) return a.type === "folder" ? -1 : 1
+      return a.name.localeCompare(b.name)
+    })
+  }
+
+  function toggleFolder(path: string) {
+    setExpandedFolders((prev) => {
+      const next = new Set(prev)
+      if (next.has(path)) {
+        next.delete(path)
+      } else {
+        next.add(path)
+      }
+      return next
+    })
+  }
+
+  function getFileIcon(path: string): string {
+    const ext = path.split(".").pop()?.toLowerCase() ?? ""
+    switch (ext) {
+      case "ts":
+      case "tsx":
+        return "TS"
+      case "js":
+      case "jsx":
+        return "JS"
+      case "java":
+        return "J"
+      case "xml":
+        return "X"
+      case "json":
+        return "{ }"
+      case "yaml":
+      case "yml":
+        return "Y"
+      case "properties":
+        return "P"
+      case "css":
+        return "C"
+      case "html":
+        return "H"
+      default:
+        return "F"
+    }
+  }
+
+  function hasValidOracleCredentials() {
+    return (
+      props.dbHost.trim().length > 0 &&
+      props.dbPort.trim().length > 0 &&
+      props.dbServiceName.trim().length > 0 &&
+      props.dbUsername.trim().length > 0 &&
+      props.dbPassword.trim().length > 0
+    )
+  }
+  function renderTreeNode(node: TreeNode, depth: number = 0): ReactNode {
+    const isExpanded = expandedFolders.has(node.path)
+    const isFolder = node.type === "folder"
+
+    if (isFolder) {
+      return (
+        <div key={node.path}>
+          <button
+            onClick={() => toggleFolder(node.path)}
+            className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs text-slate-700 hover:bg-slate-200 transition-colors"
+            style={{ paddingLeft: `${depth * 16 + 8}px` }}
+          >
+            <span className="inline-flex w-4 items-center justify-center text-slate-500 transition-transform" style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}>
+              ▶
+            </span>
+            <span className="text-slate-600">📁</span>
+            <span className="font-medium">{node.name}</span>
+          </button>
+          {isExpanded && node.children && (
+            <div>{node.children.map((child) => renderTreeNode(child, depth + 1))}</div>
+          )}
+        </div>
+      )
+    }
+
+    return (
+      <button
+        key={node.path}
+        onClick={() => void loadFileContent(node.path)}
+        className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs transition-colors ${
+          selectedFilePath === node.path
+            ? "border-l-2 border-blue-600 bg-blue-100 text-blue-700"
+            : "text-slate-700 hover:bg-slate-200"
+        }`}
+        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+      >
+        <span className="inline-flex h-5 w-5 items-center justify-center rounded text-[10px] font-semibold text-slate-500">
+          {getFileIcon(node.path)}
+        </span>
+        <span className="flex-1 truncate">{node.name}</span>
+        <span className="text-[10px] text-slate-500">{node.size ? `${node.size}B` : ""}</span>
+      </button>
+    )
+  }
+  function extractRepoName(repoUrl: string): string {
+    const normalized = repoUrl.trim().replace(/\/+$/, "")
+    if (!normalized) {
+      return "Repository not available"
+    }
+    const lastSegment = normalized.split("/").pop() ?? normalized
+    return lastSegment.replace(/\.git$/i, "") || "Repository not available"
+  }
+
+  function extractFolderName(outputPath: string): string {
+    const normalized = outputPath.trim().replace(/[\\/]+$/, "")
+    if (!normalized) {
+      return "Output directory not available"
+    }
+    const parts = normalized.split(/[\\/]/).filter(Boolean)
+    return parts[parts.length - 1] ?? normalized
+  }
+
+  useEffect(() => {
+    if (!job?.job_id) {
+      onSnapshotChange(null)
+      setProgressStage("idle")
+      return
+    }
+    const rawSummary = job.result?.summary
+    const backendSummary =
+      typeof rawSummary === "string"
+        ? rawSummary
+        : rawSummary
+          ? JSON.stringify(rawSummary, null, 2)
+          : undefined
+    const backendSummaryData =
+      rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)
+        ? (rawSummary as Record<string, unknown>)
+        : undefined
+    const outputDirectory =
+      job.result?.github_publish?.repo_url ??
+      job.result?.output_directory ??
+      job.output_directory ??
+      "Output directory not available yet"
+    const outputDisplayName = job.result?.github_publish?.repo_url
+      ? extractRepoName(job.result.github_publish.repo_url)
+      : extractFolderName(outputDirectory)
+    onSnapshotChange({
+      jobId: job.job_id,
+      status: job.status,
+      outputDirectory,
+      outputDisplayName,
+      generatedFiles: generatedFiles.map((file) => file.path),
+      backendSummary,
+      backendSummaryData,
+      conversionDurationMs: conversionDurationMs ?? undefined,
+    })
+  }, [conversionDurationMs, generatedFiles, job, onSnapshotChange])
+
+  useEffect(() => {
+    if (!job) {
+      return
+    }
+    if (lastStatusRef.current !== job.status) {
+      const now = new Date()
+      const time = now.toLocaleTimeString()
+      const message =
+        job.status === "queued"
+          ? "Job queued. Preparing pipeline..."
+          : job.status === "running"
+            ? "Pipeline running. Generating Spring Boot project..."
+            : job.status === "completed"
+              ? "Generation complete. Output is ready."
+              : job.status === "failed"
+                ? `Job failed: ${job.error ?? "Unknown error"}`
+                : `Status update: ${job.status}`
+      setLogs((prev) => [{ id: `${job.job_id}-${job.status}-${time}`, message, time }, ...prev].slice(0, 12))
+      lastStatusRef.current = job.status
+    }
+    if (job.status === "queued" || job.status === "running") {
+      setProgressStage(job.status)
+    } else if (job.status === "completed") {
+      setProgressStage("completed")
+      if (conversionStartAt && conversionDurationMs === null) {
+        const elapsed = Date.now() - conversionStartAt
+        setConversionDurationMs(elapsed)
+        setConversionElapsedMs(elapsed)
+      }
+    } else if (job.status === "failed") {
+      setProgressStage("failed")
+      if (conversionStartAt && conversionDurationMs === null) {
+        const elapsed = Date.now() - conversionStartAt
+        setConversionDurationMs(elapsed)
+        setConversionElapsedMs(elapsed)
+      }
+    }
+  }, [conversionDurationMs, conversionStartAt, job])
+
+  useEffect(() => {
+    const isConverting = conversionStarted && conversionDurationMs === null
+    if (!conversionStartAt || !isConverting) {
+      return
+    }
+    const tick = () => setConversionElapsedMs(Date.now() - conversionStartAt)
+    tick()
+    const interval = window.setInterval(tick, 1000)
+    return () => window.clearInterval(interval)
+  }, [conversionDurationMs, conversionStartAt, conversionStarted])
+
+  const loadGeneratedFiles = useCallback(async (jobId: string) => {
+    try {
+      setIsLoadingFiles(true)
+      const files = await getJobFiles(jobId)
+      setGeneratedFiles(files)
+      setError(null)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Failed to load generated files.")
+    } finally {
+      setIsLoadingFiles(false)
+    }
+  }, [])
+
+  const refreshJobStatus = useCallback(async (jobId: string) => {
+    try {
+      const latest = await getJobStatus(jobId)
+      setJob(latest)
+      setError(null)
+
+      if (latest.status === "completed") {
+        await loadGeneratedFiles(latest.job_id)
+      }
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Failed to refresh job status.")
+    }
+  }, [loadGeneratedFiles])
+
+  useEffect(() => {
+    if (!job?.job_id || !isPolling) {
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      void refreshJobStatus(job.job_id)
+    }, 2500)
+
+    return () => window.clearInterval(interval)
+  }, [isPolling, job?.job_id, refreshJobStatus])
+
+  useEffect(() => {
+    props.onBackendLogsChange?.(backendLogs, backendLogsStatus)
+  }, [backendLogs, backendLogsStatus, props])
+
+  useEffect(() => {
+    if (!job?.job_id) {
+      setBackendLogs([])
+      return
+    }
+    let isCancelled = false
+
+    async function fetchLogs() {
+      try {
+        setIsLoadingBackendLogs(true)
+        if (!job?.job_id) {
+          return
+        }
+        const response = await getJobLogs(job.job_id, 300)
+        if (!isCancelled) {
+          setBackendLogs(response.lines)
+          setBackendLogsStatus(response.status ?? null)
+        }
+      } catch {
+        if (!isCancelled) {
+          setBackendLogs([])
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingBackendLogs(false)
+        }
+      }
+    }
+
+    void fetchLogs()
+    const interval = window.setInterval(fetchLogs, 2000)
+    return () => {
+      isCancelled = true
+      window.clearInterval(interval)
+    }
+  }, [job?.job_id])
+
+  useEffect(() => {
+    if (props.sourceMethod !== "git") {
+      setIsBackendHealthy(null)
+      return
+    }
+
+    let isCancelled = false
+
+    async function checkHealth() {
+      try {
+        setIsCheckingHealth(true)
+        const response = await getBackendHealth()
+        if (isCancelled) {
+          return
+        }
+        setIsBackendHealthy(response.status === "ok")
+      } catch {
+        if (!isCancelled) {
+          setIsBackendHealthy(false)
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsCheckingHealth(false)
+        }
+      }
+    }
+
+    void checkHealth()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [props.sourceMethod])
+
+  async function loadFileContent(path: string) {
+    if (!job?.job_id) {
+      return
+    }
+    try {
+      setIsLoadingFileContent(true)
+      const content = await getJobFileContent(job.job_id, path)
+      setSelectedFilePath(path)
+      setSelectedFileContent(content)
+      setError(null)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Failed to load file content.")
+    } finally {
+      setIsLoadingFileContent(false)
+    }
+  }
+
+  async function startConversion() {
+    setError(null)
+    setGeneratedFiles([])
+    setSelectedFilePath("")
+    setSelectedFileContent("")
+    setLogs([])
+    setBackendLogs([])
+    setBackendLogsStatus(null)
+    setProgressStage("queued")
+    props.onConversionStart()
+    setConversionStarted(true)
+    const startAt = Date.now()
+    setConversionStartAt(startAt)
+    setConversionDurationMs(null)
+    setConversionElapsedMs(0)
+    try {
+      setIsStarting(true)
+      let createdJob: ConversionJob | null = null
+      const configPath = props.dbConfigPath || "config.json"
+      const isGitHubOutput = props.outputDestination === "github"
+      const parsedGitHubOutput = parseGitHubRepoInput(props.githubOutputRepoUrl)
+      const targetGithubBranch =
+        props.githubBranchMode === "new"
+          ? props.githubNewBranchName.trim()
+          : props.githubOutputBranch.trim() || parsedGitHubOutput.branch || ""
+      const githubOutput: GitHubOutputConfig | undefined = isGitHubOutput
+        ? {
+            repo_url: parsedGitHubOutput.repoUrl.trim(),
+            branch: targetGithubBranch || undefined,
+            base_branch:
+              props.githubBranchMode === "new" ? props.githubBaseBranch.trim() || props.githubOutputBranch.trim() || undefined : undefined,
+            target_path: props.githubOutputPath.trim() || undefined,
+            access_token: props.githubOutputToken.trim() || undefined,
+            username: props.githubOutputUsername.trim() || undefined,
+            commit_message: props.githubCommitMessage.trim() || undefined,
+          }
+        : undefined
+      const configOverrides: ConfigOverrides = {
+        output: {
+          project_name: props.projectDisplayName.trim() || props.projectArtifact.trim() || props.projectName,
+          group_id: props.projectGroup.trim() || "com.company",
+          artifact_id: props.projectArtifact.trim() || props.projectName,
+          package_name: props.projectPackageName.trim() || props.projectGroup.trim() || "com.company.project",
+          description: props.projectDescription.trim() || "PL/SQL to Java Modernization Project",
+          java_version: props.javaVersion,
+          spring_boot_version: props.springBootVersion,
+          build_tool: props.buildTool === "mvn" ? "maven" : "gradle",
+          packaging: props.packaging,
+          config_format: props.springConfigFormat,
+          database_type: props.targetDatabase ?? undefined,
+          target_directory:
+            props.outputDestination === "local" ? props.outputDirectory.trim() || undefined : undefined,
+          dependencies: props.optionalDependencies.length ? props.optionalDependencies : undefined,
+        },
+      }
+      const outputDirectory =
+        props.outputDestination === "local" ? props.outputDirectory.trim() || undefined : undefined
+
+      if (isGitHubOutput && !githubOutput?.repo_url) {
+        setError("Enter a GitHub repository URL for the output destination.")
+        return
+      }
+      if (isGitHubOutput && !githubOutput?.branch) {
+        setError(
+          props.githubBranchMode === "new"
+            ? "Enter a new branch name for the GitHub output destination."
+            : "Choose a GitHub branch for the output destination.",
+        )
+        return
+      }
+
+      if (props.sourceMethod === "sqlfile") {
+        if (!props.sourceFile) {
+          setError("Select a local SQL file before starting conversion.")
+          return
+        }
+        createdJob = await createFileJob(props.sourceFile, configPath, configOverrides, outputDirectory, githubOutput)
+      } else if (props.sourceMethod === "git") {
+        if (!props.gitRepoUrl.trim()) {
+          setError("Enter a valid Git repository URL.")
+          return
+        }
+        if (isBackendHealthy === false) {
+          setError("Backend health check failed. Ensure API server is running before starting Git conversion.")
+          return
+        }
+        createdJob = await createGitJob(
+          props.gitRepoUrl.trim(),
+          configPath,
+          configOverrides,
+          outputDirectory,
+          githubOutput,
+        )
+      } else {
+        if (!hasValidOracleCredentials()) {
+          setError("Fill valid Oracle host, port, service name, username, and password before starting conversion.")
+          return
+        }
+        const response = await startOracleConvert({
+          host: props.dbHost.trim(),
+          port: Number(props.dbPort),
+          service_name: props.dbServiceName.trim(),
+          username: props.dbUsername.trim(),
+          password: props.dbPassword,
+          config_path: configPath,
+          config_overrides: configOverrides,
+          output_directory: outputDirectory,
+          github_output: githubOutput,
+        })
+
+        const maybeJob = response as Partial<ConversionJob>
+        if (!maybeJob.job_id) {
+          setError("Oracle convert response did not return a job_id.")
+          return
+        }
+        createdJob = maybeJob as ConversionJob
+      }
+
+      setJob(createdJob)
+      if (createdJob.status === "completed") {
+        await loadGeneratedFiles(createdJob.job_id)
+      }
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Failed to start conversion.")
+      setProgressStage("failed")
+      if (startAt) {
+        const elapsed = Date.now() - startAt
+        setConversionDurationMs(elapsed)
+        setConversionElapsedMs(elapsed)
+      }
+    } finally {
+      setIsStarting(false)
+    }
+  }
+
+  function formatDuration(ms: number): string {
+    if (!Number.isFinite(ms) || ms < 0) {
+      return "0s"
+    }
+    const totalSeconds = Math.floor(ms / 1000)
+    const hours = Math.floor(totalSeconds / 3600)
+    const minutes = Math.floor((totalSeconds % 3600) / 60)
+    const seconds = totalSeconds % 60
+    if (hours > 0) {
+      return `${hours}h ${minutes}m ${seconds}s`
+    }
+    if (minutes > 0) {
+      return `${minutes}m ${seconds}s`
+    }
+    return `${seconds}s`
+  }
+
+  return (
+    <Card className="border-none bg-gradient-to-br from-slate-50 via-white to-blue-50 text-slate-900 shadow-sm">
+      <CardHeader>
+        <CardTitle className="text-slate-900">Ready to convert: {props.projectName}</CardTitle>
+        <CardDescription className="text-slate-600">
+          Start conversion and track job progress, generated files, preview, and download.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {props.sourceMethod === "git" ? (
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-600 font-medium">Git API Health</p>
+            <p className="mt-1 text-sm text-slate-700">
+              {isCheckingHealth
+                ? "Checking /health ..."
+                : isBackendHealthy === true
+                  ? "Backend is healthy."
+                  : isBackendHealthy === false
+                    ? "Backend is unreachable or unhealthy."
+                    : "Health check pending."}
+            </p>
+          </div>
+        ) : null}
+
+        <div className="flex flex-wrap items-center gap-2">
+          {isStarting ? (
+            <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-slate-100 px-4 text-sm font-semibold text-slate-900">
+              <LoaderCircle className="h-4 w-4 animate-spin" />
+              Starting...
+            </div>
+          ): job?.status === "completed" ? (
+            <Badge className="inline-flex items-center gap-2 rounded-full border border-emerald-300 bg-emerald-100 px-4 py-1.5 text-sm font-semibold text-emerald-700 backdrop-blur-sm">
+              <span className="h-2 w-2 rounded-full bg-emerald-500"></span>
+              Completed
+            </Badge>
+          ) : conversionStarted && !isStarting ? (
+            <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-300 bg-slate-100 px-4 text-sm font-semibold text-slate-900">
+              <LoaderCircle className="h-4 w-4 animate-spin" />
+              Converting...
+            </div>
+           ) :(
+            <Button
+              variant="secondary"
+              onClick={startConversion}
+              disabled={props.sourceMethod === "git" && (isCheckingHealth || isBackendHealthy === false)}
+            >
+              <Play className="h-4 w-4" />
+              Start Conversion
+            </Button>
+          )}
+          {/* {job?.job_id ? (
+            <Button variant="outline" onClick={() => void refreshJobStatus(job.job_id, true)} disabled={isRefreshing}>
+              {isRefreshing ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
+              Refresh Status
+            </Button>
+          ) : null} */}
+          {job?.job_id && job.status === "completed" ? (
+            <a
+              href={getJobDownloadUrl(job.job_id)}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 px-4 text-sm font-semibold text-emerald-700 transition-all duration-200 hover:bg-emerald-100 hover:border-emerald-400 active:scale-95"
+            >
+              <Download className="h-4 w-4" />
+              Download ZIP
+            </a>
+          ) : null}
+        </div>
+
+        {progressStage !== "idle" ? (
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="flex items-center justify-between text-xs text-slate-700">
+              <span className="font-medium">Application creation</span>
+              <span className="flex items-center gap-3">
+                <span className="text-[11px] text-slate-600">Elapsed: {formatDuration(conversionElapsedMs)}</span>
+                <span className="uppercase tracking-wide text-slate-600 font-medium">{progressStage}</span>
+              </span>
+            </div>
+            <div className="relative mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+              {progressStage === "completed" ? (
+                <div className="h-full w-full bg-emerald-500" />
+              ) : progressStage === "failed" ? (
+                <div className="h-full w-full bg-rose-500" />
+              ) : (
+                <div className="progress-stripe" />
+              )}
+            </div>
+          </div>
+        ) : null}
+
+        {job ? (
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-sm font-semibold text-slate-900">Job ID: {job.job_id}</p>
+              <Badge variant={statusVariant(job.status)}>{job.status}</Badge>
+            </div>
+            <p className="mt-1 text-xs text-slate-600">Source: {job.source_type}</p>
+            {job.result?.github_publish ? (
+              <p className="mt-1 text-xs text-emerald-700">
+                Published to {job.result.github_publish.repo_url} [{job.result.github_publish.branch}] at{" "}
+                {job.result.github_publish.target_path}
+              </p>
+            ) : null}
+            {job.error ? <p className="mt-2 text-xs font-medium text-rose-700">{job.error}</p> : null}
+          </div>
+        ) : null}
+
+        {/* {logs.length > 0 ? (
+          <div className="rounded-xl border border-white/20 bg-white/10 p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-200">Generation Stage</p>
+            <div className="mt-2 space-y-2">
+              {logs.map((entry, index) => (
+                <div
+                  key={entry.id}
+                  className="animate-rise rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-100 transition"
+                  style={{ animationDelay: `${index * 60}ms` }}
+                >
+                  <div className="flex items-center justify-between text-[11px] text-slate-300">
+                    <span>{entry.time}</span>
+                    <span>pipeline</span>
+                  </div>
+                  <p className="mt-1 text-sm text-slate-100">{entry.message}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null} */}
+
+        {conversionStarted ? (
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            <div className="flex items-center justify-between text-xs text-slate-700">
+              <span className="uppercase tracking-wide font-medium">Backend Logs</span>
+              {isLoadingBackendLogs ? <span>Loading…</span> : null}
+            </div>
+            <pre className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs text-emerald-200 bg-slate-900 p-2 rounded border border-slate-700">
+              {backendLogs.length > 0
+                ? backendLogs.join("\n")
+                : backendLogsStatus === "missing"
+                  ? "Job not found. Start a new conversion to stream logs."
+                  : "No backend logs yet."}
+            </pre>
+          </div>
+        ) : null}
+
+        {job?.status === "completed" ? (
+          <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm font-semibold text-slate-900">Generated Files</p>
+              <Button variant="outline" size="sm" onClick={() => void loadGeneratedFiles(job.job_id)} disabled={isLoadingFiles}>
+                {isLoadingFiles ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+                Refresh Files
+              </Button>
+            </div>
+
+            {generatedFiles.length > 0 ? (
+              <div className="space-y-1">
+                <div className="max-h-96 overflow-y-auto rounded-lg border border-slate-200 bg-white p-2">
+                  {buildFileTree(generatedFiles).map((node) => renderTreeNode(node, 0))}
+                </div>
+
+                {selectedFilePath ? (
+                  <div className="space-y-2">
+                    <pre className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs text-emerald-200 bg-slate-900 p-2 rounded border border-slate-700">
+                      {isLoadingFileContent ? "Loading file content..." : selectedFileContent}
+                    </pre>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <p className="text-xs text-slate-600">No generated files available yet.</p>
+            )}
+          </div>
+        ) : null}
+
+        {error ? <p className="text-xs font-medium text-rose-700">{error}</p> : null}
+      </CardContent>
+    </Card>
+  )
+}
