@@ -9,6 +9,17 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 import logging
 
+# Import compliance enforcer
+try:
+    from .java_generation_compliance_enforcer import (
+        JavaComplianceEnforcer, 
+        enforce_java_compliance
+    )
+    COMPLIANCE_ENFORCER_AVAILABLE = True
+except ImportError:
+    COMPLIANCE_ENFORCER_AVAILABLE = False
+    logger.warning("Compliance enforcer not available - generated code may not follow all 12 rules")
+
 logger = logging.getLogger(__name__)
 
 
@@ -1174,6 +1185,21 @@ class PLSQLtoJavaConverter:
         final_code += f"public {return_type} {method_name}({params_str}) {{\n"
         final_code += "\n".join(body_lines) if body_lines else "        logger.info(\"Method executed\");"
         final_code += "\n    }\n"
+        
+        # ========== COMPLIANCE ENFORCEMENT (Rule 1-12) ==========
+        if COMPLIANCE_ENFORCER_AVAILABLE:
+            corrected_code, is_compliant, violations = enforce_java_compliance(
+                final_code, 
+                method_name=method_name
+            )
+            if not is_compliant:
+                logger.warning(f"\n{'='*80}")
+                logger.warning(f"COMPLIANCE VIOLATIONS in method '{method_name}':")
+                for violation in violations:
+                    logger.warning(f"  ⚠ {violation}")
+                logger.warning(f"{'='*80}\n")
+            final_code = corrected_code
+        # ============================================================
         
         return final_code
     

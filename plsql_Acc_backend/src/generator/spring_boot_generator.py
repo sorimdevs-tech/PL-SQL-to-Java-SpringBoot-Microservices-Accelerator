@@ -160,6 +160,16 @@ from ..utils.logger import get_logger
 from ..utils.config import get_config_value
 from ..utils.naming import normalize_column_name, to_pascal_case
 
+# Import compliance enforcer for Java generation validation
+try:
+    from .java_generation_compliance_enforcer import (
+        JavaComplianceEnforcer,
+        ComplianceResult
+    )
+    COMPLIANCE_ENFORCER_AVAILABLE = True
+except ImportError:
+    COMPLIANCE_ENFORCER_AVAILABLE = False
+
 logger = get_logger(__name__)
 
 # ── SBG-3: known stable Spring Boot versions ─────────────────────────────────
