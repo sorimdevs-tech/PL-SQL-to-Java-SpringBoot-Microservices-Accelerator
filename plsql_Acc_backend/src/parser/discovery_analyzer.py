@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence, Set, Tuple, Optional
 
 from src.parser.sql_table_discovery import remove_sql_comments
+
+logger = logging.getLogger(__name__)
 
 
 KEYWORD_BLOCKLIST = {
@@ -153,7 +156,16 @@ def _to_pascal_case(name: str) -> str:
 
 def _prepare_sql_text(sql_text: str) -> str:
     cleaned = remove_sql_comments(sql_text)
-    return _remove_sqlplus_commands(cleaned)
+    normalized = _remove_sqlplus_commands(cleaned)
+    # Collapse newlines/multiple spaces between CREATE...PROCEDURE/FUNCTION/PACKAGE
+    # This helps match procedures split across lines (e.g. "CREATE\n  PROCEDURE")
+    normalized = re.sub(
+        r'(CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:EDITIONABLE|NONEDITIONABLE)\s+)?)\s+(?=PROCEDURE|FUNCTION|PACKAGE)\b',
+        r'\1',
+        normalized,
+        flags=re.IGNORECASE
+    )
+    return normalized
 
 
 def _remove_sqlplus_commands(sql_text: str) -> str:
@@ -801,7 +813,12 @@ def _extract_parameter_section(header_text: str) -> str:
 
 def _extract_objects(sql_text: str) -> List[ObjectSlice]:
     matches = list(OBJECT_PATTERN.finditer(sql_text))
+    logger.debug(f"Found {len(matches)} procedure/function/package objects in SQL text ({len(sql_text)} chars)")
+    if matches:
+        for match in matches:
+            logger.debug(f"  - Matched: {match.group(1).upper()} {match.group(2)}")
     if not matches:
+        logger.warning("No CREATE PROCEDURE/FUNCTION/PACKAGE statements found. Ensure SQL file contains 'CREATE [OR REPLACE] PROCEDURE/FUNCTION/PACKAGE object_name' statements.")
         return []
 
     objects: List[ObjectSlice] = []
@@ -4196,8 +4213,13 @@ def build_discovery_model(sql_text: str) -> Dict[str, Any]:
 
 def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
     """Analyze SQL/PLSQL text and return backward-compatible object metadata."""
+    logger.info(f"Analyzing SQL source ({len(sql_text)} characters)")
     model = build_discovery_model(sql_text)
     results: List[Dict[str, Any]] = []
+    procedures_found = len(model.get("procedures", []))
+    tables_found = len(model.get("schema", {}).get("tables", []))
+    logger.info(f"Discovery complete: {procedures_found} procedures, {tables_found} tables")
+    
     for proc in model.get("procedures", []):
         tables_used = proc.get("tables_used", [])
         entry: Dict[str, Any] = {

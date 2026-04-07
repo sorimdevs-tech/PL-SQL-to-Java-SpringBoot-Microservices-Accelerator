@@ -1963,7 +1963,44 @@ function SqlSourceDiscovery(props: {
         </Card>
       ) : null}
 
-      {analysis && props.sourceMethod === "git" ? (
+      {error && props.sourceMethod === "sqlfile" ? (
+        <Card className="border-rose-200 bg-rose-50">
+          <CardContent className="p-4">
+            <p className="text-sm font-medium text-rose-700">{error}</p>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {isLoading && props.sourceMethod === "sqlfile" ? (
+        <Card className="border-sky-200 bg-sky-50">
+          <CardContent className="p-4">
+            <div className="space-y-2">
+              <p className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
+                <LoaderCircle className="h-5 w-5 animate-spin text-sky-600" />
+                Analyzing SQL File...
+              </p>
+              <p className="text-xs text-slate-600">
+                Scanning procedures, functions, tables, and dependencies. This may take a moment.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {!isLoading && analysis && props.sourceMethod === "sqlfile" ? (
+        <Card className="border-emerald-200 bg-emerald-50">
+          <CardContent className="p-4">
+            <p className="inline-flex items-center gap-2 text-sm font-semibold text-emerald-900">
+              ✓ Analysis Complete
+            </p>
+            <p className="mt-2 text-xs text-emerald-700">
+              Found {(analysis?.objects ?? []).length} procedure(s)/function(s) and {globalTables.length} table(s). Review the schema and procedures below.
+            </p>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {analysis && (props.sourceMethod === "git" || props.sourceMethod === "sqlfile") ? (
         <>
 
           {globalSchema ? (

@@ -1262,8 +1262,13 @@ async def analyze_discovery_source(request: DiscoveryAnalyzeRequest) -> Dict[str
 
         analyses = analyze_sql_source(sql_text)
         discovery_model = build_discovery_model(sql_text)
-        if not analyses and not discovery_model.get("schema", {}).get("tables"):
-            raise HTTPException(status_code=422, detail="No PROCEDURE/FUNCTION/PACKAGE objects found")
+        tables_found = discovery_model.get("schema", {}).get("tables", [])
+        
+        if not analyses and not tables_found:
+            raise HTTPException(
+                status_code=422, 
+                detail="No PROCEDURE/FUNCTION/PACKAGE objects found. Ensure your SQL file contains 'CREATE [OR REPLACE] PROCEDURE/FUNCTION/PACKAGE object_name' statements."
+            )
         discovery_manager.store_analyses(analyses, discovery_model)
 
         primary = analyses[0] if analyses else {
