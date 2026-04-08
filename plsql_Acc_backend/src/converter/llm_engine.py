@@ -1503,12 +1503,24 @@ ONLY OUTPUT JAVA CODE."""
         entity_name: str,
         entity_field_types: Dict[str, Dict[str, str]],
     ) -> bool:
+        lookup_variants = spec.get('lookup_key_variants') or []
+        lookup_keys = spec.get('lookup_keys') or []
+        raw_lookup_variants = lookup_variants if lookup_variants else ([lookup_keys] if lookup_keys else [])
+        for variant in raw_lookup_variants:
+            expected_lookup_method = self._expected_lookup_method_name(list(variant or []))
+            if expected_lookup_method and not re.search(rf'\b{re.escape(expected_lookup_method)}\s*\(', repository_code):
+                return True
+
+        if spec.get('requires_skip_locked'):
+            cursor_filters = list(spec.get('cursor_filters') or [])
+            expected_skip_locked_method = self._skip_locked_method_name(cursor_filters)
+            if not re.search(rf'\b{re.escape(expected_skip_locked_method)}\s*\(', repository_code):
+                return True
+
         aggregation_columns = list(spec.get('aggregation_columns') or [])
         if not aggregation_columns:
             return False
 
-        lookup_variants = spec.get('lookup_key_variants') or []
-        lookup_keys = spec.get('lookup_keys') or []
         raw_sum_variants = lookup_variants if lookup_variants else ([lookup_keys] if lookup_keys else [[]])
 
         required_method_names: Set[str] = set()
