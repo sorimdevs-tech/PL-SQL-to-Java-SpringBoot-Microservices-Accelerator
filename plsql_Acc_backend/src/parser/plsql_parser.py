@@ -32,6 +32,7 @@ except ImportError:
     ParseTreeWalker = None
 
 from ..utils.logger import get_logger
+from ..analyzer.logic_tree_builder import LogicNode, build_logic_tree
 
 logger = get_logger(__name__)
 
@@ -394,10 +395,84 @@ class PLSQLParser:
             })
         return constants
 
+    @staticmethod
+    def _logic_node_to_structured_ir(node: LogicNode) -> Dict[str, Any]:
+        """Convert the hierarchical logic tree into parser-facing structured IR."""
+        node_type = (node.type or "").lower()
+        metadata = dict(node.metadata or {})
+        children = [PLSQLParser._logic_node_to_structured_ir(child) for child in node.children]
+
+        if node_type == "program":
+            return {"type": "PROGRAM", "body": children}
+        if node_type == "block":
+            return {"type": "BLOCK", "body": children}
+        if node_type == "try":
+            body = [child for child in children if child.get("type") != "EXCEPTION"]
+            exception = next((child for child in children if child.get("type") == "EXCEPTION"), None)
+            return {
+                "type": "TRY_BLOCK",
+                "body": body,
+                "exception": (exception or {}).get("body", []),
+                "exception_text": (exception or {}).get("text", ""),
+            }
+        if node_type == "catch":
+            return {"type": "EXCEPTION", "text": metadata.get("body", ""), "body": children}
+        if node_type == "loop":
+            return {"type": "LOOP", "header": metadata.get("condition", ""), "body": children}
+        if node_type in {"if", "elsif"}:
+            then_nodes = [child for child in children if child.get("type") != "ELSE"]
+            else_node = next((child for child in children if child.get("type") == "ELSE"), None)
+            return {
+                "type": "IF",
+                "condition": metadata.get("condition", ""),
+                "then": then_nodes,
+                "else": (else_node or {}).get("body", []),
+            }
+        if node_type == "else":
+            return {"type": "ELSE", "body": children}
+        if node_type == "transaction":
+            return {
+                "type": "TRANSACTION",
+                "statement": metadata.get("statement", ""),
+                "operation": metadata.get("operation", ""),
+            }
+        if node_type in {"select", "insert", "update", "delete", "merge", "aggregation", "count_into"}:
+            return {
+                "type": "SQL",
+                "query": metadata.get("query") or metadata.get("sql", ""),
+                "metadata": {
+                    "semantic_type": metadata.get("semantic_type", ""),
+                    "is_transactional": metadata.get("is_transactional", False),
+                    "has_join": metadata.get("has_join", False),
+                    "aggregations": metadata.get("aggregations", []),
+                },
+            }
+        return {"type": node_type.upper() or "STATEMENT", "metadata": metadata, "body": children}
+
+    def extract_structured_blocks(self, content: str) -> Dict[str, Any]:
+        """Extract recursive PL/SQL control-flow blocks for semantic processing."""
+        normalized = preprocess_plsql_for_parser(content)
+        begin_match = re.search(r"\bbegin\b", normalized, flags=re.IGNORECASE)
+        logic_source = normalized[begin_match.start():] if begin_match else normalized
+        tree = build_logic_tree(logic_source)
+        return self._logic_node_to_structured_ir(tree)
+
     def _fallback_parse(self, content: str) -> Optional[Dict[str, Any]]:
         """Build a lightweight AST when ANTLR parse fails."""
         matches = list(OBJECT_DECL_PATTERN.finditer(content))
         if not matches:
+            if re.search(r"\b(begin|for\b.*?\bloop|while\b.*?\bloop|if\b.*?\bthen|savepoint|rollback)\b", content, flags=re.IGNORECASE | re.DOTALL):
+                return {
+                    "type": "plsql_file",
+                    "procedures": [],
+                    "functions": [],
+                    "triggers": [],
+                    "packages": [],
+                    "declarations": [],
+                    "executables": [],
+                    "exceptions": [],
+                    "structured_blocks": self.extract_structured_blocks(content),
+                }
             return None
 
         ast: Dict[str, Any] = {
@@ -409,6 +484,7 @@ class PLSQLParser:
             "declarations": [],
             "executables": [],
             "exceptions": [],
+            "structured_blocks": self.extract_structured_blocks(content),
         }
 
         for index, match in enumerate(matches):
@@ -515,6 +591,10 @@ class PLSQLParser:
                 return fallback_ast
         
         if PlSqlLexer is None or PlSqlParser is None:
+            fallback_ast = self._fallback_parse(content)
+            if fallback_ast:
+                logger.debug("ANTLR parser unavailable; using fallback parser with structured blocks")
+                return fallback_ast
             raise PLSQLParseError(
                 "ANTLR parsers are not available. Generate parser files under src/parser/generated first."
             )
@@ -555,6 +635,7 @@ class PLSQLParser:
                        f"{len(ast_builder.ast['triggers'])} triggers, "
                        f"{len(ast_builder.ast['packages'])} packages")
             
+            ast_builder.ast["structured_blocks"] = self.extract_structured_blocks(content)
             return ast_builder.ast
             
         except Exception as e:

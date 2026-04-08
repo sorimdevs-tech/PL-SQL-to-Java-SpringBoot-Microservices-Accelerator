@@ -159,7 +159,13 @@ import logging
 from ..utils.logger import get_logger
 from ..utils.config import get_config_value
 from ..utils.naming import normalize_column_name, to_pascal_case
+from ..utils.prompt_builder import build_prompt
 from ..analyzer.logic_tree_builder import LogicNode
+
+try:
+    from ..rag_engine.rag_service import RAGService
+except Exception:  # pragma: no cover - optional runtime integration
+    RAGService = None  # type: ignore
 
 # Import compliance enforcer for Java generation validation
 try:
@@ -486,6 +492,8 @@ class SpringBootGenerator:
         # SBG-30: Dynamic logic extraction - procedure metadata for accurate Java generation
         self._procedure_metadata: Dict[str, Dict[str, Any]] = {}  # package.procedure -> metadata
         self._plsql_source_map: Dict[str, str] = {}               # filename -> full PL/SQL source
+        self.rag_service = None
+        self.rag_llm = config.get("rag_llm")
 
         self.base_path = self.target_directory / 'src' / 'main' / 'java'
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -495,6 +503,12 @@ class SpringBootGenerator:
         self.package_path = self.base_path / self.package_name.replace('.', '/')
 
         logger.info(f"Spring Boot Generator initialized for project: {self.project_name}")
+
+    def set_rag_service(self, rag_service: Any, llm_callable: Optional[Any] = None) -> None:
+        """Attach a RAG service once from the pipeline bootstrap."""
+        self.rag_service = rag_service
+        if llm_callable is not None:
+            self.rag_llm = llm_callable
 
     # ── SBG-3: version guard ──────────────────────────────────────────────────
     def _validate_spring_boot_version(self, version: str) -> str:
@@ -2991,6 +3005,62 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         java_code.append("    }")
         return "\n".join(java_code)
 
+    def _generate_rag_sql_node_code(self, node: LogicNode, indent: int) -> List[str]:
+        """Retrieve examples for a SQL node and attach RAG prompt/code metadata."""
+        if self.rag_service is None:
+            return []
+        query = str(node.metadata.get("query") or node.metadata.get("sql") or "").strip()
+        if not query:
+            return []
+
+        try:
+            examples = self.rag_service.get_relevant_examples(node)
+            prompt = build_prompt(node, examples)
+            generated_code = self._call_rag_llm(prompt)
+            if not generated_code:
+                generated_code = self._fallback_rag_generated_code(node, examples)
+            node.metadata["rag_examples"] = examples
+            node.metadata["rag_prompt"] = prompt
+            node.metadata["generated_code"] = generated_code
+            if not generated_code or "@Query" in generated_code or "interface " in generated_code:
+                return []
+            return [
+                f"{'    ' * indent}{line}" if line.strip() else ""
+                for line in generated_code.splitlines()
+            ]
+        except Exception as exc:
+            logger.warning("RAG generation skipped for SQL node: %s", exc)
+            return []
+
+    def _call_rag_llm(self, prompt: str) -> str:
+        """Call an optional sync LLM hook. Async providers remain in llm_engine."""
+        if not callable(self.rag_llm):
+            return ""
+        try:
+            result = self.rag_llm(prompt)
+        except TypeError:
+            result = self.rag_llm(prompt=prompt)
+        if isinstance(result, str):
+            return result.strip()
+        return ""
+
+    def _fallback_rag_generated_code(self, node: LogicNode, examples: List[Dict[str, Any]]) -> str:
+        """Use the closest retrieved pattern when no generator-local LLM hook exists."""
+        semantic_type = str(node.metadata.get("semantic_type", "")).upper()
+        if examples:
+            output = str(examples[0].get("output", "")).strip()
+            if output:
+                return output
+        if semantic_type == "AGGREGATION":
+            return "// RAG: aggregation should be implemented with an explicit @Query repository method"
+        if semantic_type == "DML":
+            return "repository.save(null);"
+        if semantic_type == "SINGLE_ROW":
+            return "repository.findAll();"
+        if semantic_type == "CURSOR_LOOP":
+            return "for (Object rec : repository.findAll()) {\n    // process cursor row\n}"
+        return ""
+
     def _generate_java_body(
         self,
         node: LogicNode,
@@ -3006,7 +3076,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         node_type = self._normalize_logic_node_type(node.type)
         lines: List[str] = []
 
-        if node_type == "sequence":
+        if node_type in {"sequence", "program", "block"}:
             for child in node.children:
                 lines.extend(self._generate_java_body(child, indent, repository_methods, declared_variables, entity_name))
             return lines
@@ -3102,7 +3172,12 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                 declared_variables.add(target)
             return lines
 
-        if node_type == "aggregation":
+        if node_type in {"aggregation", "count_into", "select", "insert", "update", "delete", "merge"}:
+            rag_lines = self._generate_rag_sql_node_code(node, indent)
+            if rag_lines:
+                return rag_lines
+
+        if node_type in {"aggregation", "count_into"}:
             methods = self._ensure_logic_tree_aggregation_methods(node, repository_methods, entity_name)
             if not methods:
                 lines.append(f"{indent_str}// Aggregation node without metadata")
@@ -3116,7 +3191,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             lines.append(f"{indent_str}repository.findAll();")
             return lines
 
-        if node_type in {"insert", "update"}:
+        if node_type in {"insert", "update", "merge"}:
             lines.append(f"{indent_str}repository.save(null);")
             return lines
 

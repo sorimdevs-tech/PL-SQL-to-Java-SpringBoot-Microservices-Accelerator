@@ -78,6 +78,10 @@ TYPE_BLOCKLIST = {
 }
 
 AGGREGATION_FUNCTIONS = ("SUM", "COUNT", "AVG", "MIN", "MAX")
+SQL_STATEMENT_PATTERN = re.compile(
+    r"\b(select|insert\s+into|update|delete\s+from|merge\s+into)\b.*?(?:;|$)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 OBJECT_PATTERN = re.compile(
     r"\bcreate\s+(?:or\s+replace\s+)?(?:editionable\s+|noneditionable\s+)?(procedure|function|package(?:\s+body)?)\s+([`\"\w$#\.]+)",
@@ -967,6 +971,42 @@ def _extract_operations_and_tables(block_text: str) -> Dict[str, Any]:
     return {"operations": sorted(operations), "tables": sorted(tables)}
 
 
+def _classify_sql_query(sql: str, transactional: bool = False) -> Dict[str, Any]:
+    query = _normalize_statement_text(sql)
+    upper = query.upper()
+    aggregations = [
+        {"function": function_name, "field": match.group(1).strip()}
+        for function_name in AGGREGATION_FUNCTIONS
+        for match in re.finditer(rf"\b{function_name}\s*\(\s*([^)]+)\)", query, flags=re.IGNORECASE)
+    ]
+    if aggregations:
+        semantic_type = "AGGREGATION"
+    elif re.search(r"\bselect\b.*\binto\b", query, flags=re.IGNORECASE | re.DOTALL):
+        semantic_type = "SINGLE_ROW"
+    elif re.match(r"\s*(insert|update|delete|merge)\b", query, flags=re.IGNORECASE):
+        semantic_type = "DML"
+    elif re.search(r"\bcursor\b|\bfor\s+\w+\s+in\s*\(", query, flags=re.IGNORECASE):
+        semantic_type = "CURSOR_LOOP"
+    else:
+        semantic_type = "QUERY" if upper.startswith("SELECT") else "UNKNOWN"
+    return {
+        "query": query,
+        "semantic_type": semantic_type,
+        "is_transactional": bool(transactional),
+        "has_join": bool(re.search(r"\bjoin\b", query, flags=re.IGNORECASE)),
+        "aggregations": aggregations,
+        "tables": _extract_operations_and_tables(query).get("tables", []),
+    }
+
+
+def _extract_query_semantics(block_text: str) -> List[Dict[str, Any]]:
+    transactional = bool(re.search(r"\b(savepoint|rollback|commit)\b", block_text, flags=re.IGNORECASE))
+    return [
+        _classify_sql_query(match.group(0), transactional)
+        for match in SQL_STATEMENT_PATTERN.finditer(block_text)
+    ]
+
+
 def _extract_operations_by_table(block_text: str) -> Dict[str, List[str]]:
     per_table: Dict[str, Set[str]] = {}
 
@@ -1151,6 +1191,7 @@ def build_conversion_units(sql_text: str) -> List[Dict[str, Any]]:
                 "business_rules": semantics.get("business_rules", []),
                 "issues": semantics.get("issues", []),
                 "semantic_analysis": semantics.get("semantic_analysis", {}),
+                "query_semantics": semantics.get("query_semantics", []),
                 # RC4 FIX
                 "programmatic_raises": semantics.get("programmatic_raises", []),
                 # RC8 FIX
@@ -3699,6 +3740,7 @@ def build_semantic_analysis(ast: Dict[str, Any]) -> Dict[str, Any]:
         "aggregation": aggregation,
         "derived_values": derived_values,
         "structured_data_flow": structured_data_flow,
+        "query_semantics": ast.get("query_semantics", []),
         "business_rules": business_rules,
         "transaction_strategy": transaction_strategy,
         "cursor_semantics": cursor_semantics,
@@ -3901,6 +3943,7 @@ def _analyze_procedure_block(
         [*parameter_names, *(var["name"] for var in local_variables)],
     )
     insert_statements = _extract_insert_statements(item.block_text)
+    query_semantics = _extract_query_semantics(item.block_text)
     lookup_keys = _extract_lookup_keys(item.block_text, ddl_columns)
     exceptions = _extend_exceptions_with_select_into_risks(
         _extract_exceptions(item.block_text),
@@ -3932,6 +3975,7 @@ def _analyze_procedure_block(
         "select_assignments": select_assignments,
         "assignments": [*select_assignments, *scalar_assignments],
         "insert_statements": insert_statements,
+        "query_semantics": query_semantics,
         "collection_definitions": collection_definitions,
         "cursor_definitions": cursor_definitions,
         "schema": {
@@ -4042,6 +4086,7 @@ def _analyze_procedure_block(
         "issues": issues,
         "dependency_chain": dependency_chain,
         "semantic_analysis": semantic_analysis,
+        "query_semantics": query_semantics,
         # RC4 FIX: programmatic raises (raise_application_error calls)
         "programmatic_raises": programmatic_raises,
         # RC8 FIX: autonomous transaction flag
@@ -4264,6 +4309,7 @@ def analyze_sql_source(sql_text: str) -> List[Dict[str, Any]]:
             "dependencyChain": proc.get("dependency_chain", []),
             "semantic_analysis": proc.get("semantic_analysis", {}),
             "semanticAnalysis": proc.get("semantic_analysis", {}),
+            "querySemantics": proc.get("query_semantics", []),
             # RC4 FIX
             "programmatic_raises": proc.get("programmatic_raises", []),
             # RC8 FIX

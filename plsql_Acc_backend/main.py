@@ -28,6 +28,8 @@ from src.generator.spring_boot_generator import SpringBootGenerator
 from src.generator.build_validator import BuildValidator
 from src.validator.test_generator import TestGenerator
 from src.validator.semantic_validator import SemanticValidator, SemanticValidationReport
+from src.analyzer.logic_tree_builder import build_logic_tree
+from src.rag_engine.rag_service import initialize_rag
 from src.utils.file_utils import FileExtractor
 from src.parser.sql_table_discovery import extract_create_table_columns
 from src.parser.discovery_analyzer import build_conversion_units, build_discovery_model
@@ -89,6 +91,8 @@ class PLSQLModernizationPipeline:
         self.semantic_validator = SemanticValidator(
             self.config.get('output', {}).get('package_name', 'com.company.project')
         )
+        self.rag_service = initialize_rag(top_k=int(self.config.get("rag", {}).get("top_k", 3)))
+        self.generator.set_rag_service(self.rag_service)
         self.file_extractor = FileExtractor()
         self.repair_config = self.config.get('backup_llm', {}) or {}
         self._last_repair_result: Dict[str, Any] = {}
@@ -348,6 +352,18 @@ class PLSQLModernizationPipeline:
             file_units = build_conversion_units(content)
             for unit in file_units:
                 unit["source_file"] = filename
+                raw_plsql = unit.get("raw_plsql") or content
+                try:
+                    parse_output = self.parser.parse(raw_plsql)
+                except Exception:
+                    parse_output = {"type": "plsql_file", "structured_blocks": self.parser.extract_structured_blocks(raw_plsql)}
+                semantic_output = self.semantic_validator.analyze(parse_output)
+                logic_source = semantic_output.get("structured_blocks") or raw_plsql
+                unit["parser_output"] = parse_output
+                unit["semantic_output"] = semantic_output
+                logic_tree = build_logic_tree(logic_source)
+                unit["logic_tree"] = logic_tree.to_dict()
+                unit["rag_examples"] = self._collect_rag_examples(logic_tree)
             units.extend(file_units)
 
             for table in model.get("schema", {}).get("tables", []):
@@ -463,6 +479,25 @@ class PLSQLModernizationPipeline:
             "schema": merged_schema,
             "sequences": sequence_map,
         }
+
+    def _collect_rag_examples(self, logic_tree: Any) -> List[Dict[str, Any]]:
+        """Retrieve and de-duplicate RAG examples for SQL nodes in a logic tree."""
+        results: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for node in logic_tree.walk():
+            metadata = getattr(node, "metadata", {}) or {}
+            if not metadata.get("query") and not metadata.get("sql"):
+                continue
+            examples = self.rag_service.get_relevant_examples(node)
+            if examples:
+                metadata["rag_examples"] = examples
+            for example in examples:
+                key = f"{example.get('type')}::{example.get('input')}::{example.get('output')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(example)
+        return results
 
     def _register_procedures_with_generator(self, semantic_model: Dict[str, Any], plsql_files: Dict[str, str]) -> None:
         """

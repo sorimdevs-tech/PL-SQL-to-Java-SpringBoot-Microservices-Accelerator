@@ -34,6 +34,68 @@ INVALID_REPOSITORY_METHOD_PREFIXES = {
     "avgBy",
 }
 
+AGGREGATION_FUNCTIONS = ("SUM", "COUNT", "AVG", "MIN", "MAX")
+
+
+def classify_query(sql: str, is_transactional: bool = False) -> Dict[str, Any]:
+    """Classify SQL semantics for parser, logic tree, and RAG metadata."""
+    query = " ".join((sql or "").strip().split())
+    upper = query.upper()
+    aggregations = [
+        {"function": function_name, "field": match.group(1).strip()}
+        for function_name in AGGREGATION_FUNCTIONS
+        for match in re.finditer(rf"\b{function_name}\s*\(\s*([^)]+)\)", query, flags=re.IGNORECASE)
+    ]
+
+    if aggregations:
+        semantic_type = "AGGREGATION"
+    elif re.search(r"\bselect\b.*\binto\b", query, flags=re.IGNORECASE | re.DOTALL):
+        semantic_type = "SINGLE_ROW"
+    elif re.match(r"\s*(insert|update|delete|merge)\b", query, flags=re.IGNORECASE):
+        semantic_type = "DML"
+    elif re.search(r"\bcursor\b|\bfor\s+\w+\s+in\s*\(", query, flags=re.IGNORECASE):
+        semantic_type = "CURSOR_LOOP"
+    else:
+        semantic_type = "QUERY" if upper.startswith("SELECT") else "UNKNOWN"
+
+    return {
+        "query": query,
+        "semantic_type": semantic_type,
+        "is_transactional": bool(is_transactional),
+        "has_join": bool(re.search(r"\bjoin\b", query, flags=re.IGNORECASE)),
+        "aggregations": aggregations,
+    }
+
+
+def enrich_sql_nodes(payload: Any, is_transactional: bool = False) -> Any:
+    """Attach semantic metadata to dict/list structures containing SQL nodes."""
+    if isinstance(payload, list):
+        return [enrich_sql_nodes(item, is_transactional) for item in payload]
+    if not isinstance(payload, dict):
+        return payload
+
+    node_type = str(payload.get("type", "")).upper()
+    next_transactional = is_transactional or node_type == "TRANSACTION"
+    if node_type == "SQL":
+        query = str(payload.get("query") or payload.get("text") or "")
+        metadata = dict(payload.get("metadata") or {})
+        existing_transactional = bool(metadata.get("is_transactional", False))
+        metadata.update(classify_query(query, next_transactional or existing_transactional))
+        payload["metadata"] = metadata
+        payload["semantic_type"] = metadata["semantic_type"]
+        payload["is_transactional"] = metadata["is_transactional"]
+        payload["has_join"] = metadata["has_join"]
+
+    for key in ("body", "children", "then", "else", "exception"):
+        if key in payload:
+            payload[key] = enrich_sql_nodes(payload[key], next_transactional)
+    for key, value in list(payload.items()):
+        if key in {"metadata", "body", "children", "then", "else", "exception"}:
+            continue
+        if isinstance(value, (dict, list)):
+            payload[key] = enrich_sql_nodes(value, next_transactional)
+    return payload
+
 
 @dataclass
 class SemanticIssue:
@@ -70,6 +132,14 @@ class SemanticValidator:
 
     def __init__(self, package_name: str = "com.company.project"):
         self.package_name = package_name
+
+    def analyze(self, parse_output: Dict[str, Any]) -> Dict[str, Any]:
+        """Return parser output enriched with reusable SQL semantic annotations."""
+        enriched = enrich_sql_nodes(parse_output)
+        if isinstance(enriched, dict):
+            enriched.setdefault("semantic_annotations", [])
+            self._collect_semantic_annotations(enriched, enriched["semantic_annotations"])
+        return enriched
 
     def validate(
         self,
@@ -169,6 +239,29 @@ class SemanticValidator:
         if "".join(token).strip():
             count += 1
         return count
+
+    def _collect_semantic_annotations(self, payload: Any, annotations: List[Dict[str, Any]]) -> None:
+        if isinstance(payload, list):
+            for item in payload:
+                self._collect_semantic_annotations(item, annotations)
+            return
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("type", "")).upper() == "SQL":
+            annotations.append(
+                {
+                    "query": payload.get("query") or payload.get("text") or "",
+                    "semantic_type": payload.get("semantic_type")
+                    or (payload.get("metadata") or {}).get("semantic_type", "UNKNOWN"),
+                    "is_transactional": bool(
+                        payload.get("is_transactional")
+                        or (payload.get("metadata") or {}).get("is_transactional", False)
+                    ),
+                    "has_join": bool(payload.get("has_join") or (payload.get("metadata") or {}).get("has_join", False)),
+                }
+            )
+        for value in payload.values():
+            self._collect_semantic_annotations(value, annotations)
 
     def _split_call_arguments(self, args_blob: str) -> List[str]:
         args: List[str] = []

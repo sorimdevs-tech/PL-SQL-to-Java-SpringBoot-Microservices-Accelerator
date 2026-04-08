@@ -1,0 +1,57 @@
+[
+  {
+    "input": "SELECT SUM(price) INTO total FROM book;",
+    "type": "AGGREGATION",
+    "output": "@Query(\"SELECT COALESCE(SUM(b.price), 0) FROM BookEntity b\")\nBigDecimal getSumPrice();"
+  },
+  {
+    "input": "SELECT COUNT(*) INTO total_count FROM orders WHERE status = p_status;",
+    "type": "AGGREGATION",
+    "output": "@Query(\"SELECT COUNT(o) FROM OrdersEntity o WHERE o.status = :status\")\nLong countByStatus(@Param(\"status\") String status);"
+  },
+  {
+    "input": "INSERT INTO book(id, title, price) VALUES (p_id, p_title, p_price);",
+    "type": "DML",
+    "output": "BookEntity entity = new BookEntity();\nentity.setId(pId);\nentity.setTitle(pTitle);\nentity.setPrice(pPrice);\nbookRepository.save(entity);"
+  },
+  {
+    "input": "UPDATE book SET price = p_price WHERE id = p_id;",
+    "type": "DML",
+    "output": "BookEntity entity = bookRepository.findById(pId).orElseThrow();\nentity.setPrice(pPrice);\nbookRepository.save(entity);"
+  },
+  {
+    "input": "DELETE FROM book WHERE id = p_id;",
+    "type": "DML",
+    "output": "bookRepository.deleteById(pId);"
+  },
+  {
+    "input": "SELECT title INTO v_title FROM book WHERE id = p_id;",
+    "type": "SINGLE_ROW",
+    "output": "@Query(\"SELECT b.title FROM BookEntity b WHERE b.id = :id\")\nString findTitleById(@Param(\"id\") Long id);"
+  },
+  {
+    "input": "SELECT * FROM book WHERE author_id = p_author_id;",
+    "type": "SINGLE_ROW",
+    "output": "@Query(\"SELECT b FROM BookEntity b WHERE b.authorId = :authorId\")\nList<BookEntity> findByAuthorId(@Param(\"authorId\") Long authorId);"
+  },
+  {
+    "input": "SELECT b.title, a.name FROM book b JOIN author a ON a.id = b.author_id WHERE a.id = p_author_id;",
+    "type": "SINGLE_ROW",
+    "output": "@Query(\"SELECT b FROM BookEntity b JOIN b.author a WHERE a.id = :authorId\")\nList<BookEntity> findBooksByAuthor(@Param(\"authorId\") Long authorId);"
+  },
+  {
+    "input": "FOR rec IN (SELECT * FROM book WHERE status = 'NEW') LOOP UPDATE book SET status = 'DONE' WHERE id = rec.id; END LOOP;",
+    "type": "CURSOR_LOOP",
+    "output": "List<BookEntity> rows = bookRepository.findByStatus(\"NEW\");\nfor (BookEntity rec : rows) {\n    rec.setStatus(\"DONE\");\n    bookRepository.save(rec);\n}"
+  },
+  {
+    "input": "CURSOR c_books IS SELECT id, price FROM book; FOR rec IN c_books LOOP total := total + rec.price; END LOOP;",
+    "type": "CURSOR_LOOP",
+    "output": "List<BookEntity> rows = bookRepository.findAll();\nfor (BookEntity rec : rows) {\n    total = total.add(rec.getPrice());\n}"
+  },
+  {
+    "input": "MERGE INTO book b USING incoming_book i ON (b.id = i.id) WHEN MATCHED THEN UPDATE SET b.price = i.price WHEN NOT MATCHED THEN INSERT (id, price) VALUES (i.id, i.price);",
+    "type": "DML",
+    "output": "Optional<BookEntity> existing = bookRepository.findById(incoming.getId());\nBookEntity entity = existing.orElseGet(BookEntity::new);\nentity.setId(incoming.getId());\nentity.setPrice(incoming.getPrice());\nbookRepository.save(entity);"
+  }
+]

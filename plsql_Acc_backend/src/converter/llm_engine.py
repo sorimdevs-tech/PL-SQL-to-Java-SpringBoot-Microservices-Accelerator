@@ -1251,6 +1251,7 @@ class LLMConversionEngine:
                     'requires_skip_locked': False,
                     'aggregation_columns': [],
                     'cursor_filters': [],
+                    'rag_examples': [],
                 }
 
             for table_name, operations in (unit.get('operations_by_table') or {}).items():
@@ -1274,6 +1275,9 @@ class LLMConversionEngine:
                         spec['lookup_key_variants'].append(unit_lookup_keys)
                 spec['requires_upsert'] = spec['requires_upsert'] or ('MERGE' in spec['operations'])
                 spec['requires_skip_locked'] = spec['requires_skip_locked'] or (normalized_table in skip_locked_tables)
+                for example in unit.get('rag_examples') or []:
+                    if example not in spec['rag_examples']:
+                        spec['rag_examples'].append(example)
             for upsert in semantic_upserts:
                 table_name = str(upsert.get('table', '')).upper()
                 if not table_name:
@@ -1342,6 +1346,7 @@ class LLMConversionEngine:
                 'requires_skip_locked': spec['requires_skip_locked'],
                 'aggregation_columns': spec['aggregation_columns'],
                 'cursor_filters': spec['cursor_filters'],
+                'rag_examples': spec.get('rag_examples', [])[:5],
             }
             
             entities_info = {}
@@ -1390,6 +1395,9 @@ INPUT:
 {semantic_model}
 {entities_info}
 {metadata}
+
+RETRIEVED RAG CONVERSION EXAMPLES:
+{semantic_model.get('rag_examples', [])}
 
 OUTPUT:
 - Valid Spring Data JPA interfaces
