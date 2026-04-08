@@ -615,7 +615,11 @@ class PLSQLModernizationPipeline:
                 dependency_graph['tables'] = ddl_tables
                 logger.info(f"LCE-FIX: enriched dependency_graph with {len(ddl_tables)} DDL tables: {ddl_tables}")
 
-        return await self.llm_engine.convert(merged_ast, dependency_graph)
+        return await self.llm_engine.convert(
+            merged_ast,
+            dependency_graph,
+            metadata_provider=self.table_metadata_provider,
+        )
 
     def _merge_ast_results(self, ast_results: Dict[str, Any]) -> Dict[str, Any]:
         """Merge file-level AST results into a single AST for conversion."""

@@ -73,14 +73,14 @@ class SQLToJPAConverter:
         """
         logger.info(f"Converting {len(sql_queries)} SQL queries to JPA entities...")
         
-        # Analyze tables and columns from SQL queries
+        # Prefer DDL-first parsing (CREATE TABLE / ALTER TABLE) and then enrich from DML
         table_info = self._analyze_tables_from_queries(sql_queries)
         
         # Generate entities
         entities = {}
         for table_name, table_data in table_info.items():
             entity_code = self._generate_entity_class(table_data)
-            entity_filename = f"{table_name}Entity.java"
+            entity_filename = f"{self._to_camel_case(table_name, capitalize=True)}.java"
             entities[entity_filename] = entity_code
         
         logger.info(f"Generated {len(entities)} JPA entity classes")
@@ -115,7 +115,7 @@ class SQLToJPAConverter:
     
     def _analyze_tables_from_queries(self, sql_queries: List[Dict[str, Any]]) -> Dict[str, TableInfo]:
         """Analyze tables and columns from SQL queries"""
-        table_info = {}
+        table_info = self._parse_schema_from_ddl(sql_queries)
         
         for query in sql_queries:
             query_text = query.get('query', '')
@@ -123,38 +123,228 @@ class SQLToJPAConverter:
             
             # Analyze each table in the query
             for table in tables:
-                if table not in table_info:
-                    table_info[table] = TableInfo(name=table)
+                normalized_table = self._normalize_sql_identifier(table)
+                if normalized_table not in table_info:
+                    table_info[normalized_table] = TableInfo(name=normalized_table)
                 
                 # Extract column information
-                columns = self._extract_columns_from_query(query_text, table)
+                columns = self._extract_columns_from_query(query_text, normalized_table)
                 for col_info in columns:
                     # Check if column already exists
-                    existing_col = next((c for c in table_info[table].columns if c.name == col_info.name), None)
+                    existing_col = next((c for c in table_info[normalized_table].columns if c.name.lower() == col_info.name.lower()), None)
                     if existing_col:
                         # Update existing column info
                         existing_col.nullable = existing_col.nullable and col_info.nullable
                         if col_info.primary_key:
                             existing_col.primary_key = True
-                            if col_info.name not in table_info[table].primary_keys:
-                                table_info[table].primary_keys.append(col_info.name)
+                            if col_info.name.upper() not in table_info[normalized_table].primary_keys:
+                                table_info[normalized_table].primary_keys.append(col_info.name.upper())
                     else:
                         # Add new column
-                        table_info[table].columns.append(col_info)
-                        if col_info.primary_key and col_info.name not in table_info[table].primary_keys:
-                            table_info[table].primary_keys.append(col_info.name)
+                        table_info[normalized_table].columns.append(col_info)
+                        if col_info.primary_key and col_info.name.upper() not in table_info[normalized_table].primary_keys:
+                            table_info[normalized_table].primary_keys.append(col_info.name.upper())
         
         # Analyze relationships
         relationships = self._analyze_relationships(sql_queries)
         for rel in relationships:
             # Update foreign key information
-            if rel.source_column in [c.name for c in table_info[rel.source_table].columns]:
-                for col in table_info[rel.source_table].columns:
-                    if col.name == rel.source_column:
+            source_table = self._normalize_sql_identifier(rel.source_table)
+            if source_table in table_info:
+                if rel.source_column in [c.name for c in table_info[source_table].columns]:
+                    for col in table_info[source_table].columns:
+                        if col.name == rel.source_column:
+                            col.foreign_key = True
+                            break
+
+        return table_info
+
+    def _parse_schema_from_ddl(self, sql_queries: List[Dict[str, Any]]) -> Dict[str, TableInfo]:
+        """Parse CREATE TABLE / ALTER TABLE metadata into TableInfo."""
+        tables: Dict[str, TableInfo] = {}
+
+        for query in sql_queries:
+            raw_sql = query.get('query', '') or ''
+            if not raw_sql:
+                continue
+            sql = raw_sql.strip().rstrip(';')
+            if not re.match(r'^\s*CREATE\s+TABLE\b', sql, re.IGNORECASE):
+                continue
+
+            match = re.search(r'CREATE\s+TABLE\s+([A-Za-z0-9_.$"]+)\s*\((.*)\)\s*$', sql, re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+
+            table_name = self._normalize_sql_identifier(match.group(1))
+            table = tables.setdefault(table_name, TableInfo(name=table_name))
+            definitions = self._split_sql_definitions(match.group(2))
+
+            for definition in definitions:
+                part = definition.strip().rstrip(',')
+                if not part:
+                    continue
+
+                pk_match = re.search(r'PRIMARY\s+KEY\s*\(([^)]+)\)', part, re.IGNORECASE)
+                if pk_match and re.match(r'^(CONSTRAINT\s+\w+\s+)?PRIMARY\s+KEY', part, re.IGNORECASE):
+                    for pk_col in self._split_csv(pk_match.group(1)):
+                        normalized_pk = self._normalize_sql_identifier(pk_col)
+                        if normalized_pk not in table.primary_keys:
+                            table.primary_keys.append(normalized_pk)
+                    continue
+
+                fk_match = re.search(
+                    r'(?:CONSTRAINT\s+([A-Za-z0-9_.$"]+)\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+([A-Za-z0-9_.$"]+)\s*\(([^)]+)\)',
+                    part,
+                    re.IGNORECASE
+                )
+                if fk_match:
+                    source_cols = self._split_csv(fk_match.group(2))
+                    target_table = self._normalize_sql_identifier(fk_match.group(3))
+                    target_cols = self._split_csv(fk_match.group(4))
+                    for idx, source_col in enumerate(source_cols):
+                        src = self._normalize_sql_identifier(source_col)
+                        tgt = self._normalize_sql_identifier(target_cols[idx] if idx < len(target_cols) else target_cols[0])
+                        table.foreign_keys.append({
+                            "column": src,
+                            "target_table": target_table,
+                            "target_column": tgt
+                        })
+                    continue
+
+                col = self._parse_column_definition(part)
+                if col:
+                    existing = next((c for c in table.columns if c.name.lower() == col.name.lower()), None)
+                    if existing is None:
+                        table.columns.append(col)
+                    else:
+                        existing.nullable = existing.nullable and col.nullable
+                        existing.primary_key = existing.primary_key or col.primary_key
+                        existing.foreign_key = existing.foreign_key or col.foreign_key
+                        existing.unique = existing.unique or col.unique
+                        existing.length = existing.length or col.length
+                        existing.precision = existing.precision or col.precision
+                        existing.scale = existing.scale if existing.scale is not None else col.scale
+
+                    if col.primary_key and col.name not in table.primary_keys:
+                        table.primary_keys.append(col.name)
+
+                    if col.foreign_key and "target_table" in part.lower():
+                        pass
+
+        # Parse ALTER TABLE ... FOREIGN KEY ...
+        for query in sql_queries:
+            raw_sql = query.get('query', '') or ''
+            sql = raw_sql.strip().rstrip(';')
+            if not re.match(r'^\s*ALTER\s+TABLE\b', sql, re.IGNORECASE):
+                continue
+            fk_match = re.search(
+                r'ALTER\s+TABLE\s+([A-Za-z0-9_.$"]+)\s+ADD\s+(?:CONSTRAINT\s+[A-Za-z0-9_.$"]+\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+([A-Za-z0-9_.$"]+)\s*\(([^)]+)\)',
+                sql,
+                re.IGNORECASE | re.DOTALL
+            )
+            if not fk_match:
+                continue
+            source_table = self._normalize_sql_identifier(fk_match.group(1))
+            target_table = self._normalize_sql_identifier(fk_match.group(3))
+            source_cols = self._split_csv(fk_match.group(2))
+            target_cols = self._split_csv(fk_match.group(4))
+            table = tables.setdefault(source_table, TableInfo(name=source_table))
+            for idx, source_col in enumerate(source_cols):
+                src = self._normalize_sql_identifier(source_col)
+                tgt = self._normalize_sql_identifier(target_cols[idx] if idx < len(target_cols) else target_cols[0])
+                table.foreign_keys.append({
+                    "column": src,
+                    "target_table": target_table,
+                    "target_column": tgt
+                })
+                for col in table.columns:
+                    if col.name == src:
                         col.foreign_key = True
                         break
-        
-        return table_info
+
+        # Mark FK/PK flags consistently
+        for table in tables.values():
+            for col in table.columns:
+                if col.name in table.primary_keys:
+                    col.primary_key = True
+                if any(fk.get("column") == col.name for fk in table.foreign_keys):
+                    col.foreign_key = True
+
+        return tables
+
+    def _split_sql_definitions(self, ddl_body: str) -> List[str]:
+        parts: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        for ch in ddl_body:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth = max(depth - 1, 0)
+            if ch == ',' and depth == 0:
+                segment = ''.join(buf).strip()
+                if segment:
+                    parts.append(segment)
+                buf = []
+                continue
+            buf.append(ch)
+        tail = ''.join(buf).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _split_csv(self, text: str) -> List[str]:
+        return [self._normalize_sql_identifier(v) for v in text.split(',') if v.strip()]
+
+    def _normalize_sql_identifier(self, name: str) -> str:
+        cleaned = (name or "").strip().strip('"')
+        if "." in cleaned:
+            cleaned = cleaned.split(".")[-1]
+        return cleaned.upper()
+
+    def _parse_column_definition(self, definition: str) -> Optional[ColumnInfo]:
+        match = re.match(
+            r'([A-Za-z0-9_.$"]+)\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)*(?:\s*\([^)]*\))?)\s*(.*)$',
+            definition.strip(),
+            re.IGNORECASE
+        )
+        if not match:
+            return None
+        column_name = self._normalize_sql_identifier(match.group(1))
+        sql_type = match.group(2).strip().upper()
+        constraints = (match.group(3) or "").upper()
+
+        length = None
+        precision = None
+        scale = None
+        type_args_match = re.search(r'\(([^)]*)\)', sql_type)
+        if type_args_match:
+            args = [a.strip() for a in type_args_match.group(1).split(',')]
+            base_type = sql_type.split('(')[0].strip()
+            if base_type in {"VARCHAR2", "VARCHAR", "CHAR", "NCHAR", "NVARCHAR2"} and args:
+                length = int(args[0]) if args[0].isdigit() else None
+            elif base_type in {"NUMBER", "NUMERIC", "DECIMAL"}:
+                if args and args[0].isdigit():
+                    precision = int(args[0])
+                if len(args) > 1 and args[1].isdigit():
+                    scale = int(args[1])
+
+        nullable = "NOT NULL" not in constraints
+        primary_key = "PRIMARY KEY" in constraints
+        unique = "UNIQUE" in constraints
+        foreign_key = "REFERENCES" in constraints
+
+        return ColumnInfo(
+            name=column_name,
+            data_type=sql_type,
+            nullable=nullable,
+            primary_key=primary_key,
+            foreign_key=foreign_key,
+            unique=unique,
+            length=length,
+            precision=precision,
+            scale=scale
+        )
     
     def _extract_columns_from_query(self, query_text: str, table_name: str) -> List[ColumnInfo]:
         """Extract column information from SQL query"""
@@ -227,14 +417,12 @@ class SQLToJPAConverter:
             return 'String'
         
         # Date/time columns
-        if any(date_word in column_name_lower for date_word in ['date', 'time', 'created', 'updated']):
+        if any(date_word in column_name_lower for date_word in ['created', 'updated', 'timestamp', 'datetime']):
             return 'LocalDateTime'
-        
-        if any(date_word in column_name_lower for date_word in ['date', 'time', 'created', 'updated']):
-            return 'LocalTime'
-        
-        if any(date_word in column_name_lower for date_word in ['date', 'time', 'created', 'updated']):
+        if any(date_word in column_name_lower for date_word in ['_date', 'birthdate', 'start_date', 'end_date', 'date']):
             return 'LocalDate'
+        if any(date_word in column_name_lower for date_word in ['_time', 'time']):
+            return 'LocalTime'
         
         # Numeric columns
         if any(num_word in column_name_lower for num_word in ['amount', 'price', 'count', 'number', 'qty']):
@@ -344,8 +532,10 @@ public class {entity_name} {{
     def _generate_entity_imports(self, table_info: TableInfo) -> str:
         """Generate imports for entity class"""
         imports = [
-            'import javax.persistence.*;',
+            'import jakarta.persistence.*;',
             'import java.time.LocalDateTime;',
+            'import java.time.LocalDate;',
+            'import java.time.LocalTime;',
             'import java.math.BigDecimal;',
             'import java.util.Objects;'
         ]
@@ -354,9 +544,6 @@ public class {entity_name} {{
         has_relationships = any(col.foreign_key for col in table_info.columns)
         if has_relationships:
             imports.append('import java.util.List;')
-            imports.append('import javax.persistence.OneToMany;')
-            imports.append('import javax.persistence.ManyToOne;')
-            imports.append('import javax.persistence.JoinColumn;')
         
         return '\n'.join(imports)
     
@@ -374,16 +561,27 @@ public class {entity_name} {{
         fields = []
         
         for col in table_info.columns:
-            # Generate column annotation
-            col_annotation = f"@Column(name = \"{col.name}\""
+            annotations: List[str] = []
             if col.primary_key:
+                annotations.append("@Id")
+
+            # Generate column annotation with SQL-accurate attributes
+            col_annotation = f"@Column(name = \"{col.name}\""
+            if not col.nullable:
                 col_annotation += ", nullable = false"
             if col.unique:
                 col_annotation += ", unique = true"
+            if col.length:
+                col_annotation += f", length = {col.length}"
+            if col.precision:
+                col_annotation += f", precision = {col.precision}"
+            if col.scale is not None:
+                col_annotation += f", scale = {col.scale}"
             col_annotation += ")"
+            annotations.append(col_annotation)
             
             # Generate field declaration
-            field_type = self.type_mappings.get(col.data_type, col.data_type)
+            field_type = self._map_sql_type_to_java(col.data_type)
             field_name = self._to_camel_case(col.name)
             
             field_declaration = f"    private {field_type} {field_name};"
@@ -391,7 +589,25 @@ public class {entity_name} {{
             # Add getter/setter comments
             comment = f"    // {col.name} column"
             
-            fields.extend([f"    {col_annotation}", f"    {field_declaration}", f"    {comment}", ""])
+            for ann in annotations:
+                fields.append(f"    {ann}")
+            fields.extend([field_declaration, comment, ""])
+
+        # Add relationship helpers while keeping raw FK fields intact.
+        for fk in table_info.foreign_keys:
+            source_col = self._normalize_sql_identifier(fk.get("column", ""))
+            target_table = self._normalize_sql_identifier(fk.get("target_table", ""))
+            if not source_col or not target_table:
+                continue
+            relation_entity = self._to_camel_case(target_table, capitalize=True)
+            relation_field = self._to_camel_case(target_table)
+            fields.extend([
+                "    @ManyToOne(fetch = FetchType.LAZY)",
+                f"    @JoinColumn(name = \"{source_col}\", referencedColumnName = \"{fk.get('target_column', 'ID')}\", insertable = false, updatable = false)",
+                f"    private {relation_entity} {relation_field};",
+                f"    // relationship via {source_col}",
+                ""
+            ])
         
         return '\n'.join(fields)
     
@@ -407,7 +623,7 @@ public class {entity_name} {{
             assignment_list = []
             
             for col in table_info.columns:
-                field_type = self.type_mappings.get(col.data_type, col.data_type)
+                field_type = self._map_sql_type_to_java(col.data_type)
                 field_name = self._to_camel_case(col.name)
                 param_list.append(f"{field_type} {field_name}")
                 assignment_list.append(f"        this.{field_name} = {field_name};")
@@ -426,7 +642,7 @@ public class {entity_name} {{
         methods = []
         
         for col in table_info.columns:
-            field_type = self.type_mappings.get(col.data_type, col.data_type)
+            field_type = self._map_sql_type_to_java(col.data_type)
             field_name = self._to_camel_case(col.name)
             method_name = field_name[0].upper() + field_name[1:]
             
@@ -534,6 +750,39 @@ import com.company.project.entity.*;"""
                 return f"findBy{self._to_camel_case(columns[0], capitalize=True)}"
         
         return f"find{query_type}Query"
+
+    def _map_sql_type_to_java(self, sql_type: str) -> str:
+        """Map SQL column type text to Java/JPA field type."""
+        normalized = (sql_type or "").upper().strip()
+        if not normalized:
+            return "String"
+        base = normalized.split("(")[0].strip()
+
+        if base in {"VARCHAR2", "VARCHAR", "CHAR", "NCHAR", "NVARCHAR2", "CLOB", "NCLOB", "TEXT"}:
+            return "String"
+        if base in {"DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "DATETIME"}:
+            return "LocalDateTime"
+        if base in {"TIME"}:
+            return "LocalTime"
+        if base in {"BOOLEAN"}:
+            return "Boolean"
+        if base in {"BINARY_FLOAT", "FLOAT", "REAL"}:
+            return "Float"
+        if base in {"BINARY_DOUBLE", "DOUBLE"}:
+            return "Double"
+        if base in {"NUMBER", "NUMERIC", "DECIMAL"}:
+            args_match = re.search(r'\(([^)]*)\)', normalized)
+            if args_match:
+                args = [a.strip() for a in args_match.group(1).split(',')]
+                if len(args) > 1:
+                    return "BigDecimal"
+                if args and args[0].isdigit():
+                    precision = int(args[0])
+                    return "Long" if precision >= 10 else "Integer"
+            return "Long"
+        if "INT" in base:
+            return "Long"
+        return self.type_mappings.get(base, "String")
     
     def _convert_sql_to_jpql(self, sql_query: str, entity_name: str) -> str:
         """Convert SQL query to JPQL"""
@@ -574,6 +823,28 @@ import com.company.project.entity.*;"""
     def _get_type_mappings(self) -> Dict[str, str]:
         """Get SQL to Java type mappings"""
         return {
+            'VARCHAR2': 'String',
+            'VARCHAR': 'String',
+            'CHAR': 'String',
+            'NCHAR': 'String',
+            'NVARCHAR2': 'String',
+            'CLOB': 'String',
+            'NCLOB': 'String',
+            'TEXT': 'String',
+            'NUMBER': 'Long',
+            'NUMERIC': 'BigDecimal',
+            'DECIMAL': 'BigDecimal',
+            'INTEGER': 'Integer',
+            'INT': 'Long',
+            'SMALLINT': 'Integer',
+            'BIGINT': 'Long',
+            'FLOAT': 'Float',
+            'DOUBLE': 'Double',
+            'REAL': 'Float',
+            'DATE': 'LocalDateTime',
+            'TIMESTAMP': 'LocalDateTime',
+            'TIME': 'LocalTime',
+            'BOOLEAN': 'Boolean',
             'String': 'String',
             'Long': 'Long',
             'Integer': 'Integer',

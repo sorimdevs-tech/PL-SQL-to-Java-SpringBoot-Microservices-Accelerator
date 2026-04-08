@@ -84,6 +84,7 @@ class LogicExtractionReport:
     procedure_name: str
     total_logic_elements: int
     elements: List[LogicElement] = field(default_factory=list)
+    structured_elements: List[Dict[str, Any]] = field(default_factory=list)
     control_flow_graph: Dict[str, ControlFlowNode] = field(default_factory=dict)
     data_dependencies: Dict[str, Set[str]] = field(default_factory=dict)
     critical_warning: str = ""
@@ -105,11 +106,12 @@ class LogicExtractor:
         """
         [LEE-1] Extract all logic elements from PL/SQL procedure
         """
-        report = LogicExtractionReport(procedure_name=procedure_name)
+        report = LogicExtractionReport(procedure_name=procedure_name, total_logic_elements=0)
         
         # Stage 1: Identify high-level control structures
         logger.info(f"[LEE-1] Extracting logic from {procedure_name}")
         self.elements = self._extract_top_level_logic(procedure_source)
+        structured_elements = self._extract_structured_logic(procedure_source)
         
         # Stage 2: Build control flow graph
         logger.info("[LEE-2] Building control flow graph")
@@ -124,6 +126,7 @@ class LogicExtractor:
         
         # Stage 5: Build report
         report.elements = self.elements
+        report.structured_elements = structured_elements
         report.control_flow_graph = self.control_flow
         report.data_dependencies = self.data_flow
         report.total_logic_elements = len(self.elements)
@@ -172,6 +175,125 @@ class LogicExtractor:
         elements.extend(self._extract_audit_operations(source))
         
         return elements
+
+    def _extract_structured_logic(self, source: str) -> List[Dict[str, Any]]:
+        """Extract structured logic elements for SQL intent and control flow"""
+        structured = []
+        
+        # SQL operations
+        structured.extend(self._extract_sql_operations(source))
+        
+        # Aggregations
+        structured.extend(self._extract_structured_aggregations(source))
+        
+        # IF conditions
+        structured.extend(self._extract_structured_conditionals(source))
+        
+        # Loops
+        structured.extend(self._extract_structured_loops(source))
+        
+        return structured
+
+    def _extract_sql_operations(self, source: str) -> List[Dict[str, Any]]:
+        """Extract SQL operations with types"""
+        operations = []
+        
+        # INSERT
+        insert_pattern = re.compile(r'\bINSERT\s+INTO\b', re.IGNORECASE)
+        for match in insert_pattern.finditer(source):
+            operations.append({
+                "type": "insert",
+                "line": source[:match.start()].count('\n') + 1
+            })
+        
+        # UPDATE
+        update_pattern = re.compile(r'\bUPDATE\b', re.IGNORECASE)
+        for match in update_pattern.finditer(source):
+            operations.append({
+                "type": "update",
+                "line": source[:match.start()].count('\n') + 1
+            })
+        
+        # DELETE
+        delete_pattern = re.compile(r'\bDELETE\s+FROM\b', re.IGNORECASE)
+        for match in delete_pattern.finditer(source):
+            operations.append({
+                "type": "delete",
+                "line": source[:match.start()].count('\n') + 1
+            })
+        
+        # SELECT
+        select_pattern = re.compile(r'\bSELECT\b', re.IGNORECASE)
+        for match in select_pattern.finditer(source):
+            operations.append({
+                "type": "select",
+                "line": source[:match.start()].count('\n') + 1
+            })
+        
+        return operations
+
+    def _extract_structured_aggregations(self, source: str) -> List[Dict[str, Any]]:
+        """Extract aggregation functions"""
+        aggregations = []
+        agg_functions = ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX']
+        
+        for func in agg_functions:
+            pattern = re.compile(rf'\b{func}\s*\(\s*([^)]+)\s*\)', re.IGNORECASE)
+            for match in pattern.finditer(source):
+                field = match.group(1).strip()
+                aggregations.append({
+                    "type": "aggregation",
+                    "function": func.upper(),
+                    "field": field,
+                    "line": source[:match.start()].count('\n') + 1
+                })
+        
+        return aggregations
+
+    def _extract_structured_conditionals(self, source: str) -> List[Dict[str, Any]]:
+        """Extract IF conditions"""
+        conditionals = []
+        
+        if_pattern = re.compile(r'\bIF\s+(.*?)\s+THEN\b', re.IGNORECASE | re.DOTALL)
+        for match in if_pattern.finditer(source):
+            condition = match.group(1).strip()
+            conditionals.append({
+                "type": "if",
+                "condition": condition,
+                "line": source[:match.start()].count('\n') + 1
+            })
+        
+        return conditionals
+
+    def _extract_structured_loops(self, source: str) -> List[Dict[str, Any]]:
+        """Extract loop structures"""
+        loops = []
+        
+        # FOR loops
+        for_pattern = re.compile(r'\bFOR\s+(\w+)\s+IN\s+(.*?)\s+LOOP\b', re.IGNORECASE | re.DOTALL)
+        for match in for_pattern.finditer(source):
+            variable = match.group(1)
+            range_expr = match.group(2).strip()
+            loops.append({
+                "type": "loop",
+                "kind": "for",
+                "variable": variable,
+                "range": range_expr,
+                "line": source[:match.start()].count('\n') + 1
+            })
+        
+        # WHILE loops
+        while_pattern = re.compile(r'\bWHILE\s+(.*?)\s+LOOP\b', re.IGNORECASE | re.DOTALL)
+        for match in while_pattern.finditer(source):
+            condition = match.group(1).strip()
+            loops.append({
+                "type": "loop",
+                "kind": "while",
+                "condition": condition,
+                "line": source[:match.start()].count('\n') + 1
+            })
+        
+        return loops
 
     def _extract_cursor_operations(self, source: str) -> List[LogicElement]:
         """[LEE-1] Extract CURSOR declarations and usage patterns"""
@@ -333,30 +455,22 @@ class LogicExtractor:
     def _extract_aggregations(self, source: str) -> List[LogicElement]:
         """[LEE-1] Extract SUM, COUNT, AVG, MIN, MAX operations"""
         elements = []
+        agg_functions = ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX']
         
-        # Pattern: SELECT ... SUM(...) or COUNT(...) etc INTO variable
-        agg_pattern = re.compile(
-            r"SELECT\s+(.*?)(?:SUM|COUNT|AVG|MIN|MAX)\s*\([^)]*\)(.*?)\s+INTO\s+(\w+)",
-            re.IGNORECASE | re.DOTALL
-        )
-        
-        for match in agg_pattern.finditer(source):
-            select_clause = match.group(1).strip()
-            target_var = match.group(3).strip()
-            
-            agg_type = "SUM" if "SUM" in select_clause.upper() else "COUNT"
-            
-            element = LogicElement(
-                logic_type=LogicType.AGGREGATION,
-                name=f"{agg_type.lower()}_{target_var}",
-                description=f"{agg_type} aggregation into {target_var}",
-                source_code=match.group(0),
-                line_start=source[:match.start()].count('\n'),
-                line_end=source[:match.end()].count('\n'),
-                is_critical=True,
-                variables_assigned={target_var}
-            )
-            elements.append(element)
+        for func in agg_functions:
+            pattern = re.compile(rf'\b{func}\s*\(\s*([^)]+)\s*\)', re.IGNORECASE)
+            for match in pattern.finditer(source):
+                field = match.group(1).strip()
+                element = LogicElement(
+                    logic_type=LogicType.AGGREGATION,
+                    name=f"{func.lower()}_{field.replace('.', '_')}",
+                    description=f"{func} aggregation on {field}",
+                    source_code=match.group(0),
+                    line_start=source[:match.start()].count('\n'),
+                    line_end=source[:match.end()].count('\n'),
+                    is_critical=True
+                )
+                elements.append(element)
         
         return elements
 

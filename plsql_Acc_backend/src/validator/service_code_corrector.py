@@ -13,6 +13,7 @@ and applies corrections to ensure:
 
 import re
 import json
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
@@ -222,6 +223,39 @@ class ServiceCodeValidator:
 
 class ServiceCodeCorrector:
     """Applies corrections to generated Java service code"""
+
+    @staticmethod
+    def correct_service_code_logic(
+        code: str,
+        repositories: Optional[Dict[str, str]] = None,
+        entity_name: str = "",
+        lookup_keys: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Repair invalid Java service code using actual repository contracts.
+
+        Fixes:
+        1. Invalid repository method names such as sumBy...
+        2. Mismatched method names/casing versus repository declarations
+        3. Placeholder or missing repository method calls
+        4. Missing try/catch blocks around service methods
+        """
+        corrected = ServiceCodeCorrector.correct_plsql_syntax(code)
+        repository_contracts = ServiceCodeCorrector._extract_repository_contracts(repositories or {})
+        corrected = ServiceCodeCorrector._repair_repository_calls(
+            corrected,
+            repository_contracts,
+            entity_name=entity_name,
+            lookup_keys=lookup_keys or [],
+        )
+        corrected = ServiceCodeCorrector._ensure_repository_invocation(
+            corrected,
+            repository_contracts,
+            entity_name=entity_name,
+            lookup_keys=lookup_keys or [],
+        )
+        corrected = ServiceCodeCorrector.ensure_try_catch(corrected)
+        return corrected
     
     @staticmethod
     def correct_return_type(
@@ -266,21 +300,400 @@ class ServiceCodeCorrector:
     def fill_placeholder_repository_methods(
         code: str,
         entity_name: str,
-        lookup_keys: List[str]
+        lookup_keys: List[str],
+        repositories: Optional[Dict[str, str]] = None,
     ) -> str:
         """Fill in placeholder repository method calls"""
-        # Replace findOne(...) with actual method call
-        if lookup_keys and entity_name:
-            key_var = lookup_keys[0] if lookup_keys else 'id'
-            key_getter = f'get{key_var[0].upper()}{key_var[1:]}'
-            
-            code = re.sub(
-                r'findOne\(\.\.\.\)',
-                f'findBy{key_var[0].upper()}{key_var[1:]}({key_var})',
-                code
+        return ServiceCodeCorrector.correct_service_code_logic(
+            code,
+            repositories=repositories,
+            entity_name=entity_name,
+            lookup_keys=lookup_keys,
+        )
+
+    @staticmethod
+    def ensure_try_catch(code: str) -> str:
+        """Wrap public method bodies in try/catch when exception handling is missing."""
+        search_pos = 0
+        while True:
+            match = re.search(
+                r'((?:public|protected)\s+(?!class\b)[\w<>\[\],\s]+\s+\w+\s*\([^)]*\)\s*\{)',
+                code[search_pos:],
+                flags=re.MULTILINE,
             )
-        
+            if not match:
+                return code
+
+            method_start = search_pos + match.start(1)
+            brace_start = code.find('{', method_start)
+            brace_end = ServiceCodeCorrector._find_matching_brace(code, brace_start)
+            if brace_start == -1 or brace_end == -1:
+                return code
+
+            method_body = code[brace_start + 1:brace_end]
+            if re.search(r'\btry\s*\{', method_body) and re.search(r'\bcatch\s*\(', method_body):
+                search_pos = brace_end + 1
+                continue
+
+            indented_body = ServiceCodeCorrector._indent_block(method_body.strip('\n'), 8)
+            if indented_body:
+                indented_body = "\n" + indented_body + "\n    "
+            wrapped = (
+                "{\n"
+                "        try {"
+                f"{indented_body}"
+                "        } catch (Exception e) {\n"
+                '            throw new RuntimeException("Service operation failed", e);\n'
+                "        }\n"
+                "    }"
+            )
+            code = code[:brace_start] + wrapped + code[brace_end + 1:]
+            search_pos = method_start + len(wrapped)
+
+    @staticmethod
+    def _extract_repository_contracts(repositories: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+        """Extract repository method names and signatures from generated repository interfaces."""
+        contracts: Dict[str, Dict[str, Any]] = {}
+        method_pattern = re.compile(
+            r"^\s*(?:public\s+)?(?:default\s+)?[\w<>\[\], ?.]+\s+([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*;",
+            flags=re.MULTILINE,
+        )
+
+        for filename, repo_code in (repositories or {}).items():
+            interface_name = Path(filename).stem
+            methods: Dict[str, List[int]] = {}
+            for match in method_pattern.finditer(repo_code or ""):
+                method_name = match.group(1)
+                arg_count = ServiceCodeCorrector._count_method_parameters(match.group(2))
+                methods.setdefault(method_name, []).append(arg_count)
+            contracts[interface_name] = {
+                "methods": methods,
+                "code": repo_code or "",
+            }
+        return contracts
+
+    @staticmethod
+    def _repair_repository_calls(
+        code: str,
+        repository_contracts: Dict[str, Dict[str, Any]],
+        entity_name: str = "",
+        lookup_keys: Optional[List[str]] = None,
+    ) -> str:
+        """Rewrite invalid repository calls to match actual repository methods."""
+        repo_vars = ServiceCodeCorrector._extract_repository_variables(code)
+        if not repo_vars:
+            return code
+
+        call_pattern = re.compile(r'\b(\w+)\.(\w+)\s*\((.*?)\)', flags=re.DOTALL)
+        lookup_keys = lookup_keys or []
+        result: List[str] = []
+        last_end = 0
+
+        for match in call_pattern.finditer(code):
+            repo_var, method_name, arg_blob = match.group(1), match.group(2), match.group(3)
+            repo_type = repo_vars.get(repo_var)
+            contract = repository_contracts.get(repo_type or "")
+            if not contract:
+                continue
+
+            args = ServiceCodeCorrector._split_call_arguments(arg_blob)
+            replacement_method = ServiceCodeCorrector._choose_repository_method(
+                invalid_method=method_name,
+                args=args,
+                contract=contract,
+                entity_name=entity_name,
+                lookup_keys=lookup_keys,
+            )
+            if replacement_method == method_name:
+                continue
+
+            result.append(code[last_end:match.start()])
+            result.append(f"{repo_var}.{replacement_method}({arg_blob})")
+            last_end = match.end()
+
+        repaired = "".join(result) + code[last_end:]
+        repaired = ServiceCodeCorrector._repair_missing_parentheses(repaired, repo_vars, repository_contracts)
+        return repaired
+
+    @staticmethod
+    def _ensure_repository_invocation(
+        code: str,
+        repository_contracts: Dict[str, Dict[str, Any]],
+        entity_name: str = "",
+        lookup_keys: Optional[List[str]] = None,
+    ) -> str:
+        """Replace obvious placeholders/TODOs with safe repository calls when possible."""
+        repo_vars = ServiceCodeCorrector._extract_repository_variables(code)
+        if not repo_vars:
+            return code
+        if any(re.search(rf'\b{re.escape(repo_var)}\.\w+\s*\(', code) for repo_var in repo_vars):
+            return code
+
+        lookup_keys = lookup_keys or []
+        repo_var, repo_type = next(iter(repo_vars.items()))
+        contract = repository_contracts.get(repo_type or "")
+        if not contract:
+            return code
+
+        replacement = ServiceCodeCorrector._fallback_repository_call(
+            repo_var=repo_var,
+            contract=contract,
+            entity_name=entity_name,
+            lookup_keys=lookup_keys,
+        )
+        if not replacement:
+            return code
+
+        placeholder_pattern = re.compile(r'//\s*TODO[^\n]*|/\*\s*TODO[\s\S]*?\*/|return\s+null\s*;')
+        match = placeholder_pattern.search(code)
+        if not match:
+            return code
+        return code[:match.start()] + replacement + code[match.end():]
+
+    @staticmethod
+    def _extract_repository_variables(code: str) -> Dict[str, str]:
+        """Map repository field/variable names to repository types."""
+        repo_vars: Dict[str, str] = {}
+        for repo_type, repo_var in re.findall(
+            r'\b([A-Z]\w*Repository)\s+(\w+)\s*(?:;|[,)=])',
+            code,
+        ):
+            repo_vars[repo_var] = repo_type
+        return repo_vars
+
+    @staticmethod
+    def _choose_repository_method(
+        invalid_method: str,
+        args: List[str],
+        contract: Dict[str, Any],
+        entity_name: str = "",
+        lookup_keys: Optional[List[str]] = None,
+    ) -> str:
+        """Pick the closest valid repository method for an invalid call."""
+        methods: Dict[str, List[int]] = contract.get("methods", {})
+        if invalid_method in methods:
+            return invalid_method
+
+        arg_count = len(args)
+        lookup_keys = lookup_keys or []
+
+        exact_case_insensitive = next(
+            (method for method in methods if method.lower() == invalid_method.lower()),
+            None,
+        )
+        if exact_case_insensitive:
+            return exact_case_insensitive
+
+        if ServiceCodeCorrector._looks_like_invalid_aggregation_method(invalid_method):
+            aggregation = ServiceCodeCorrector._find_aggregation_method(methods, invalid_method, arg_count)
+            if aggregation:
+                return aggregation
+
+        preferred = {
+            "findOne": "findById" if arg_count == 1 and "findById" in methods else "",
+            "remove": "deleteById" if arg_count == 1 and "deleteById" in methods else "delete",
+            "update": "save" if "save" in methods else "",
+            "insert": "save" if "save" in methods else "",
+            "deleteByCondition": "deleteById" if arg_count == 1 and "deleteById" in methods else "delete",
+        }
+        for prefix, candidate in preferred.items():
+            if invalid_method == prefix or invalid_method.startswith(prefix):
+                if candidate and ServiceCodeCorrector._method_supports_arg_count(methods, candidate, arg_count):
+                    return candidate
+
+        if invalid_method.startswith("findBy"):
+            suffix = invalid_method[6:]
+            candidates = [
+                method for method, counts in methods.items()
+                if method.startswith("findBy") and arg_count in counts
+            ]
+            matched = ServiceCodeCorrector._best_suffix_match(suffix, candidates)
+            if matched:
+                return matched
+
+        close_matches = get_close_matches(invalid_method, list(methods.keys()), n=1, cutoff=0.6)
+        if close_matches and ServiceCodeCorrector._method_supports_arg_count(methods, close_matches[0], arg_count):
+            return close_matches[0]
+
+        fallback = ServiceCodeCorrector._fallback_repository_method(
+            methods=methods,
+            entity_name=entity_name,
+            lookup_keys=lookup_keys,
+            arg_count=arg_count,
+        )
+        return fallback or invalid_method
+
+    @staticmethod
+    def _find_aggregation_method(methods: Dict[str, List[int]], invalid_method: str, arg_count: int) -> Optional[str]:
+        suffix = ServiceCodeCorrector._aggregation_suffix(invalid_method)
+        candidates = [
+            method for method, counts in methods.items()
+            if arg_count in counts and (method.startswith("getTotal") or method.startswith("getSum"))
+        ]
+        return ServiceCodeCorrector._best_suffix_match(suffix, candidates)
+
+    @staticmethod
+    def _looks_like_invalid_aggregation_method(method_name: str) -> bool:
+        normalized = (method_name or "").strip()
+        return normalized.startswith(("sumBy", "getTotalBy", "getTotalValueBy", "avgBy"))
+
+    @staticmethod
+    def _aggregation_suffix(method_name: str) -> str:
+        normalized = (method_name or "").strip()
+        for prefix in ("sumBy", "getTotalValueBy", "getTotalBy", "avgBy"):
+            if normalized.startswith(prefix):
+                return normalized[len(prefix):]
+        if normalized.startswith("getTotal") and "By" in normalized:
+            return normalized[len("getTotal"):]
+        if normalized.startswith("getSum") and "By" in normalized:
+            return normalized[len("getSum"):]
+        return normalized
+
+    @staticmethod
+    def _best_suffix_match(suffix: str, candidates: List[str]) -> Optional[str]:
+        if not candidates:
+            return None
+        normalized_suffix = re.sub(r'[^A-Za-z0-9]', '', suffix or '').lower()
+        ranked: List[Tuple[int, int, str]] = []
+        for candidate in candidates:
+            candidate_suffix = re.sub(r'^(findBy|getTotal|getSum|getCount)', '', candidate)
+            normalized_candidate = re.sub(r'[^A-Za-z0-9]', '', candidate_suffix).lower()
+            overlap = len(set(normalized_suffix.split("by")) & set(normalized_candidate.split("by")))
+            contains = int(normalized_suffix in normalized_candidate or normalized_candidate in normalized_suffix)
+            ranked.append((contains, overlap, candidate))
+        ranked.sort(reverse=True)
+        return ranked[0][2] if ranked else None
+
+    @staticmethod
+    def _fallback_repository_method(
+        methods: Dict[str, List[int]],
+        entity_name: str,
+        lookup_keys: List[str],
+        arg_count: int,
+    ) -> Optional[str]:
+        """Choose a compile-safe repository method when a custom method is missing."""
+        if arg_count == 1:
+            for name in ("findById", "deleteById", "delete", "save"):
+                if ServiceCodeCorrector._method_supports_arg_count(methods, name, arg_count):
+                    return name
+        for name in ("save", "findAll", "findById", "deleteById"):
+            if ServiceCodeCorrector._method_supports_arg_count(methods, name, arg_count):
+                return name
+        if entity_name:
+            entity_pascal = entity_name[0].upper() + entity_name[1:] if entity_name else ""
+            preferred_custom = [
+                method for method in methods
+                if entity_pascal and entity_pascal.lower() in method.lower()
+                and ServiceCodeCorrector._method_supports_arg_count(methods, method, arg_count)
+            ]
+            if preferred_custom:
+                return preferred_custom[0]
+        if lookup_keys:
+            preferred_key = lookup_keys[0].lower()
+            key_matches = [
+                method for method in methods
+                if preferred_key in method.lower()
+                and ServiceCodeCorrector._method_supports_arg_count(methods, method, arg_count)
+            ]
+            if key_matches:
+                return key_matches[0]
+        return None
+
+    @staticmethod
+    def _fallback_repository_call(
+        repo_var: str,
+        contract: Dict[str, Any],
+        entity_name: str,
+        lookup_keys: List[str],
+    ) -> Optional[str]:
+        methods: Dict[str, List[int]] = contract.get("methods", {})
+        if lookup_keys and ServiceCodeCorrector._method_supports_arg_count(methods, "findById", 1):
+            return f"return {repo_var}.findById({lookup_keys[0]});"
+        if entity_name and ServiceCodeCorrector._method_supports_arg_count(methods, "save", 1):
+            entity_var = entity_name[0].lower() + entity_name[1:]
+            return f"return {repo_var}.save({entity_var});"
+        if ServiceCodeCorrector._method_supports_arg_count(methods, "findAll", 0):
+            return f"return {repo_var}.findAll();"
+        return None
+
+    @staticmethod
+    def _repair_missing_parentheses(
+        code: str,
+        repo_vars: Dict[str, str],
+        repository_contracts: Dict[str, Dict[str, Any]],
+    ) -> str:
+        """Fix references like repo.findAll; to repo.findAll()."""
+        for repo_var, repo_type in repo_vars.items():
+            methods = repository_contracts.get(repo_type, {}).get("methods", {})
+            zero_arg_methods = [name for name, counts in methods.items() if 0 in counts]
+            for method_name in zero_arg_methods:
+                code = re.sub(
+                    rf'\b{re.escape(repo_var)}\.{re.escape(method_name)}\s*;',
+                    f'{repo_var}.{method_name}();',
+                    code,
+                )
         return code
+
+    @staticmethod
+    def _method_supports_arg_count(methods: Dict[str, List[int]], method_name: str, arg_count: int) -> bool:
+        counts = methods.get(method_name, [])
+        return arg_count in counts
+
+    @staticmethod
+    def _count_method_parameters(param_blob: str) -> int:
+        text = (param_blob or "").strip()
+        if not text:
+            return 0
+        return len(ServiceCodeCorrector._split_call_arguments(text))
+
+    @staticmethod
+    def _split_call_arguments(args_blob: str) -> List[str]:
+        args: List[str] = []
+        text = (args_blob or "").strip()
+        if not text:
+            return args
+
+        depth = 0
+        token: List[str] = []
+        for ch in text:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth = max(0, depth - 1)
+            if ch == ',' and depth == 0:
+                value = ''.join(token).strip()
+                if value:
+                    args.append(value)
+                token = []
+                continue
+            token.append(ch)
+
+        tail = ''.join(token).strip()
+        if tail:
+            args.append(tail)
+        return args
+
+    @staticmethod
+    def _find_matching_brace(code: str, brace_start: int) -> int:
+        if brace_start < 0 or brace_start >= len(code) or code[brace_start] != '{':
+            return -1
+        depth = 1
+        pos = brace_start + 1
+        while pos < len(code):
+            if code[pos] == '{':
+                depth += 1
+            elif code[pos] == '}':
+                depth -= 1
+                if depth == 0:
+                    return pos
+            pos += 1
+        return -1
+
+    @staticmethod
+    def _indent_block(text: str, spaces: int) -> str:
+        indent = ' ' * spaces
+        lines = text.splitlines()
+        return '\n'.join(f"{indent}{line}" if line.strip() else "" for line in lines)
 
 
 def generate_correction_report(issues: List[ValidationIssue]) -> str:

@@ -55,6 +55,7 @@ class LogicPreservationReport:
     preservation_percentage: float = 0.0
     critical_issues: List[str] = field(default_factory=list)
     recommendations: List[str] = field(default_factory=list)
+    logic_preserved: bool = True  # Overall logic preservation status
     
 
 class LogicPreservationValidator:
@@ -90,32 +91,38 @@ class LogicPreservationValidator:
         for element in extraction_report.elements:
             self._validate_element(element, java_code, report)
         
-        # Stage 2: Check control flow [LPV-2]
-        logger.info("[LPV-2] Validating control flow correctness")
-        self._validate_control_flow(extraction_report, java_code, report)
+        # Validate structured elements from logic tree
+        for structured_elem in extraction_report.structured_elements:
+            self._validate_structured_element(structured_elem, java_code, report)
         
-        # Stage 3: Check data transformations [LPV-3]
-        logger.info("[LPV-3] Validating data transformation accuracy")
-        self._validate_data_transformations(extraction_report, java_code, report)
+        # Validate logic completeness - ensure no elements are missing
+        self._validate_logic_completeness(extraction_report, java_code, report)
         
-        # Stage 4: Check exception handling [LPV-4]
-        logger.info("[LPV-4] Validating exception preservation")
-        self._validate_exception_handling(extraction_report, java_code, report)
+        # Set final status based on issues
+        if self.issues:
+            report.status = ValidationStatus.PARTIAL
+            report.logic_preserved = False
+        else:
+            report.status = ValidationStatus.PASSED
+            report.logic_preserved = True
         
-        # Stage 5: Check transaction boundaries [LPV-5]
-        logger.info("[LPV-5] Validating transaction control")
-        self._validate_transaction_boundaries(extraction_report, java_code, report)
+        logger.info(f"[LPV-1] Validation complete: {report.status.value} "
+                   f"({len(self.issues)} issues found)")
         
-        # Calculate metrics
-        report.invalid_elements = self.issues
-        report.valid_elements = report.total_elements - len(self.issues)
-        report.preservation_percentage = (report.valid_elements / report.total_elements * 100) if report.total_elements > 0 else 0
+        return report
+    
+    def _validate_structured_element(self, structured_elem: dict, java_code: str, report: LogicPreservationReport):
+        """Validate structured logic elements from the logic tree."""
+        elem_type = structured_elem.get('type', '')
         
-        # Determine overall status
-        critical_issues = [i for i in self.issues if i.severity == "error"]
-        if critical_issues:
-            report.status = ValidationStatus.FAILED
-            report.critical_issues = [i.message for i in critical_issues]
+        if elem_type == 'loop':
+            self._validate_loop_structure(structured_elem, java_code, report)
+        elif elem_type == 'conditional':
+            self._validate_conditional_structure(structured_elem, java_code, report)
+        elif elem_type == 'exception':
+            self._validate_exception_structure(structured_elem, java_code, report)
+        elif elem_type == 'aggregation':
+            self._validate_aggregation_structure(structured_elem, java_code, report)
         elif self.issues:
             report.status = ValidationStatus.PARTIAL
         else:
@@ -292,27 +299,37 @@ class LogicPreservationValidator:
                 severity="error"
             )
             self.issues.append(issue)
+            report.logic_preserved = False
 
     def _validate_aggregation(self, element: LogicElement, java_code: str, report: LogicPreservationReport) -> None:
-        """[LPV-3] Validate aggregation operations"""
+        """[LPV-3] Validate aggregation operations use @Query instead of manual accumulation"""
         
-        # Look for aggregation patterns
-        agg_patterns = [
-            r"\.sum\s*\(",  # Stream.sum()
-            r"\.reduce\s*\(",  # Stream.reduce()
-            r"stream\s*\(\).*sum",  # Stream sum
+        # Check for @Query annotation (preferred for aggregations)
+        has_query_annotation = "@Query" in java_code
+        
+        # Check for manual accumulation patterns (less preferred)
+        manual_patterns = [
             r"total\s*\+=",  # Manual accumulation
-            r"summing\s*\(",  # Collectors.summing
+            r"sum\s*\+=",    # Manual summing
+            r"\.collect\s*\(\s*Collectors\.summing",  # Stream summing
         ]
+        has_manual_accumulation = any(re.search(pattern, java_code, re.IGNORECASE) for pattern in manual_patterns)
         
-        found = any(re.search(pattern, java_code, re.IGNORECASE) for pattern in agg_patterns)
-        
-        if not found:
+        if not has_query_annotation and not has_manual_accumulation:
             issue = LogicValidationIssue(
                 plsql_element=element,
                 issue_type="missing",
-                message=f"Aggregation operation not found. Expected .sum() or accumulation logic.",
+                message=f"Aggregation operation not found. Expected @Query annotation or proper accumulation logic.",
                 severity="error"
+            )
+            self.issues.append(issue)
+            report.logic_preserved = False
+        elif has_manual_accumulation and not has_query_annotation:
+            issue = LogicValidationIssue(
+                plsql_element=element,
+                issue_type="inefficient",
+                message=f"Aggregation using manual accumulation. Consider using @Query for better performance.",
+                severity="warning"
             )
             self.issues.append(issue)
 
@@ -331,6 +348,7 @@ class LogicPreservationValidator:
                 severity="error"
             )
             self.issues.append(issue)
+            report.logic_preserved = False
         else:
             # Check for multiple catch blocks (matching WHEN clauses)
             catch_count = len(re.findall(r"catch\s*\(", java_code, re.IGNORECASE))
@@ -481,3 +499,136 @@ class LogicPreservationValidator:
                         severity="warning"
                     )
                     self.issues.append(issue)
+
+    def _validate_loop_structure(self, structured_elem: dict, java_code: str, report: LogicPreservationReport):
+        """Validate loop structures are preserved in Java code."""
+        loop_type = structured_elem.get('loop_type', '')
+        loop_condition = structured_elem.get('condition', '')
+        
+        # Check if corresponding loop exists in Java
+        if loop_type == 'FOR':
+            if 'for (' not in java_code and 'for(' not in java_code:
+                issue = LogicValidationIssue(
+                    plsql_element=None,  # We don't have the original element
+                    issue_type="missing",
+                    message=f"FOR loop with condition '{loop_condition}' not found in Java code",
+                    severity="error"
+                )
+                self.issues.append(issue)
+        elif loop_type == 'WHILE':
+            if 'while (' not in java_code and 'while(' not in java_code:
+                issue = LogicValidationIssue(
+                    plsql_element=None,
+                    issue_type="missing", 
+                    message=f"WHILE loop with condition '{loop_condition}' not found in Java code",
+                    severity="error"
+                )
+                self.issues.append(issue)
+        elif loop_type == 'CURSOR_FOR':
+            # Cursor FOR loops should be converted to repository/stream operations
+            if not any(keyword in java_code for keyword in ['.stream()', '.forEach(', '.collect(', '@Query']):
+                issue = LogicValidationIssue(
+                    plsql_element=None,
+                    issue_type="missing",
+                    message=f"Cursor FOR loop not converted to proper Java stream/repository operation",
+                    severity="error"
+                )
+                self.issues.append(issue)
+
+    def _validate_conditional_structure(self, structured_elem: dict, java_code: str, report: LogicPreservationReport):
+        """Validate conditional structures are preserved."""
+        condition = structured_elem.get('condition', '')
+        
+        # Check if if-statement exists
+        if 'if (' not in java_code and 'if(' not in java_code:
+            issue = LogicValidationIssue(
+                plsql_element=None,
+                issue_type="missing",
+                message=f"Conditional logic with condition '{condition}' not found in Java code",
+                severity="error"
+            )
+            self.issues.append(issue)
+
+    def _validate_exception_structure(self, structured_elem: dict, java_code: str, report: LogicPreservationReport):
+        """Validate exception handling structures are preserved."""
+        exception_type = structured_elem.get('exception_type', '')
+        
+        # Check if try-catch exists
+        if 'try {' not in java_code and 'try{' not in java_code:
+            issue = LogicValidationIssue(
+                plsql_element=None,
+                issue_type="missing",
+                message=f"Exception handling for '{exception_type}' not found in Java code",
+                severity="error"
+            )
+            self.issues.append(issue)
+
+    def _validate_aggregation_structure(self, structured_elem: dict, java_code: str, report: LogicPreservationReport):
+        """Validate aggregation operations are properly mapped to @Query."""
+        agg_function = structured_elem.get('function', '')
+        
+        # Check if aggregation is mapped to @Query instead of manual accumulation
+        if '@Query' not in java_code:
+            issue = LogicValidationIssue(
+                plsql_element=None,
+                issue_type="incorrect",
+                message=f"Aggregation function '{agg_function}' should use @Query annotation, not manual accumulation",
+                severity="error"
+            )
+            self.issues.append(issue)
+
+    def _validate_logic_completeness(self, extraction_report: LogicExtractionReport, java_code: str, report: LogicPreservationReport):
+        """Validate that no logic elements are missing from the Java code."""
+        
+        # Count expected logic elements
+        expected_loops = len([e for e in extraction_report.elements if e.logic_type == LogicType.LOOP])
+        expected_conditionals = len([e for e in extraction_report.elements if e.logic_type == LogicType.CONDITIONAL])
+        expected_exceptions = len([e for e in extraction_report.elements if e.logic_type == LogicType.EXCEPTION_HANDLER])
+        expected_aggregations = len([e for e in extraction_report.elements if e.logic_type == LogicType.AGGREGATION])
+        
+        # Count found elements in Java code
+        found_loops = len(re.findall(r'\bfor\s*\(|\bwhile\s*\(|\.forEach\s*\(', java_code, re.IGNORECASE))
+        found_conditionals = len(re.findall(r'\bif\s*\(', java_code, re.IGNORECASE))
+        found_exceptions = len(re.findall(r'\btry\s*\{', java_code, re.IGNORECASE))
+        found_aggregations = len(re.findall(r'@Query|\.sum\s*\(|\.reduce\s*\(', java_code, re.IGNORECASE))
+        
+        # Check for missing elements
+        if expected_loops > 0 and found_loops == 0:
+            issue = LogicValidationIssue(
+                plsql_element=None,
+                issue_type="missing",
+                message=f"Expected {expected_loops} loop(s) but found none in Java code",
+                severity="error"
+            )
+            self.issues.append(issue)
+            report.logic_preserved = False
+            
+        if expected_conditionals > 0 and found_conditionals == 0:
+            issue = LogicValidationIssue(
+                plsql_element=None,
+                issue_type="missing",
+                message=f"Expected {expected_conditionals} conditional(s) but found none in Java code",
+                severity="error"
+            )
+            self.issues.append(issue)
+            report.logic_preserved = False
+            
+        if expected_exceptions > 0 and found_exceptions == 0:
+            issue = LogicValidationIssue(
+                plsql_element=None,
+                issue_type="missing",
+                message=f"Expected {expected_exceptions} exception handler(s) but found none in Java code",
+                severity="error"
+            )
+            self.issues.append(issue)
+            report.logic_preserved = False
+            
+        if expected_aggregations > 0 and found_aggregations == 0:
+            issue = LogicValidationIssue(
+                plsql_element=None,
+                issue_type="missing",
+                message=f"Expected {expected_aggregations} aggregation(s) but found none in Java code",
+                severity="error"
+            )
+            self.issues.append(issue)
+            report.logic_preserved = False

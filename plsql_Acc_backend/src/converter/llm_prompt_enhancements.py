@@ -58,12 +58,27 @@ class RepositoryEnchancements:
      List<User> findByStatus(String status);
    ✗ WRONG: userRepository.findByEmail("test@test.com LIKE '%'");  // Wrong context!
 
+6. AGGREGATION Queries:
+   ✓ CORRECT:
+     @Query("SELECT COALESCE(SUM(i.amount), 0) FROM InvoiceEntity i WHERE i.customerId = :customerId")
+     BigDecimal getSumAmountByCustomerId(@Param("customerId") Long customerId);
+   ✓ CORRECT:
+     @Query("SELECT COUNT(o) FROM OrderEntity o WHERE o.status = :status")
+     Long getCountOrderByStatus(@Param("status") String status);
+   ✗ WRONG: invoiceRepository.sumByCustomerId(customerId);  // NEVER invent sumBy...
+   ✗ WRONG: invoiceRepository.findByCustomerId(customerId).stream().map(...).reduce(...);  // Aggregation must live in @Query
+
 === RULES FOR REPOSITORY METHOD CALLS ===
 
 A. If a method doesn't exist on the repository, DO NOT call it!
    - Don't invent method names like insertUser, updateUser, getUser
    - Valid JPA methods: save(), findById(), deleteById(), findAll()
    - Only use custom methods if they were explicitly provided
+
+A1. NEVER generate repository methods starting with sumBy...
+   - `sumBy...` is invalid in this project
+   - For SUM/COUNT/NVL/GROUP BY, ALWAYS declare an explicit `@Query` repository method
+   - Prefer names like `getSumAmountByCustomerId(...)` or `getTotalAmountByCustomerId(...)`
 
 B. When accepting entity objects from parameters:
    - Map SQL parameters to entity fields using setters
@@ -102,6 +117,15 @@ PL/SQL DELETE → Java:
 PL/SQL SELECT → Java:
   1. Simple: OrderEntity o = orderRepository.findById(pId).orElseThrow();
   2. With condition (if custom @Query exists): Optional<OrderEntity> o = orderRepository.findByStatus("PENDING");
+
+=== AGGREGATION ENFORCEMENT ===
+
+For every SQL aggregation such as SUM, COUNT, AVG, MIN, MAX, NVL, or GROUP BY:
+1. ALWAYS implement it as a repository method annotated with @Query
+2. NEVER fetch rows first and aggregate in the service layer
+3. NEVER generate method names like sumBy..., countBy... unless that exact repository contract already exists
+4. Make null-safe aggregation explicit with COALESCE/NVL-equivalent behavior when needed
+5. Service code must call the declared @Query repository method directly
 """
     
     @staticmethod
@@ -155,6 +179,39 @@ When calling repository methods:
 
 class ServiceMethodEnhancement:
     """Enhancements for service method generation"""
+
+    @staticmethod
+    def get_logic_preservation_rules() -> str:
+        """Get strict logic-preservation guidance for services."""
+        return """
+=== LOGIC PRESERVATION RULES ===
+
+Preserve the source PL/SQL behavior completely:
+
+1. Maintain full business logic.
+   - Do not simplify, skip, merge, or reorder business rules
+   - Preserve all validations, assignments, side effects, and branching outcomes
+   - Never replace real logic with TODOs, placeholders, stubs, or comments
+
+2. Preserve loops exactly in behavior.
+   - If the source contains FOR/WHILE/CURSOR iteration, emit equivalent Java iteration
+   - Do not collapse loops into a single repository call if loop-side effects exist
+   - Preserve loop ordering, accumulator updates, and conditional logic inside the loop
+
+3. Preserve exception behavior.
+   - Keep try/catch when source logic has exception handling
+   - Preserve business exceptions and failure branches explicitly
+   - Do not swallow exceptions or silently continue after a failure path
+
+4. Preserve data-flow and control-flow.
+   - Conditions that gate updates/inserts/deletes must remain explicit in Java
+   - If one statement computes values used later, keep that dependency intact
+   - Maintain transaction-sensitive ordering of reads, updates, deletes, logging, and audit writes
+
+5. Preserve aggregation semantics.
+   - If PL/SQL computes totals/counts, map them to repository @Query aggregations
+   - Do not replace query-level aggregation with manual Java accumulation unless the source explicitly requires row-by-row side effects
+"""
     
     @staticmethod
     def get_error_handling_pattern() -> str:
@@ -231,6 +288,7 @@ def enhance_service_prompt_with_metadata(base_prompt: str,
     repo_sigs = RepositoryEnchancements.get_repository_signature_examples(repo_examples)
     error_handling = ServiceMethodEnhancement.get_error_handling_pattern()
     transactions = ServiceMethodEnhancement.get_transaction_guidelines()
+    logic_preservation = ServiceMethodEnhancement.get_logic_preservation_rules()
     
     # Insert after the basic requirements section
     insertion_point = base_prompt.find("STRICT OUTPUT RULES")
@@ -247,6 +305,8 @@ def enhance_service_prompt_with_metadata(base_prompt: str,
 {error_handling}
 
 {transactions}
+
+{logic_preservation}
 """
     
     return base_prompt[:insertion_point] + enhancements + "\n" + base_prompt[insertion_point:]
@@ -263,10 +323,14 @@ Before emitting a service method, verify:
 [] 2. All parameter types match the method signature exactly
 [] 3. All entity field accesses (get/set) correspond to actual fields
 [] 4. No invented methods like insertXxx, updateXxx, findOne, etc.
-[] 5. Query syntax is valid (if using @Query, syntax is correct)
-[] 6. Type conversions are handled (e.g., Long → BigDecimal where needed)
-[] 7. Exception handling is present for repository.findById().orElseThrow()
-[] 8. Transaction boundaries are correct (no nested @Transactional needed)
-[] 9. All imports reference existing classes in the project
-[] 10. Method returns void (controller handles response format)
+[] 5. NEVER generate sumBy... methods or calls
+[] 6. All aggregations use explicit repository @Query methods
+[] 7. Query syntax is valid (if using @Query, syntax is correct)
+[] 8. Type conversions are handled (e.g., Long → BigDecimal where needed)
+[] 9. Exception handling is preserved for business and repository failure paths
+[] 10. Loop structures from source logic are preserved in Java
+[] 11. Full business logic is maintained with no dropped validations or side effects
+[] 12. Transaction boundaries are correct (no nested @Transactional needed)
+[] 13. All imports reference existing classes in the project
+[] 14. Method returns the correct result for the preserved business flow
 """

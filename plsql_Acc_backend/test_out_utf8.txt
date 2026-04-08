@@ -1,0 +1,90 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.0, pytest-9.0.2, pluggy-1.6.0
+rootdir: C:\Users\Sorim-Prasanth\Desktop\PL-SQL-to-Java-SpringBoot-Microservices-Accelerator\plsql_Acc_backend
+plugins: anyio-4.13.0, langsmith-0.7.22, asyncio-1.3.0, cov-7.1.0, mock-3.15.1, xdist-3.8.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 54 items
+
+tests\test_backup_repair_imports.py .....                                [  9%]
+tests\test_deterministic_generation.py ......                            [ 20%]
+tests\test_discovery_analyzer.py F.......                                [ 35%]
+tests\test_file_extractor.py .....                                       [ 44%]
+tests\test_package_extraction.py ........                                [ 59%]
+tests\test_plsql_preprocessing.py ....                                   [ 66%]
+tests\test_sbg29_package_logic.py F                                      [ 68%]
+tests\test_semantic_validator.py ....                                    [ 75%]
+tests\test_service_type_alignment.py ........                            [ 90%]
+tests\test_sql_table_discovery.py .....                                  [100%]
+
+================================== FAILURES ===================================
+__________________ test_analyze_sql_source_extracts_metadata __________________
+
+    def test_analyze_sql_source_extracts_metadata():
+        sql = """
+        CREATE OR REPLACE PROCEDURE process_order(
+            p_customer_id IN NUMBER,
+            p_status OUT VARCHAR2
+        ) AS
+            v_total NUMBER;
+            e_invalid EXCEPTION;
+        BEGIN
+            SELECT id INTO v_total FROM customers WHERE customer_id = p_customer_id;
+            INSERT INTO orders(customer_id) VALUES (p_customer_id);
+            IF v_total > 0 THEN
+                UPDATE customers SET status = 'ACTIVE' WHERE customer_id = p_customer_id;
+            ELSE
+                DELETE FROM products WHERE id = 1;
+            END IF;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                p_status := 'NOT_FOUND';
+            WHEN OTHERS THEN
+                p_status := 'ERROR';
+        END;
+        """
+    
+        results = analyze_sql_source(sql)
+        assert len(results) == 1
+        item = results[0]
+        assert item["procedureName"] == "process_order"
+        assert item["objectType"] == "PROCEDURE"
+        assert item["parameters"]["in"] == [{"name": "p_customer_id", "type": "NUMBER"}]
+        assert item["parameters"]["out"] == [{"name": "p_status", "type": "VARCHAR2"}]
+        assert "CUSTOMERS" in item["tablesUsed"]
+        assert "ORDERS" in item["tablesUsed"]
+        assert set(item["operations"]) == {"SELECT", "INSERT", "UPDATE", "DELETE"}
+        assert "NO_DATA_FOUND" in item["exceptions"]
+>       assert "OTHERS" in item["exceptions"]
+E       AssertionError: assert 'OTHERS' in ['E_INVALID', 'NO_DATA_FOUND', 'TOO_MANY_ROWS']
+
+tests\test_discovery_analyzer.py:39: AssertionError
+_____________________ test_inject_package_specific_logic ______________________
+
+    def test_inject_package_specific_logic():
+        """Test that package-specific logic is detected and injected"""
+    
+        # Create a mock SpringBootGenerator instance
+>       generator = SpringBootGenerator(
+            project_name="test_project",
+            package_name="com.test",
+            java_version="17",
+            spring_boot_version="3.2.5",
+            base_path=Path("/tmp/test")
+        )
+E       TypeError: SpringBootGenerator.__init__() got an unexpected keyword argument 'project_name'
+
+tests\test_sbg29_package_logic.py:21: TypeError
+============================== warnings summary ===============================
+src\utils\config.py:51
+  C:\Users\Sorim-Prasanth\Desktop\PL-SQL-to-Java-SpringBoot-Microservices-Accelerator\plsql_Acc_backend\src\utils\config.py:51: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+    @validator('api_key', always=True)
+
+src\utils\config.py:73
+  C:\Users\Sorim-Prasanth\Desktop\PL-SQL-to-Java-SpringBoot-Microservices-Accelerator\plsql_Acc_backend\src\utils\config.py:73: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+    @validator('api_key', always=True)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_discovery_analyzer.py::test_analyze_sql_source_extracts_metadata
+FAILED tests/test_sbg29_package_logic.py::test_inject_package_specific_logic
+================== 2 failed, 52 passed, 2 warnings in 13.14s ==================

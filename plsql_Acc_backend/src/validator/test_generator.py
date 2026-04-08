@@ -248,33 +248,52 @@ class {class_name}Test {{
         """Generate repository test class"""
         # Extract entity name from repository
         entity_name = interface_name.replace('Repository', '')
-        
-        # Generate test methods
-        test_methods = [
-            f"""    @Test
-    void testFindById() {{
-        when(repository.findById(1L)).thenReturn(Optional.of(new {entity_name}()));
+        repository_methods = self._extract_java_methods(repo_code)
+
+        test_methods = [self._generate_repository_contract_test(interface_name)]
+
+        if any(method['name'] == 'findById' for method in repository_methods):
+            test_methods.append(f"""    @Test
+    void testFindByIdReturnsEntity() {{
+        {entity_name} entity = new {entity_name}();
+        when(repository.findById(1L)).thenReturn(Optional.of(entity));
+
         Optional<{entity_name}> result = repository.findById(1L);
+
         assertTrue(result.isPresent());
-    }}""",
-            
-            f"""    @Test
-    void testSave() {{
+        assertSame(entity, result.get());
+        verify(repository).findById(1L);
+    }}""")
+
+        if any(method['name'] == 'save' for method in repository_methods):
+            test_methods.append(f"""    @Test
+    void testSavePersistsEntity() {{
         {entity_name} entity = new {entity_name}();
         when(repository.save(entity)).thenReturn(entity);
+
         {entity_name} result = repository.save(entity);
-        assertNotNull(result);
-    }}""",
-            
-            f"""    @Test
-    void testDeleteById() {{
-        assertDoesNotThrow(() -> repository.deleteById(1L));
-        verify(repository, times(1)).deleteById(1L);
-    }}"""
-        ]
+
+        assertSame(entity, result);
+        verify(repository).save(entity);
+    }}""")
+
+        if any(method['name'] == 'deleteById' for method in repository_methods):
+            test_methods.append("""    @Test
+    void testDeleteByIdInvokesRepository() {
+        doNothing().when(repository).deleteById(1L);
+
+        repository.deleteById(1L);
+
+        verify(repository).deleteById(1L);
+    }""")
+
+        for method in repository_methods:
+            generated = self._generate_repository_behavior_test(method, entity_name)
+            if generated:
+                test_methods.append(generated)
         
         # Generate imports
-        imports = self._generate_repository_test_imports(entity_name, interface_name)
+        imports = self._generate_repository_test_imports(entity_name, interface_name, repo_code)
         
         return f"""package {self.package_name}.repository;
 
@@ -285,12 +304,7 @@ class {interface_name}Test {{
     
     @Mock
     private {interface_name} repository;
-    
-    @Test
-    void testRepositoryInterface() {{
-        assertNotNull(repository);
-    }}
-    
+
 {chr(10).join(test_methods)}
 }}
 """
@@ -336,6 +350,7 @@ class {interface_name}Test {{
         """Generate service test class"""
         # Extract dependencies from service
         dependencies = self._extract_service_dependencies(service_code)
+        service_methods = self._extract_java_methods(service_code)
         
         # Generate mock declarations
         mock_declarations = []
@@ -345,21 +360,16 @@ class {interface_name}Test {{
             mock_declarations.append(f"    @Mock\n    private {dep_type} {dep_name};")
         
         # Generate test methods
-        test_methods = [
-            f"""    @Test
+        test_methods = [f"""    @Test
     void testServiceInitialization() {{
         assertNotNull(service);
-    }}""",
-            
-            """    @Test
-    void testServiceMethod() {
-        // Test service method implementation
-        // This would be customized based on actual service methods
-    }"""
-        ]
+    }}"""]
+        for method in service_methods:
+            test_methods.extend(self._generate_service_method_tests(method))
         
         # Generate imports
         imports = self._generate_service_test_imports(class_name, dependencies)
+        helper_methods = self._generate_service_test_helpers()
         
         return f"""package {self.package_name}.service;
 
@@ -374,6 +384,8 @@ class {class_name}Test {{
 {chr(10).join(mock_declarations)}
     
 {chr(10).join(test_methods)}
+
+{helper_methods}
 }}
 """
     
@@ -863,10 +875,15 @@ class {entity_name}IntegrationTest {{
         """Extract dependency information from service code"""
         dependencies = []
         # Look for @Autowired fields or constructor parameters
-        autowired_matches = re.findall(r'@Autowired\s+private\s+(\w+)\s+(\w+);', code)
+        autowired_matches = re.findall(r'@Autowired\s+private\s+(?:final\s+)?(\w+)\s+(\w+);', code)
         for dep_type, dep_name in autowired_matches:
             dependencies.append({'type': dep_type, 'name': dep_name})
-        
+
+        final_field_matches = re.findall(r'private\s+final\s+(\w+)\s+(\w+);', code)
+        for dep_type, dep_name in final_field_matches:
+            if not any(dep['name'] == dep_name for dep in dependencies):
+                dependencies.append({'type': dep_type, 'name': dep_name})
+
         return dependencies
     
     def _extract_controller_service(self, code: str) -> Optional[str]:
@@ -910,26 +927,398 @@ class {entity_name}IntegrationTest {{
             import_lines.append("import java.math.BigDecimal;")
         return "\n".join(import_lines)
     
-    def _generate_repository_test_imports(self, entity_name: str, interface_name: str) -> str:
+    def _generate_repository_test_imports(self, entity_name: str, interface_name: str, repo_code: str) -> str:
         """Generate imports for repository test"""
-        return f"""import java.util.Optional;
-import org.junit.jupiter.api.Test;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
-import org.junit.jupiter.api.extension.ExtendWith;
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.*;
-import {self.package_name}.entity.{entity_name};"""
+        import_lines = [
+            "import java.util.Optional;",
+            "import org.junit.jupiter.api.Test;",
+            "import org.mockito.Mock;",
+            "import org.mockito.junit.jupiter.MockitoExtension;",
+            "import org.junit.jupiter.api.extension.ExtendWith;",
+            "import static org.junit.jupiter.api.Assertions.*;",
+            "import static org.mockito.ArgumentMatchers.*;",
+            "import static org.mockito.Mockito.*;",
+            f"import {self.package_name}.entity.{entity_name};",
+        ]
+        if "BigDecimal" in repo_code:
+            import_lines.append("import java.math.BigDecimal;")
+        if "List<" in repo_code:
+            import_lines.append("import java.util.List;")
+            import_lines.append("import java.util.Collections;")
+        return "\n".join(dict.fromkeys(import_lines))
     
     def _generate_service_test_imports(self, class_name: str, dependencies: List[Dict[str, str]]) -> str:
         """Generate imports for service test"""
-        return f"""import org.junit.jupiter.api.Test;
-import org.mockito.Mock;
-import org.mockito.InjectMocks;
-import org.mockito.junit.jupiter.MockitoExtension;
-import org.junit.jupiter.api.extension.ExtendWith;
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.*;"""
+        import_lines = [
+            "import java.lang.reflect.InvocationTargetException;",
+            "import java.lang.reflect.Method;",
+            "import java.math.BigDecimal;",
+            "import java.time.LocalDateTime;",
+            "import java.util.Arrays;",
+            "import java.util.Collections;",
+            "import java.util.List;",
+            "import java.util.Optional;",
+            "import org.junit.jupiter.api.Test;",
+            "import org.mockito.Mock;",
+            "import org.mockito.InjectMocks;",
+            "import org.mockito.junit.jupiter.MockitoExtension;",
+            "import org.junit.jupiter.api.extension.ExtendWith;",
+            "import static org.junit.jupiter.api.Assertions.*;",
+            "import static org.mockito.ArgumentMatchers.*;",
+            "import static org.mockito.Mockito.*;",
+        ]
+        for dependency in dependencies:
+            dep_type = dependency['type']
+            if dep_type.endswith("Repository"):
+                import_lines.append(f"import {self.package_name}.repository.{dep_type};")
+            elif dep_type.endswith("Service"):
+                import_lines.append(f"import {self.package_name}.service.{dep_type};")
+        return "\n".join(dict.fromkeys(import_lines))
+
+    def _generate_repository_contract_test(self, interface_name: str) -> str:
+        return f"""    @Test
+    void testRepositoryInterfaceIsMocked() {{
+        assertNotNull(repository);
+        assertEquals("{interface_name}", repository.getClass().getInterfaces()[0].getSimpleName());
+    }}"""
+
+    def _generate_repository_behavior_test(self, method: Dict[str, Any], entity_name: str) -> Optional[str]:
+        method_name = method['name']
+        return_type = method['return_type']
+        params = method['parameters']
+        arg_expr = ", ".join(self._test_literal_for_type(param['type'], param['name']) for param in params)
+        matcher_expr = ", ".join(self._mock_matcher_for_type(param['type']) for param in params)
+
+        if method_name in {"findById", "save", "deleteById"}:
+            return None
+
+        if method_name.startswith(("getSum", "getTotal")):
+            return f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}ReturnsAggregationResult() {{
+        BigDecimal expected = BigDecimal.valueOf(42);
+        when(repository.{method_name}({matcher_expr})).thenReturn(expected);
+
+        {return_type} result = repository.{method_name}({arg_expr});
+
+        assertEquals(expected, result);
+        verify(repository).{method_name}({arg_expr});
+    }}"""
+
+        if method_name.startswith("getCount"):
+            return f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}ReturnsCount() {{
+        Long expected = 3L;
+        when(repository.{method_name}({matcher_expr})).thenReturn(expected);
+
+        {return_type} result = repository.{method_name}({arg_expr});
+
+        assertEquals(expected, result);
+        verify(repository).{method_name}({arg_expr});
+    }}"""
+
+        if method_name.startswith("findBy"):
+            if "Optional<" in return_type:
+                return f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}FindsMatchingRecord() {{
+        {entity_name} entity = new {entity_name}();
+        when(repository.{method_name}({matcher_expr})).thenReturn(Optional.of(entity));
+
+        {return_type} result = repository.{method_name}({arg_expr});
+
+        assertTrue(result.isPresent());
+        assertSame(entity, result.get());
+        verify(repository).{method_name}({arg_expr});
+    }}"""
+            if "List<" in return_type:
+                return f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}ReturnsMatchingRecords() {{
+        when(repository.{method_name}({matcher_expr})).thenReturn(Collections.singletonList(new {entity_name}()));
+
+        {return_type} result = repository.{method_name}({arg_expr});
+
+        assertEquals(1, result.size());
+        verify(repository).{method_name}({arg_expr});
+    }}"""
+
+        return None
+
+    def _generate_service_method_tests(self, method: Dict[str, Any]) -> List[str]:
+        tests: List[str] = []
+        method_name = method['name']
+        body = method['body']
+        params = method['parameters']
+        default_args = ", ".join(self._test_literal_for_type(param['type'], param['name']) for param in params)
+        invalid_args = ", ".join(self._invalid_test_literal_for_type(param['type']) for param in params)
+        dependency_calls = self._extract_dependency_calls(body)
+        first_call = dependency_calls[0] if dependency_calls else None
+
+        if self._contains_business_validation(body):
+            tests.append(f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}EnforcesBusinessRules() {{
+        assertThrows(Exception.class, () -> invokeServiceMethod("{method_name}"{self._prefixed_args(invalid_args)}));
+    }}""")
+
+        aggregation_call = next(
+            (call for call in dependency_calls if call['method'].startswith(("getSum", "getTotal", "getCount"))),
+            None,
+        )
+        if aggregation_call:
+            stub_lines, expected_expr = self._build_dependency_stub(aggregation_call, method['return_type'], for_exception=False)
+            tests.append(f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}ReturnsAggregationResult() throws Throwable {{
+{stub_lines}
+        Object result = invokeServiceMethod("{method_name}"{self._prefixed_args(default_args)});
+
+        assertEquals({expected_expr}, result);
+        verify({aggregation_call['dependency']}).{aggregation_call['method']}({aggregation_call['args_literal']});
+    }}""")
+
+        if self._contains_loop(body) and first_call:
+            loop_args = ", ".join(self._loop_test_literal_for_type(param['type'], param['name']) for param in params)
+            stub_lines, _ = self._build_dependency_stub(first_call, method['return_type'], for_exception=False, loop_friendly=True)
+            verification = f"verify({first_call['dependency']}, atLeastOnce()).{first_call['method']}({first_call['args_literal']});"
+            if any(self._is_collection_type(param['type']) for param in params):
+                verification = f"verify({first_call['dependency']}, atLeast(2)).{first_call['method']}({first_call['args_literal']});"
+            tests.append(f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}ProcessesLoopBehavior() throws Throwable {{
+{stub_lines}
+        assertDoesNotThrow(() -> invokeServiceMethod("{method_name}"{self._prefixed_args(loop_args)}));
+
+        {verification}
+    }}""")
+
+        if self._contains_exception_flow(body) and first_call:
+            stub_lines, _ = self._build_dependency_stub(first_call, method['return_type'], for_exception=True)
+            tests.append(f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}HandlesDependencyFailure() {{
+{stub_lines}
+        assertThrows(Exception.class, () -> invokeServiceMethod("{method_name}"{self._prefixed_args(default_args)}));
+    }}""")
+
+        if not tests:
+            tests.append(f"""    @Test
+    void test{method_name[0].upper() + method_name[1:]}ExecutesBusinessFlow() {{
+        assertDoesNotThrow(() -> invokeServiceMethod("{method_name}"{self._prefixed_args(default_args)}));
+    }}""")
+
+        return tests
+
+    def _generate_service_test_helpers(self) -> str:
+        return """
+    private Object invokeServiceMethod(String methodName, Object... args) throws Throwable {
+        Method target = Arrays.stream(service.getClass().getDeclaredMethods())
+            .filter(method -> method.getName().equals(methodName) && method.getParameterCount() == args.length)
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("No matching service method: " + methodName));
+        try {
+            target.setAccessible(true);
+            return target.invoke(service, args);
+        } catch (InvocationTargetException ex) {
+            throw ex.getCause();
+        }
+    }
+"""
+
+    def _extract_java_methods(self, code: str) -> List[Dict[str, Any]]:
+        methods: List[Dict[str, Any]] = []
+        pattern = re.compile(
+            r'(?:public|protected)\s+([\w<>\[\], ?]+)\s+(\w+)\s*\(([^)]*)\)\s*\{',
+            flags=re.MULTILINE,
+        )
+        for match in pattern.finditer(code):
+            body_start = match.end() - 1
+            body_end = self._find_matching_brace(code, body_start)
+            if body_end == -1:
+                continue
+            methods.append({
+                'return_type': " ".join(match.group(1).split()),
+                'name': match.group(2),
+                'parameters': self._parse_parameters(match.group(3)),
+                'body': code[body_start + 1:body_end],
+            })
+        return methods
+
+    def _parse_parameters(self, params_blob: str) -> List[Dict[str, str]]:
+        params: List[Dict[str, str]] = []
+        for raw_param in self._split_arguments(params_blob):
+            cleaned = re.sub(r'@\w+(?:\([^)]*\))?\s*', '', raw_param).strip()
+            if not cleaned:
+                continue
+            parts = cleaned.rsplit(' ', 1)
+            if len(parts) != 2:
+                continue
+            params.append({'type': parts[0].strip(), 'name': parts[1].strip()})
+        return params
+
+    def _extract_dependency_calls(self, body: str) -> List[Dict[str, str]]:
+        calls: List[Dict[str, str]] = []
+        for dependency, method_name, args_blob in re.findall(r'\b(\w+)\.(\w+)\(([^()]*)\)', body):
+            matcher_args = [self._mock_matcher_for_expression(arg) for arg in self._split_arguments(args_blob)]
+            calls.append({
+                'dependency': dependency,
+                'method': method_name,
+                'args_literal': ", ".join(arg for arg in matcher_args if arg),
+            })
+        return calls
+
+    def _contains_business_validation(self, body: str) -> bool:
+        return bool(re.search(r'\bif\s*\(.*?\bthrow\b|\borElseThrow\b|\bvalidate\b', body, re.IGNORECASE | re.DOTALL))
+
+    def _contains_loop(self, body: str) -> bool:
+        return bool(re.search(r'\bfor\s*\(|\bwhile\s*\(|\.forEach\s*\(', body))
+
+    def _contains_exception_flow(self, body: str) -> bool:
+        return bool(re.search(r'\btry\s*\{|\bcatch\s*\(|\bthrow\s+new\b', body))
+
+    def _build_dependency_stub(
+        self,
+        dependency_call: Dict[str, str],
+        service_return_type: str,
+        for_exception: bool,
+        loop_friendly: bool = False,
+    ) -> Tuple[str, str]:
+        dependency = dependency_call['dependency']
+        method_name = dependency_call['method']
+        matcher_expr = dependency_call['args_literal']
+        invocation = f"{dependency}.{method_name}({matcher_expr})" if matcher_expr else f"{dependency}.{method_name}()"
+
+        if method_name.startswith("delete"):
+            if for_exception:
+                return f'        doThrow(new RuntimeException("boom")).when({dependency}).{method_name}({matcher_expr});', "null"
+            return f'        doNothing().when({dependency}).{method_name}({matcher_expr});', "null"
+
+        if method_name.startswith(("getSum", "getTotal")):
+            sample = "BigDecimal.valueOf(42)"
+        elif method_name.startswith("getCount"):
+            sample = "3L"
+        elif loop_friendly and method_name.startswith("findAll"):
+            sample = "Collections.emptyList()"
+        elif service_return_type == "BigDecimal":
+            sample = "BigDecimal.valueOf(42)"
+        elif service_return_type in {"Long", "long"}:
+            sample = "3L"
+        elif service_return_type in {"Integer", "int"}:
+            sample = "3"
+        elif service_return_type.startswith("List<"):
+            sample = "Collections.emptyList()"
+        else:
+            sample = "null"
+
+        if for_exception:
+            return f'        when({invocation}).thenThrow(new RuntimeException("boom"));', sample
+        return f'        when({invocation}).thenReturn({sample});', sample
+
+    def _test_literal_for_type(self, java_type: str, var_name: str = "value") -> str:
+        normalized = java_type.strip()
+        if self._is_collection_type(normalized):
+            return 'Arrays.asList("a", "b")'
+        if normalized in {"Long", "long"}:
+            return "1L"
+        if normalized in {"Integer", "int"}:
+            return "1"
+        if normalized in {"Double", "double"}:
+            return "1.0d"
+        if normalized in {"Float", "float"}:
+            return "1.0f"
+        if normalized == "BigDecimal":
+            return "BigDecimal.valueOf(10)"
+        if normalized in {"Boolean", "boolean"}:
+            return "true"
+        if normalized == "String":
+            return f'"{var_name}"'
+        if normalized == "LocalDateTime":
+            return "LocalDateTime.now()"
+        if normalized.startswith("Optional<"):
+            return "Optional.empty()"
+        return "null"
+
+    def _invalid_test_literal_for_type(self, java_type: str) -> str:
+        normalized = java_type.strip()
+        if normalized == "String":
+            return '""'
+        if normalized in {"boolean", "Boolean"}:
+            return "false"
+        if self._is_collection_type(normalized):
+            return "Collections.emptyList()"
+        return "null"
+
+    def _loop_test_literal_for_type(self, java_type: str, var_name: str) -> str:
+        normalized = java_type.strip()
+        if self._is_collection_type(normalized):
+            return 'Arrays.asList("first", "second")'
+        return self._test_literal_for_type(normalized, var_name)
+
+    def _mock_matcher_for_type(self, java_type: str) -> str:
+        normalized = java_type.strip()
+        if normalized in {"long", "Long"}:
+            return "anyLong()"
+        if normalized in {"int", "Integer"}:
+            return "anyInt()"
+        if normalized in {"double", "Double"}:
+            return "anyDouble()"
+        if normalized in {"float", "Float"}:
+            return "anyFloat()"
+        if normalized in {"boolean", "Boolean"}:
+            return "anyBoolean()"
+        return "any()"
+
+    def _mock_matcher_for_expression(self, expression: str) -> str:
+        expr = expression.strip()
+        if not expr:
+            return ""
+        if re.match(r'^-?\d+L$', expr):
+            return "anyLong()"
+        if re.match(r'^-?\d+$', expr):
+            return "anyInt()"
+        if expr in {"true", "false"}:
+            return "anyBoolean()"
+        return "any()"
+
+    def _split_arguments(self, args_blob: str) -> List[str]:
+        args: List[str] = []
+        text = (args_blob or "").strip()
+        if not text:
+            return args
+        depth = 0
+        token: List[str] = []
+        for ch in text:
+            if ch in "(<":
+                depth += 1
+            elif ch in ")>":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                value = "".join(token).strip()
+                if value:
+                    args.append(value)
+                token = []
+                continue
+            token.append(ch)
+        tail = "".join(token).strip()
+        if tail:
+            args.append(tail)
+        return args
+
+    def _find_matching_brace(self, code: str, brace_start: int) -> int:
+        if brace_start < 0 or brace_start >= len(code) or code[brace_start] != "{":
+            return -1
+        depth = 1
+        pos = brace_start + 1
+        while pos < len(code):
+            if code[pos] == "{":
+                depth += 1
+            elif code[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    return pos
+            pos += 1
+        return -1
+
+    def _is_collection_type(self, java_type: str) -> bool:
+        normalized = java_type.replace(" ", "")
+        return normalized.startswith(("List<", "Collection<", "Set<")) or normalized in {"List", "Collection", "Set"}
+
+    def _prefixed_args(self, args: str) -> str:
+        return f", {args}" if args else ""
     
     def _generate_controller_test_imports(self, class_name: str, service_dependency: str) -> str:
         """Generate imports for controller test"""

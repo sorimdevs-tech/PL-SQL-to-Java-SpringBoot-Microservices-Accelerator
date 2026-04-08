@@ -9,6 +9,13 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 import logging
 
+try:
+    from ..analyzer.logic_tree_builder import build_logic_tree, LogicNode
+    LOGIC_TREE_AVAILABLE = True
+except Exception:
+    LOGIC_TREE_AVAILABLE = False
+    LogicNode = Any  # type: ignore
+
 # Import compliance enforcer
 try:
     from .java_generation_compliance_enforcer import (
@@ -18,9 +25,11 @@ try:
     COMPLIANCE_ENFORCER_AVAILABLE = True
 except ImportError:
     COMPLIANCE_ENFORCER_AVAILABLE = False
-    logger.warning("Compliance enforcer not available - generated code may not follow all 12 rules")
 
 logger = logging.getLogger(__name__)
+
+if not COMPLIANCE_ENFORCER_AVAILABLE:
+    logger.warning("Compliance enforcer not available - generated code may not follow all 12 rules")
 
 
 @dataclass
@@ -809,13 +818,190 @@ class PLSQLtoJavaConverter:
         params_str = ', '.join(params) if params else ''
         
         return f"public {return_type} {method_name}({params_str})"
+
+    @staticmethod
+    def _extract_source_body(source: str) -> str:
+        """Extract executable block between BEGIN ... END from PL/SQL source."""
+        if not source:
+            return ""
+        m = re.search(r'\bBEGIN\b(.*)\bEND\b', source, re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip() if m else source
+
+    @staticmethod
+    def _translate_condition_to_java(condition: str) -> str:
+        """Translate common PL/SQL condition operators to Java."""
+        cond = (condition or "").strip()
+        if not cond:
+            return "true"
+        cond = re.sub(r'\bTHEN\b', '', cond, flags=re.IGNORECASE).strip()
+        cond = cond.replace('<>', '!=')
+        cond = re.sub(r'\bAND\b', '&&', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'\bOR\b', '||', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'\bNOT\b', '!', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'\bIS\s+NOT\s+NULL\b', '!= null', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'\bIS\s+NULL\b', '== null', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'(?<![<>=!])=(?!=)', '==', cond)
+        return PLSQLtoJavaConverter._translate_plsql_expression(cond)
+
+    @staticmethod
+    def _safe_var_name(name: str, default_name: str = "i") -> str:
+        v = re.sub(r'[^A-Za-z0-9_]', '_', (name or '').strip())
+        if not v:
+            v = default_name
+        if re.match(r'^\d', v):
+            v = f"v_{v}"
+        return v
+
+    @staticmethod
+    def _collect_structured_control_nodes(logic: 'ExtractedLogic') -> List[Dict[str, Any]]:
+        """Collect control-flow nodes from structured_elements if present."""
+        structured = getattr(logic, 'structured_elements', None)
+        if not structured:
+            return []
+        items = []
+        for elem in structured:
+            t = (elem.get('type') or '').lower()
+            if t in {'if', 'conditional', 'loop', 'exception', 'try', 'catch'}:
+                items.append(elem)
+        items.sort(key=lambda e: e.get('line', 0))
+        return items
+
+    @staticmethod
+    def _generate_java_from_logic_tree_node(node: 'LogicNode', indent: int = 1) -> List[str]:
+        """Generate Java lines from logic tree nodes preserving order and nesting."""
+        lines: List[str] = []
+        indent_str = "    " * indent
+        node_type = (getattr(node, 'type', '') or '').lower()
+        metadata = getattr(node, 'metadata', {}) or {}
+        children = getattr(node, 'children', []) or []
+
+        if node_type == 'sequence':
+            for child in children:
+                lines.extend(PLSQLtoJavaConverter._generate_java_from_logic_tree_node(child, indent))
+            return lines
+
+        if node_type == 'loop':
+            condition = metadata.get('condition', '')
+            upper = condition.upper()
+            if 'FOR' in upper:
+                m = re.search(r'FOR\s+(\w+)\s+IN\s+(.+)', condition, re.IGNORECASE)
+                if m:
+                    var = PLSQLtoJavaConverter._safe_var_name(m.group(1), 'i')
+                    range_expr = re.sub(r'\s+LOOP\s*$', '', m.group(2).strip(), flags=re.IGNORECASE)
+                    if '..' in range_expr:
+                        start, end = [x.strip() for x in range_expr.split('..', 1)]
+                        lines.append(f"{indent_str}for (int {var} = {start}; {var} <= {end}; {var}++) {{")
+                    else:
+                        lines.append(f"{indent_str}for (;;) {{")
+                else:
+                    lines.append(f"{indent_str}for (;;) {{")
+            elif 'WHILE' in upper:
+                m = re.search(r'WHILE\s+(.+)', condition, re.IGNORECASE)
+                if m:
+                    cond = PLSQLtoJavaConverter._translate_condition_to_java(m.group(1))
+                    lines.append(f"{indent_str}while ({cond}) {{")
+                else:
+                    lines.append(f"{indent_str}while (true) {{")
+            else:
+                lines.append(f"{indent_str}for (;;) {{")
+            for child in children:
+                lines.extend(PLSQLtoJavaConverter._generate_java_from_logic_tree_node(child, indent + 1))
+            lines.append(f"{indent_str}}}")
+            return lines
+
+        if node_type == 'if':
+            cond = PLSQLtoJavaConverter._translate_condition_to_java(metadata.get('condition', 'true'))
+            lines.append(f"{indent_str}if ({cond}) {{")
+            for child in children:
+                lines.extend(PLSQLtoJavaConverter._generate_java_from_logic_tree_node(child, indent + 1))
+            lines.append(f"{indent_str}}}")
+            return lines
+
+        if node_type == 'try':
+            lines.append(f"{indent_str}try {{")
+            catch_node = None
+            for child in children:
+                if (getattr(child, 'type', '') or '').lower() == 'catch':
+                    catch_node = child
+                    continue
+                lines.extend(PLSQLtoJavaConverter._generate_java_from_logic_tree_node(child, indent + 1))
+            lines.append(f"{indent_str}}} catch (Exception e) {{")
+            action = ((getattr(catch_node, 'metadata', {}) or {}).get('action', 'log') if catch_node else 'log').lower()
+            if action == 'rollback':
+                lines.append(f"{indent_str}    throw new RuntimeException(\"Transaction rolled back\", e);")
+            else:
+                lines.append(f"{indent_str}    logger.error(\"Exception occurred\", e);")
+                lines.append(f"{indent_str}    throw new RuntimeException(e);")
+            lines.append(f"{indent_str}}}")
+            return lines
+
+        if node_type == 'assignment':
+            target = PLSQLtoJavaConverter._safe_var_name(metadata.get('target', 'value'), 'value')
+            expr = PLSQLtoJavaConverter._translate_plsql_expression(metadata.get('expression', 'null'))
+            lines.append(f"{indent_str}var {target} = {expr};")
+            return lines
+
+        if node_type in {'select', 'insert', 'update', 'delete', 'merge', 'aggregation'}:
+            sql = metadata.get('sql', '').strip().replace('"', '\\"')
+            lines.append(f'{indent_str}// SQL: {sql}')
+            return lines
+
+        for child in children:
+            lines.extend(PLSQLtoJavaConverter._generate_java_from_logic_tree_node(child, indent))
+        return lines
+
+    @staticmethod
+    def _generate_control_flow_body(logic: 'ExtractedLogic', source_body: str = "") -> List[str]:
+        """
+        Build Java body lines from control-flow structure first (loop/if/exception),
+        preserving PL/SQL execution order. Falls back to structured elements if needed.
+        """
+        body_lines: List[str] = []
+
+        if LOGIC_TREE_AVAILABLE and source_body.strip():
+            try:
+                logic_tree = build_logic_tree(PLSQLtoJavaConverter._extract_source_body(source_body))
+                body_lines = PLSQLtoJavaConverter._generate_java_from_logic_tree_node(logic_tree, indent=1)
+                if body_lines:
+                    return body_lines
+            except Exception as ex:
+                logger.debug("Control-flow tree generation fallback: %s", ex)
+
+        structured = PLSQLtoJavaConverter._collect_structured_control_nodes(logic)
+        if not structured:
+            return []
+
+        # Fallback: linearized control hints from structured elements
+        for elem in structured:
+            t = (elem.get('type') or '').lower()
+            if t in {'if', 'conditional'}:
+                cond = PLSQLtoJavaConverter._translate_condition_to_java(elem.get('condition', 'true'))
+                body_lines.append(f"    if ({cond}) {{")
+                body_lines.append("        // preserved conditional branch")
+                body_lines.append("    }")
+            elif t == 'loop':
+                cond = (elem.get('condition') or '').upper()
+                if 'WHILE' in cond:
+                    body_lines.append("    while (true) {")
+                else:
+                    body_lines.append("    for (;;) {")
+                body_lines.append("        // preserved loop body")
+                body_lines.append("    }")
+            elif t in {'exception', 'try'}:
+                body_lines.append("    try {")
+                body_lines.append("        // preserved exception scope")
+                body_lines.append("    } catch (Exception e) {")
+                body_lines.append("        throw new RuntimeException(e);")
+                body_lines.append("    }")
+        return body_lines
     
     @staticmethod
     def generate_java_method(
         proc_name: str,
         logic: 'ExtractedLogic',
         entity_names: Dict[str, str] = None,
-        package_name: str = 'com.example.demo'
+        package_name: str = 'com.example.demo',
+        source_body: str = ''
     ) -> str:
         """
         Generate complete Java method implementation from PL/SQL logic.
@@ -903,7 +1089,34 @@ class PLSQLtoJavaConverter:
         params_str = ', '.join(params_dict.values())
         
         # Build method body
-        body_lines = []
+        body_lines: List[str] = []
+
+        # Control-flow first: preserve loop/if/exception order directly from source/structured tree.
+        control_flow_body = PLSQLtoJavaConverter._generate_control_flow_body(logic, source_body)
+        if control_flow_body:
+            body_lines.extend(control_flow_body)
+            # Also preserve explicit raises if extracted.
+            for ex in getattr(logic, 'exceptions_raised', []) or []:
+                msg = ex.get('message', 'PL/SQL exception')
+                code = ex.get('error_code', '')
+                if code:
+                    body_lines.append(f'    throw new BusinessException("-{code}", "{msg}");')
+                else:
+                    body_lines.append(f'    throw new BusinessException("{msg}");')
+
+            final_code = ""
+            if logic.has_commit or logic.inserts or logic.updates or logic.deletes or logic.logging_calls:
+                if logic.has_autonomous_transaction:
+                    final_code += "    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.REQUIRES_NEW)\n"
+                else:
+                    final_code += "    @Transactional\n"
+
+            final_code += f"public {return_type} {method_name}({params_str}) {{\n"
+            final_code += "\n".join(body_lines) if body_lines else "        logger.info(\"Method executed\");"
+            if return_type != 'void' and not any(line.strip().startswith('return ') for line in body_lines):
+                final_code += "\n    return null;"
+            final_code += "\n    }\n"
+            return final_code
         
         # 1. VALIDATION LAYER - error assertions and validations
         if logic.validations or logic.error_assertions:

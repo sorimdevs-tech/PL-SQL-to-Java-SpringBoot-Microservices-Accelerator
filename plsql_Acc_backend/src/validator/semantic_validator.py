@@ -27,6 +27,13 @@ STANDARD_REPOSITORY_METHODS = {
     "flush",
 }
 
+INVALID_REPOSITORY_METHOD_PREFIXES = {
+    "sumBy",
+    "getTotalBy",
+    "getTotalValueBy",
+    "avgBy",
+}
+
 
 @dataclass
 class SemanticIssue:
@@ -124,18 +131,68 @@ class SemanticValidator:
         for filename, code in repositories.items():
             interface_name = filename.replace(".java", "")
             method_pattern = re.compile(
-                r"^\s*(?:public\s+)?(?:default\s+)?[\w<>\[\], ?.]+\s+([A-Za-z_]\w*)\s*\([^;{]*\)\s*;",
+                r"^\s*(?:public\s+)?(?:default\s+)?[\w<>\[\], ?.]+\s+([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*;",
                 flags=re.MULTILINE,
             )
-            custom_methods = set(
-                match.group(1)
-                for match in method_pattern.finditer(code)
-            )
+            custom_methods: Set[str] = set()
+            signatures: Dict[str, Set[int]] = {}
+            for match in method_pattern.finditer(code):
+                method_name = match.group(1)
+                param_blob = match.group(2)
+                custom_methods.add(method_name)
+                signatures.setdefault(method_name, set()).add(self._count_method_parameters(param_blob))
             contracts[interface_name] = {
                 "methods": custom_methods | STANDARD_REPOSITORY_METHODS,
+                "signatures": signatures,
                 "code": code,
             }
         return contracts
+
+    def _count_method_parameters(self, param_blob: str) -> int:
+        text = (param_blob or "").strip()
+        if not text:
+            return 0
+        count = 0
+        depth = 0
+        token: List[str] = []
+        for ch in text:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                if "".join(token).strip():
+                    count += 1
+                token = []
+                continue
+            token.append(ch)
+        if "".join(token).strip():
+            count += 1
+        return count
+
+    def _split_call_arguments(self, args_blob: str) -> List[str]:
+        args: List[str] = []
+        text = (args_blob or "").strip()
+        if not text:
+            return args
+        depth = 0
+        token: List[str] = []
+        for ch in text:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                value = "".join(token).strip()
+                if value:
+                    args.append(value)
+                token = []
+                continue
+            token.append(ch)
+        tail = "".join(token).strip()
+        if tail:
+            args.append(tail)
+        return args
 
     def _validate_repository_files(self, repositories: Dict[str, str]) -> List[SemanticIssue]:
         issues: List[SemanticIssue] = []
@@ -211,6 +268,25 @@ class SemanticValidator:
                         file_name=filename,
                     )
                 )
+            invalid_method_pattern = re.compile(
+                r"^\s*(?:public\s+)?(?:default\s+)?[\w<>\[\], ?.]+\s+([A-Za-z_]\w*)\s*\([^;{]*\)\s*;",
+                flags=re.MULTILINE,
+            )
+            for method_match in invalid_method_pattern.finditer(code):
+                method_name = method_match.group(1)
+                if any(method_name.startswith(prefix) for prefix in INVALID_REPOSITORY_METHOD_PREFIXES):
+                    issues.append(
+                        SemanticIssue(
+                            component="repository",
+                            object_name=interface_name,
+                            code="invalid_repository_method_name",
+                            message=(
+                                f"{interface_name}.{method_name}(...) is invalid Spring Data naming. "
+                                f"Use explicit @Query for aggregation instead of derived {method_name}(...)"
+                            ),
+                            file_name=filename,
+                        )
+                    )
         return issues
 
     def _validate_service_files(self, services: Dict[str, str]) -> List[SemanticIssue]:
@@ -323,6 +399,7 @@ class SemanticValidator:
                     continue
 
                 call_pattern = re.compile(rf"\b{re.escape(repo_var)}\.(\w+)\s*\(")
+                call_signature_pattern = re.compile(rf"\b{re.escape(repo_var)}\.(\w+)\s*\(([^)]*)\)")
                 for match in call_pattern.finditer(service_code):
                     method_name = match.group(1)
                     if method_name not in contract["methods"]:
@@ -332,6 +409,30 @@ class SemanticValidator:
                                 object_name=unit.get("name", ""),
                                 code="missing_repository_method",
                                 message=f"{service_filename} calls {repo_type}.{method_name}() but that method is not declared",
+                                file_name=service_filename,
+                            )
+                        )
+                for sig_match in call_signature_pattern.finditer(service_code):
+                    method_name = sig_match.group(1)
+                    if method_name not in contract["methods"]:
+                        continue
+                    args_blob = sig_match.group(2)
+                    arg_count = len(self._split_call_arguments(args_blob))
+                    declared_counts = contract.get("signatures", {}).get(method_name)
+                    # Methods inherited from JpaRepository are intentionally skipped by signature checking.
+                    if not declared_counts:
+                        continue
+                    if arg_count not in declared_counts:
+                        pretty_decl = ", ".join(str(v) for v in sorted(declared_counts))
+                        issues.append(
+                            SemanticIssue(
+                                component="service",
+                                object_name=unit.get("name", ""),
+                                code="repository_method_signature_mismatch",
+                                message=(
+                                    f"{service_filename} calls {repo_type}.{method_name}(...) with {arg_count} args, "
+                                    f"but repository declares {method_name}(...) with [{pretty_decl}] args"
+                                ),
                                 file_name=service_filename,
                             )
                         )
@@ -473,7 +574,7 @@ class SemanticValidator:
                     "INSERT": [r"\.\s*(insert\w*|save|saveAndFlush)\s*\("],
                     "UPDATE": [r"\.\s*(update\w*|save|saveAndFlush)\s*\("],
                     "DELETE": [r"\.\s*(delete\w*|remove\w*)\s*\("],
-                    "SELECT": [r"\.\s*(find\w*|sumBy\w*|count\w*)\s*\("],
+                    "SELECT": [r"\.\s*(find\w*|getTotal\w*|getSum\w*|count\w*)\s*\("],
                 }
                 for operation in sorted(required_operations):
                     if operation not in operation_patterns:
@@ -521,23 +622,23 @@ class SemanticValidator:
                 if not repository_code:
                     continue
                 repository_var = self._lower_first(repository_name)
-                if "sumBy" not in repository_code:
+                if not re.search(r"@Query\(\"SELECT .*SUM\(", repository_code):
                     issues.append(
                         SemanticIssue(
                             component="repository",
                             object_name=object_name,
                             code="missing_aggregation_repository_method",
-                            message=f"{repository_filename} must expose SUM aggregation methods (sumBy...)",
+                            message=f"{repository_filename} must expose SUM aggregation methods with explicit @Query",
                             file_name=repository_filename,
                         )
                     )
-                if not re.search(rf"\b{re.escape(repository_var)}\.sumBy\w*\s*\(", service_code):
+                if not re.search(rf"\b{re.escape(repository_var)}\.(getTotal\w*|getSum\w*)\s*\(", service_code):
                     issues.append(
                         SemanticIssue(
                             component="service",
                             object_name=object_name,
                             code="aggregation_not_preserved",
-                            message=f"{service_filename} must use repository sumBy... methods for table {table_name}",
+                            message=f"{service_filename} must use explicit repository aggregation methods for table {table_name}",
                             file_name=service_filename,
                         )
                     )

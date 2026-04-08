@@ -159,6 +159,7 @@ import logging
 from ..utils.logger import get_logger
 from ..utils.config import get_config_value
 from ..utils.naming import normalize_column_name, to_pascal_case
+from ..analyzer.logic_tree_builder import LogicNode
 
 # Import compliance enforcer for Java generation validation
 try:
@@ -2490,7 +2491,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 }}
 """
 
-    def generate_services(self, java_code: Dict[str, str], write_files: bool = True) -> Dict[str, str]:
+    def generate_services(self, java_code: Dict[str, str], write_files: bool = True, logic_tree: Optional[LogicNode] = None) -> Dict[str, str]:
         # SBG-16 FIX: ensure _ddl_table_map is populated from entity sources
         # before normalising any service, so that _derive_entity_name can map
         # procedure-named services to the correct entity class.
@@ -2510,6 +2511,69 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
 
         services = {}
         service_dir = self.package_path / 'service'
+        service_dir.mkdir(parents=True, exist_ok=True)
+
+        # Logic-tree-first generation path (strict orchestration priority)
+        if logic_tree is not None:
+            service_name = "BusinessLogicService"
+            service_code = self._generate_service_from_logic_tree(logic_tree, service_name)
+            services[f"{service_name}.java"] = service_code
+
+            if write_files:
+                file_path = service_dir / f"{service_name}.java"
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(service_code)
+
+                # Ensure the repository used by logic-tree-generated service exists.
+                repo_dir = self.package_path / 'repository'
+                repo_dir.mkdir(parents=True, exist_ok=True)
+                repo_name, repo_code = self._generate_repository_from_logic_tree(logic_tree)
+                with open(repo_dir / f"{repo_name}.java", 'w', encoding='utf-8') as f:
+                    f.write(repo_code)
+
+            logger.info(f"Generated service from logic tree: {service_name}")
+            return services
+
+        # Re-audit already-generated services on disk (same pattern used for repositories)
+        if service_dir.exists():
+            for service_file in sorted(service_dir.glob('*.java')):
+                try:
+                    original = service_file.read_text(encoding='utf-8')
+                except OSError:
+                    continue
+                normalised = self._normalize_service_code(service_file.name, original)
+                if normalised != original:
+                    service_file.write_text(normalised, encoding='utf-8')
+                    services[service_file.name] = normalised
+                    logger.info(f"Re-audited service: {service_file.name}")
+
+        # Normal service generation/normalization path
+        for filename, code in (java_code or {}).items():
+            class_name = None
+            for line in code.splitlines():
+                stripped = line.strip()
+                if stripped.startswith('public class '):
+                    class_name = stripped.split()[2].split('{')[0].strip()
+                    break
+
+            looks_like_service = (
+                '@Service' in code
+                or filename.lower().endswith('service.java')
+                or (class_name is not None and class_name.lower().endswith('service'))
+            )
+            if not looks_like_service:
+                continue
+
+            target_filename = f"{class_name}.java" if class_name else filename
+            normalised = self._normalize_service_code(target_filename, code)
+            services[target_filename] = normalised
+            if write_files:
+                file_path = service_dir / target_filename
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(normalised)
+
+        logger.info(f"Generated {len(services)} service classes")
+        return services
 
     def register_procedure_metadata(self, procedures: List[Dict[str, Any]], plsql_source_map: Dict[str, str] = None) -> None:
         """
@@ -2730,51 +2794,6 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             logger.error(f"SBG-30: Error generating method for {proc_name}: {e}", exc_info=True)
             return ""
 
-        # SBG-23 FIX: Re-normalise service files that were already written during
-        # Stage 5 (generate_project). At that point _ddl_table_map was empty so
-        # _derive_entity_name fell back to raw class names, entity imports were wrong,
-        # and _inject_crud_repository_calls had no repository names to inject.
-        # Now that Stage 6 has populated _ddl_table_map, re-read each service,
-        # run the full normalisation pipeline, and overwrite if anything changed.
-        if service_dir.exists() and self._ddl_table_map:
-            for svc_file in sorted(service_dir.glob('*.java')):
-                if svc_file.stem.endswith('Test'):
-                    continue
-                try:
-                    original = svc_file.read_text(encoding='utf-8')
-                except OSError:
-                    continue
-                normalised = self._normalize_service_code(svc_file.name, original)
-                if normalised != original:
-                    svc_file.write_text(normalised, encoding='utf-8')
-                    services[svc_file.name] = normalised
-                    logger.info(f"Re-normalised service: {svc_file.name}")
-
-        for filename, code in java_code.items():
-            class_name = None
-            for line in code.splitlines():
-                stripped = line.strip()
-                if stripped.startswith('public class '):
-                    class_name = stripped.split()[2]
-                    break
-
-            looks_like_service = (
-                '@Service' in code
-                or filename.lower().endswith('service.java')
-                or (class_name is not None and class_name.lower().endswith('service'))
-            )
-            if looks_like_service:
-                target_filename = f"{class_name}.java" if class_name else filename
-                normalised = self._normalize_service_code(target_filename, code)
-                services[target_filename] = normalised
-                if write_files:
-                    file_path = service_dir / target_filename
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        f.write(normalised)
-
-        logger.info(f"Generated {len(services)} service classes")
-        return services
-
     def _inject_method_body(self, service_code: str, generated_method: str) -> str:
         """
         Replace the first public METHOD (not class) in service code with the complete generated method.
@@ -2868,6 +2887,311 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         
         result = '\n'.join(output_lines)
         return result
+
+    def _normalize_logic_node_type(self, node_type: str) -> str:
+        return (node_type or "").strip().lower().replace("-", "_")
+
+    def _to_java_condition(self, condition: str) -> str:
+        cond = (condition or "").strip()
+        if not cond:
+            return "true"
+        cond = re.sub(r'\bTHEN\b', '', cond, flags=re.IGNORECASE).strip()
+        cond = re.sub(r'\bAND\b', '&&', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'\bOR\b', '||', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'\bNOT\b', '!', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'\bIS\s+NOT\s+NULL\b', '!= null', cond, flags=re.IGNORECASE)
+        cond = re.sub(r'\bIS\s+NULL\b', '== null', cond, flags=re.IGNORECASE)
+        cond = cond.replace('<>', '!=')
+        cond = re.sub(r'(?<![<>=!])=(?!=)', '==', cond)
+        return cond or "true"
+
+    def _sanitize_java_identifier(self, value: str, fallback: str) -> str:
+        candidate = re.sub(r'[^A-Za-z0-9_]', '_', (value or "").strip())
+        if not candidate:
+            candidate = fallback
+        if re.match(r'^\d', candidate):
+            candidate = f"v_{candidate}"
+        return candidate
+
+    def _coerce_java_expression(self, expression: str) -> str:
+        expr = (expression or "").strip().rstrip(';')
+        if not expr:
+            return "null"
+        if re.search(r'\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|INTO|LOOP|THEN)\b', expr, re.IGNORECASE):
+            return "null"
+        return expr
+
+    def _escape_java_string_literal(self, value: str) -> str:
+        flattened = re.sub(r'\s+', ' ', (value or "").strip())
+        return flattened.replace('\\', '\\\\').replace('"', '\\"')
+
+    def _derive_logic_tree_entity_name(self) -> str:
+        if self._ddl_table_map:
+            table_name = sorted(set(self._ddl_table_map.values()))[0]
+            entity_name = f"{self._to_camel_case(table_name.lower())}Entity"
+            return self._normalize_entity_name(entity_name)
+        return "Object"
+
+    def _logic_tree_query_method_name(self, function_name: str, field_name: str) -> str:
+        fn = self._to_camel_case(function_name.lower()) or "Aggregate"
+        field = self._to_camel_case(re.sub(r'[^A-Za-z0-9_]', '_', field_name or "value").lower())
+        return f"query{fn}{field}"
+
+    def _ensure_logic_tree_aggregation_methods(
+        self,
+        node: LogicNode,
+        repository_methods: Dict[str, Dict[str, str]],
+        entity_name: str,
+    ) -> List[Dict[str, str]]:
+        methods: List[Dict[str, str]] = []
+        for agg in node.metadata.get("aggregations", []) or []:
+            function_name = (agg.get("function") or "SUM").upper()
+            field_name = agg.get("field") or "value"
+            method_name = self._logic_tree_query_method_name(function_name, field_name)
+            return_type = {
+                "COUNT": "Long",
+                "AVG": "Double",
+            }.get(function_name, "BigDecimal")
+            sql = (node.metadata.get("sql") or "").strip()
+            if sql:
+                query_value = self._escape_java_string_literal(sql)
+                native_query = "true"
+            elif entity_name != "Object":
+                field_java = self._to_lower_camel_case(field_name)
+                query_value = f"SELECT {function_name}(e.{field_java}) FROM {entity_name} e"
+                native_query = "false"
+            else:
+                query_value = "SELECT 0"
+                native_query = "true"
+            repository_methods.setdefault(method_name, {
+                "return_type": return_type,
+                "query": query_value,
+                "native_query": native_query,
+            })
+            methods.append({"name": method_name, "return_type": return_type})
+        return methods
+
+    def _generate_java_from_logic_tree(self, logic_tree: LogicNode, method_name: str = "process") -> str:
+        """Generate Java method code from a LogicNode tree."""
+        repository_methods: Dict[str, Dict[str, str]] = {}
+        entity_name = self._derive_logic_tree_entity_name()
+        body_lines = self._generate_java_body(
+            logic_tree,
+            indent=2,
+            repository_methods=repository_methods,
+            declared_variables=set(),
+            entity_name=entity_name,
+        )
+
+        if not body_lines:
+            body_lines = ["        // No executable nodes were found in logic tree"]
+
+        java_code = [f"    public void {method_name}() {{"]
+        java_code.extend(body_lines)
+        java_code.append("    }")
+        return "\n".join(java_code)
+
+    def _generate_java_body(
+        self,
+        node: LogicNode,
+        indent: int = 0,
+        repository_methods: Optional[Dict[str, Dict[str, str]]] = None,
+        declared_variables: Optional[Set[str]] = None,
+        entity_name: str = "Object",
+    ) -> List[str]:
+        """Recursively generate Java code from LogicNode tree."""
+        repository_methods = repository_methods if repository_methods is not None else {}
+        declared_variables = declared_variables if declared_variables is not None else set()
+        indent_str = "    " * indent
+        node_type = self._normalize_logic_node_type(node.type)
+        lines: List[str] = []
+
+        if node_type == "sequence":
+            for child in node.children:
+                lines.extend(self._generate_java_body(child, indent, repository_methods, declared_variables, entity_name))
+            return lines
+
+        if node_type == "loop":
+            condition = node.metadata.get("condition", "")
+            if "FOR" in condition.upper():
+                var_match = re.search(r'FOR\s+(\w+)\s+IN\s+(.+)', condition, re.IGNORECASE)
+                if var_match:
+                    loop_var = self._sanitize_java_identifier(var_match.group(1), "i")
+                    range_expr = re.sub(r'\s+LOOP\s*$', '', var_match.group(2).strip(), flags=re.IGNORECASE)
+                    if ".." in range_expr:
+                        parts = range_expr.split("..", 1)
+                        start = self._coerce_java_expression(parts[0].strip())
+                        end = self._coerce_java_expression(parts[1].strip())
+                        lines.append(f"{indent_str}for (int {loop_var} = {start}; {loop_var} <= {end}; {loop_var}++) {{")
+                    else:
+                        lines.append(f"{indent_str}for (;;) {{")
+                else:
+                    lines.append(f"{indent_str}for (;;) {{")
+            elif "WHILE" in condition.upper():
+                cond_match = re.search(r'WHILE\s+(.+)', condition, re.IGNORECASE)
+                if cond_match:
+                    cond = self._to_java_condition(cond_match.group(1))
+                    lines.append(f"{indent_str}while ({cond}) {{")
+                else:
+                    lines.append(f"{indent_str}while (true) {{")
+            else:
+                lines.append(f"{indent_str}for (;;) {{")
+
+            for child in node.children:
+                lines.extend(self._generate_java_body(child, indent + 1, repository_methods, declared_variables, entity_name))
+            lines.append(f"{indent_str}}}")
+            return lines
+
+        if node_type == "if":
+            condition = self._to_java_condition(node.metadata.get("condition", "true"))
+            lines.append(f"{indent_str}if ({condition}) {{")
+            then_children = []
+            elseif_nodes = []
+            else_node = None
+            for child in node.children:
+                child_type = self._normalize_logic_node_type(child.type)
+                if child_type in {"elseif", "elsif", "else_if"}:
+                    elseif_nodes.append(child)
+                elif child_type == "else":
+                    else_node = child
+                else:
+                    then_children.append(child)
+            for child in then_children:
+                lines.extend(self._generate_java_body(child, indent + 1, repository_methods, declared_variables, entity_name))
+            lines.append(f"{indent_str}}}")
+
+            for elseif_node in elseif_nodes:
+                elseif_cond = self._to_java_condition(elseif_node.metadata.get("condition", "true"))
+                lines.append(f"{indent_str}else if ({elseif_cond}) {{")
+                for grand_child in elseif_node.children:
+                    lines.extend(self._generate_java_body(grand_child, indent + 1, repository_methods, declared_variables, entity_name))
+                lines.append(f"{indent_str}}}")
+
+            if else_node is not None:
+                lines.append(f"{indent_str}else {{")
+                for grand_child in else_node.children:
+                    lines.extend(self._generate_java_body(grand_child, indent + 1, repository_methods, declared_variables, entity_name))
+                lines.append(f"{indent_str}}}")
+            return lines
+
+        if node_type == "try":
+            lines.append(f"{indent_str}try {{")
+            for child in node.children:
+                if self._normalize_logic_node_type(child.type) != "catch":
+                    lines.extend(self._generate_java_body(child, indent + 1, repository_methods, declared_variables, entity_name))
+            lines.append(f"{indent_str}}} catch (Exception e) {{")
+            catch_node = next((c for c in node.children if self._normalize_logic_node_type(c.type) == "catch"), None)
+            action = (catch_node.metadata.get("action", "log") if catch_node else "log").lower()
+            if action == "continue":
+                lines.append(f"{indent_str}    logger.warn(\"Exception caught; continuing\", e);")
+            elif action == "rollback":
+                lines.append(f"{indent_str}    throw new RuntimeException(\"Transaction rolled back\", e);")
+            else:
+                lines.append(f"{indent_str}    logger.error(\"Exception occurred\", e);")
+                lines.append(f"{indent_str}    throw new RuntimeException(e);")
+            lines.append(f"{indent_str}}}")
+            return lines
+
+        if node_type == "assignment":
+            target = self._sanitize_java_identifier(node.metadata.get("target", "value"), "value")
+            expr = self._coerce_java_expression(node.metadata.get("expression", "null"))
+            if target in declared_variables:
+                lines.append(f"{indent_str}{target} = {expr};")
+            else:
+                lines.append(f"{indent_str}Object {target} = {expr};")
+                declared_variables.add(target)
+            return lines
+
+        if node_type == "aggregation":
+            methods = self._ensure_logic_tree_aggregation_methods(node, repository_methods, entity_name)
+            if not methods:
+                lines.append(f"{indent_str}// Aggregation node without metadata")
+                return lines
+            for idx, method in enumerate(methods, start=1):
+                var_name = f"aggregationResult{idx}"
+                lines.append(f"{indent_str}{method['return_type']} {var_name} = repository.{method['name']}();")
+            return lines
+
+        if node_type == "select":
+            lines.append(f"{indent_str}repository.findAll();")
+            return lines
+
+        if node_type in {"insert", "update"}:
+            lines.append(f"{indent_str}repository.save(null);")
+            return lines
+
+        if node_type == "delete":
+            lines.append(f"{indent_str}repository.deleteById(0L);")
+            return lines
+
+        for child in node.children:
+            lines.extend(self._generate_java_body(child, indent, repository_methods, declared_variables, entity_name))
+        if not lines:
+            lines.append(f"{indent_str}// {node.type}: {node.metadata}")
+        return lines
+
+    def _generate_repository_from_logic_tree(self, logic_tree: LogicNode) -> Tuple[str, str]:
+        repository_name = "BusinessLogicRepository"
+        entity_name = self._derive_logic_tree_entity_name()
+        repository_methods: Dict[str, Dict[str, str]] = {}
+        self._generate_java_body(
+            logic_tree,
+            indent=0,
+            repository_methods=repository_methods,
+            declared_variables=set(),
+            entity_name=entity_name,
+        )
+        method_blocks: List[str] = []
+        needs_big_decimal = False
+        for method_name in sorted(repository_methods.keys()):
+            spec = repository_methods[method_name]
+            if spec.get("return_type") == "BigDecimal":
+                needs_big_decimal = True
+            method_blocks.append(
+                "    @Query(value = \"" + spec["query"] + "\", nativeQuery = " + spec["native_query"] + ")\n"
+                f"    {spec['return_type']} {method_name}();"
+            )
+        methods_section = "\n\n".join(method_blocks)
+        if methods_section:
+            methods_section = "\n\n" + methods_section + "\n"
+        big_decimal_import = "import java.math.BigDecimal;\n" if needs_big_decimal else ""
+        repository_code = f"""package {self.package_name}.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+{big_decimal_import}
+
+@Repository
+public interface {repository_name} extends JpaRepository<{entity_name}, Long> {{{methods_section}}}
+"""
+        return repository_name, repository_code
+
+    def _generate_service_from_logic_tree(self, logic_tree: LogicNode, service_name: str) -> str:
+        """Generate a complete Spring service class from LogicNode tree."""
+        method_code = self._generate_java_from_logic_tree(logic_tree, "executeBusinessLogic")
+        service_code = f"""package {self.package_name}.service;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import {self.package_name}.repository.BusinessLogicRepository;
+
+@Service
+public class {service_name} {{
+
+    private static final Logger logger = LoggerFactory.getLogger({service_name}.class);
+
+    @Autowired
+    private BusinessLogicRepository repository;
+
+    @Transactional
+{method_code}
+}}
+"""
+        return service_code
 
     def _normalize_service_code(self, filename: str, code: str) -> str:
         """
@@ -4965,6 +5289,40 @@ import java.time.Instant;'''
                     extra_imports.append('import java.time.LocalDate;')
                 if any(ptype == 'LocalTime' for _, ptype in all_params):
                     extra_imports.append('import java.time.LocalTime;')
+
+        # ── Add aggregation methods ──────────────────────────────────────────
+        # Generate common aggregation methods using @Query
+        numeric_cols = [c for c in columns if self._map_sql_type_to_java(c.get('type', '')) in ['BigDecimal', 'Long', 'Integer', 'Double']]
+        
+        for col in numeric_cols:
+            col_name = col['name'].upper()
+            col_java = self._to_lower_camel_case(col_name)
+            method_name = f'getSum{self._to_camel_case(col_name)}'
+            
+            # Check if method already exists
+            if re.search(rf'\b{method_name}\s*\(', body):
+                continue
+                
+            # Add SUM aggregation method
+            sum_method = (
+                f'\n    @Query("SELECT SUM(e.{col_java}) FROM {entity_class} e")\n'
+                f'    BigDecimal {method_name}();\n'
+            )
+            body = re.sub(r'\}\s*$', sum_method + '\n}', body)
+            
+            # Add COUNT method
+            count_method_name = f'getCount{self._to_camel_case(table_lower)}'
+            if not re.search(rf'\b{count_method_name}\s*\(', body):
+                count_method = (
+                    f'\n    @Query("SELECT COUNT(e) FROM {entity_class} e")\n'
+                    f'    Long {count_method_name}();\n'
+                )
+                body = re.sub(r'\}\s*$', count_method + '\n}', body)
+            
+            extra_imports += [
+                'import org.springframework.data.jpa.repository.Query;',
+                'import java.math.BigDecimal;'
+            ]
 
         return body, list(dict.fromkeys(extra_imports))
 

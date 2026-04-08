@@ -29,7 +29,11 @@ class MetadataAwareLLMEngine:
         """
         self.base_engine = base_llm_engine
         self.metadata_provider = metadata_provider
-        self.prompt_template = base_llm_engine.prompt_template
+        if base_llm_engine is not None:
+            self.prompt_template = base_llm_engine.prompt_template
+        else:
+            from src.converter.llm_engine import PromptTemplate
+            self.prompt_template = PromptTemplate()
     
     def enhance_context_with_metadata(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -54,12 +58,24 @@ class MetadataAwareLLMEngine:
         # Add Spring Data patterns
         enhanced['spring_data_patterns'] = self._get_spring_data_guidance()
         
-        # Add entity field constraints
-        entity_fields_text = self.metadata_provider.get_all_entity_fields_text()
-        enhanced['entity_fields'] = entity_fields_text
+        # Add entity field constraints in the dict format expected by PromptTemplate
+        enhanced['entity_fields'] = self._generate_entity_field_map()
         
         logger.info("Enhanced context with metadata from TableMetadataProvider")
         return enhanced
+
+    def _generate_entity_field_map(self) -> Dict[str, List[str]]:
+        """Generate entity field metadata in the dict format expected by PromptTemplate."""
+        if not self.metadata_provider or not self.metadata_provider.tables:
+            return {}
+
+        field_map: Dict[str, List[str]] = {}
+        for table_meta in self.metadata_provider.tables.values():
+            if not table_meta:
+                continue
+            entity_name = table_meta.java_entity_name
+            field_map[entity_name] = [col.to_dict()['java_field_name'] for col in table_meta.columns]
+        return field_map
     
     def _generate_repository_examples(self) -> str:
         """Generate repository method examples from metadata"""
@@ -69,6 +85,8 @@ class MetadataAwareLLMEngine:
             return ""
         
         for table_meta in list(self.metadata_provider.tables.values())[:3]:  # First 3 entities
+            if not table_meta:
+                continue
             entity_name = table_meta.java_entity_name
             examples.append(f"// {entity_name}")
             
@@ -416,5 +434,12 @@ def inject_enhanced_prompts(prompt_template, plsql_ast: Dict[str, Any],
             base_prompt = (base_prompt[:insertion_point] + 
                           f"\n\n{pattern_guidance}" + 
                           base_prompt[insertion_point:])
-    
+    elif pattern_guidance:
+        base_prompt = f"{base_prompt}\n\n{pattern_guidance}"
+
+    if enhanced_context.get('spring_data_patterns') and 'Spring Data guidance:' not in base_prompt:
+        base_prompt = f"{base_prompt}\n\nSpring Data guidance:\n{enhanced_context['spring_data_patterns']}"
+    if enhanced_context.get('repository_examples') and 'Repository examples:' not in base_prompt:
+        base_prompt = f"{base_prompt}\n\nRepository examples:\n{enhanced_context['repository_examples']}"
+
     return base_prompt

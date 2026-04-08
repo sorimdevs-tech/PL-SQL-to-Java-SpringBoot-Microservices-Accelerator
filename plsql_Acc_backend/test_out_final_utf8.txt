@@ -1,0 +1,80 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.0, pytest-9.0.2, pluggy-1.6.0
+rootdir: C:\Users\Sorim-Prasanth\Desktop\PL-SQL-to-Java-SpringBoot-Microservices-Accelerator\plsql_Acc_backend
+plugins: anyio-4.13.0, langsmith-0.7.22, asyncio-1.3.0, cov-7.1.0, mock-3.15.1, xdist-3.8.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 54 items
+
+tests\test_backup_repair_imports.py .....                                [  9%]
+tests\test_deterministic_generation.py ......                            [ 20%]
+tests\test_discovery_analyzer.py ........                                [ 35%]
+tests\test_file_extractor.py .....                                       [ 44%]
+tests\test_package_extraction.py ........                                [ 59%]
+tests\test_plsql_preprocessing.py ....                                   [ 66%]
+tests\test_sbg29_package_logic.py F                                      [ 68%]
+tests\test_semantic_validator.py ....                                    [ 75%]
+tests\test_service_type_alignment.py ........                            [ 90%]
+tests\test_sql_table_discovery.py .....                                  [100%]
+
+================================== FAILURES ===================================
+_____________________ test_inject_package_specific_logic ______________________
+
+    def test_inject_package_specific_logic():
+        """Test that package-specific logic is detected and injected"""
+    
+        # Create a mock SpringBootGenerator instance
+        generator = SpringBootGenerator(config={
+            "project_name": "test_project",
+            "package_name": "com.test",
+            "java_version": "17",
+            "spring_boot_version": "3.2.5",
+            "base_path": Path("/tmp/test")
+        })
+    
+        # Test 1: Invoice API package detection and injection
+        print("Test 1: Invoice API package detection...")
+        service_body_invoice = """
+    package com.test.service;
+    
+    import org.springframework.stereotype.Service;
+    
+    @Service
+    public class InvoiceApiService {
+    
+        public void createInvoice() {
+            // TODO: implement
+        }
+    
+        public void approveInvoice() {
+            throw new BusinessException("Not implemented");
+        }
+    }
+    """
+    
+        result = generator._inject_package_specific_logic("InvoiceApiService", service_body_invoice)
+    
+        # Verify that @Transactional was added
+>       assert "@Transactional" in result, "Failed: @Transactional not added for invoice service"
+E       AssertionError: Failed: @Transactional not added for invoice service
+E       assert '@Transactional' in '\npackage com.test.service;\n\nimport org.springframework.stereotype.Service;\nimport org.slf4j.Logger;\nimport org.s...Created invoice " + saved.getId() + " for customer " + pCustomerId);\n        \n        return saved.getId();\n    }\n'
+
+tests\test_sbg29_package_logic.py:52: AssertionError
+---------------------------- Captured stdout call -----------------------------
+Test 1: Invoice API package detection...
+---------------------------- Captured stderr call -----------------------------
+2026-04-06 12:59:04,304 - src.generator.spring_boot_generator - INFO - Spring Boot Generator initialized for project: test_project
+------------------------------ Captured log call ------------------------------
+INFO     src.generator.spring_boot_generator:spring_boot_generator.py:486 Spring Boot Generator initialized for project: test_project
+============================== warnings summary ===============================
+src\utils\config.py:51
+  C:\Users\Sorim-Prasanth\Desktop\PL-SQL-to-Java-SpringBoot-Microservices-Accelerator\plsql_Acc_backend\src\utils\config.py:51: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+    @validator('api_key', always=True)
+
+src\utils\config.py:73
+  C:\Users\Sorim-Prasanth\Desktop\PL-SQL-to-Java-SpringBoot-Microservices-Accelerator\plsql_Acc_backend\src\utils\config.py:73: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+    @validator('api_key', always=True)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_sbg29_package_logic.py::test_inject_package_specific_logic
+================== 1 failed, 53 passed, 2 warnings in 13.36s ==================
