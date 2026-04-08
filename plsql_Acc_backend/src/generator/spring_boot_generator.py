@@ -161,6 +161,8 @@ from ..utils.config import get_config_value
 from ..utils.naming import normalize_column_name, to_pascal_case
 from ..utils.prompt_builder import build_prompt
 from ..analyzer.logic_tree_builder import LogicNode
+from .deterministic_repository_generator import DeterministicRepositoryGenerator
+from .deterministic_service_generator import DeterministicServiceGenerator
 
 try:
     from ..rag_engine.rag_service import RAGService
@@ -494,6 +496,8 @@ class SpringBootGenerator:
         self._plsql_source_map: Dict[str, str] = {}               # filename -> full PL/SQL source
         self.rag_service = None
         self.rag_llm = config.get("rag_llm")
+        self.repository_generator = DeterministicRepositoryGenerator(self.package_name)
+        self.service_generator = DeterministicServiceGenerator()
 
         self.base_path = self.target_directory / 'src' / 'main' / 'java'
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -2947,9 +2951,13 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
         return "Object"
 
     def _logic_tree_query_method_name(self, function_name: str, field_name: str) -> str:
-        fn = self._to_camel_case(function_name.lower()) or "Aggregate"
+        function = (function_name or "").upper()
         field = self._to_camel_case(re.sub(r'[^A-Za-z0-9_]', '_', field_name or "value").lower())
-        return f"query{fn}{field}"
+        if function == "COUNT":
+            return f"count{field}"
+        if function in {"SUM", "AVG"}:
+            return f"getTotal{field}"
+        return f"get{self._to_camel_case(function.lower())}{field}"
 
     def _ensure_logic_tree_aggregation_methods(
         self,
@@ -2965,7 +2973,8 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
             return_type = {
                 "COUNT": "Long",
                 "AVG": "Double",
-            }.get(function_name, "BigDecimal")
+                "SUM": "Double",
+            }.get(function_name, "Double")
             sql = (node.metadata.get("sql") or "").strip()
             if sql:
                 query_value = self._escape_java_string_literal(sql)
@@ -3183,7 +3192,7 @@ public interface {interface_name} extends JpaRepository<{entity_name}, Long> {{
                 lines.append(f"{indent_str}// Aggregation node without metadata")
                 return lines
             for idx, method in enumerate(methods, start=1):
-                var_name = f"aggregationResult{idx}"
+                var_name = "total" if method["name"].startswith("getTotal") else f"aggregationResult{idx}"
                 lines.append(f"{indent_str}{method['return_type']} {var_name} = repository.{method['name']}();")
             return lines
 
@@ -3518,6 +3527,10 @@ public class {service_name} {{
             logger.info(f"SBG-30: ❌ No procedure metadata found for '{service_name}'")
             logger.info(f"SBG-30: Available keys: {list(self._procedure_metadata.keys())[:5]}")
 
+        # Safety rule: service calls must use the safe native-query method names
+        # produced for FOR UPDATE / SKIP LOCKED repository methods.
+        body = self._rewrite_unsupported_locking_repository_calls(body)
+
         
         # SBG-29: Inject package-specific business logic for complex PL/SQL packages
         # (invoice_api, customer, paypal_util, xtp, appl_log)
@@ -3763,6 +3776,31 @@ public class {service_name} {{
             param_name = param_alias or type_match.group(2)
             params.append((param_name, java_type))
         return params
+
+    def _rewrite_unsupported_locking_repository_calls(self, body: str) -> str:
+        """Rewrite service calls that still contain SQL locking clauses in names."""
+        repo_vars = {
+            var_name: repo_type[:-10] if repo_type.endswith("Repository") else repo_type
+            for repo_type, var_name in re.findall(r'\b([A-Z]\w*Repository)\s+([a-zA-Z_]\w*)\b', body)
+        }
+
+        def rewrite(match: re.Match) -> str:
+            repo_var = match.group("repo")
+            suffix = match.group("suffix") or ""
+            args = match.group("args")
+            repo_base = repo_vars.get(repo_var)
+            if not repo_base:
+                repo_base = self._to_camel_case(re.sub(r'Repository$', '', repo_var))
+            method_name = f"findLocked{repo_base}"
+            if suffix:
+                method_name += f"By{suffix}"
+            return f"{repo_var}.{method_name}({args})"
+
+        return re.sub(
+            r'\b(?P<repo>[a-zA-Z_]\w*)\.find(?:Page)?ForUpdateSkipLocked(?:By(?P<suffix>[A-Z]\w*))?\s*\((?P<args>[^;]*)\)',
+            rewrite,
+            body,
+        )
 
     def _get_entity_field_types(self, entity_name: str) -> Dict[str, str]:
         """Read entity field types from the on-disk entity source."""
@@ -5137,6 +5175,129 @@ import java.time.Instant;'''
 
         return ''.join(result)
 
+    def _is_transactional_sql(self, sql: str) -> bool:
+        """FOR UPDATE / SKIP LOCKED must always be native @Query SQL."""
+        return self.repository_generator.is_transactional_sql(sql)
+
+    def _extract_native_query_params(self, sql: str, columns: List[Dict[str, str]]) -> List[Tuple[str, str, str]]:
+        """Extract WHERE equality fields as (sql_column, param_name, java_type)."""
+        where_match = re.search(
+            r'\bWHERE\b\s+(.*?)(?:\bFOR\s+UPDATE\b|\bORDER\s+BY\b|\bGROUP\s+BY\b|$)',
+            sql or "",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not where_match:
+            return []
+        column_types = {
+            str(column.get('name', '')).upper(): self._map_sql_type_to_java(column.get('type', ''))
+            for column in columns
+        }
+        params: List[Tuple[str, str, str]] = []
+        seen: Set[str] = set()
+        for match in re.finditer(r'(?:\b\w+\.)?([A-Za-z_][\w$#]*)\s*=\s*(?::\w+|[A-Za-z_][\w$#]*|\'[^\']*\')', where_match.group(1)):
+            column_name = match.group(1).upper()
+            param_name = self._to_lower_camel_case(column_name)
+            if param_name in seen:
+                continue
+            seen.add(param_name)
+            params.append((column_name.lower(), param_name, column_types.get(column_name, "String")))
+        return params
+
+    def _native_query_method_name(
+        self,
+        entity_name: str,
+        params: List[Tuple[str, str, str]],
+        sql: str,
+        single_row: bool = False,
+    ) -> str:
+        """Create a meaningful method name without raw SQL locking clauses."""
+        base = entity_name[:-6] if entity_name.endswith("Entity") else entity_name
+        if self._is_transactional_sql(sql):
+            prefix = "findLocked" if single_row else "findLocked"
+        else:
+            prefix = "find"
+        suffix = ""
+        if params:
+            suffix = "By" + "And".join(self._to_camel_case(param_name) for _, param_name, _ in params)
+        return f"{prefix}{base}{suffix}"
+
+    def generate_native_query_method(
+        self,
+        sql: str,
+        entity_name: str,
+        params: List[Tuple[str, str, str]],
+        method_name: Optional[str] = None,
+        pageable: bool = False,
+        single_row: bool = False,
+        return_type: Optional[str] = None,
+    ) -> str:
+        """
+        Generate a safe native @Query repository method for SQL clauses that
+        cannot be represented as Spring Data derived method names.
+        """
+        normalized_params = [
+            (param_name, java_type, param_name)
+            for _, param_name, java_type in params
+        ]
+        plan = self.repository_generator.generate_native_query_method(
+            sql=sql,
+            entity_name=entity_name,
+            params=normalized_params,
+            method_name=method_name,
+            pageable=pageable,
+            single_row=single_row,
+            return_type=return_type,
+        )
+        return plan.render()
+
+    def _remove_unsupported_repository_method_names(self, body: str, entity_name: str, table_name: str, columns: List[Dict[str, str]]) -> str:
+        """Rewrite lock-clause-derived methods into native @Query methods."""
+        bad_method_pattern = re.compile(
+            r'(?:\s*@Query\s*\([^)]*\)\s*)?'
+            r'\s*(?P<return_type>(?:Page|List|Optional)\s*<[^>]+>)\s+'
+            r'(?P<name>find\w*(?:ForUpdate|SkipLocked)\w*)\s*\((?P<params>[^;]*)\)\s*;',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        def rewrite(match: re.Match) -> str:
+            method_name = match.group("name")
+            return_type = " ".join((match.group("return_type") or f"List<{entity_name}>").split())
+            params_blob = match.group("params") or ""
+            has_pageable = bool(re.search(r'\bPageable\b', params_blob))
+            suffix_match = re.search(r'\bBy([A-Z]\w*)$', method_name)
+            filter_columns: List[str] = []
+            if suffix_match:
+                filter_columns = [
+                    self._to_snake_case(part).upper()
+                    for part in suffix_match.group(1).split("And")
+                    if part
+                ]
+            method_params: List[Tuple[str, str, str]] = []
+            sql = f"SELECT * FROM {table_name.lower()}"
+            if filter_columns:
+                where_parts = []
+                column_type_map = {
+                    str(column.get('name', '')).upper(): self._map_sql_type_to_java(column.get('type', ''))
+                    for column in columns
+                }
+                for column in filter_columns:
+                    param_name = self._to_lower_camel_case(column)
+                    where_parts.append(f"{column.lower()} = :{param_name}")
+                    method_params.append((column.lower(), param_name, column_type_map.get(column, "String")))
+                sql += " WHERE " + " AND ".join(where_parts)
+            sql += " FOR UPDATE SKIP LOCKED"
+            safe_name = self._native_query_method_name(entity_name, method_params, sql)
+            return "\n" + self.generate_native_query_method(
+                sql,
+                entity_name,
+                method_params,
+                method_name=safe_name,
+                pageable=has_pageable,
+                return_type=return_type,
+            )
+
+        return bad_method_pattern.sub(rewrite, body)
+
     def _audit_and_complete_repository(self, body: str, filename: str) -> tuple:
         """
         SBG-20 FIX: Issues 4 & 5 — ensure every repository generated from a
@@ -5201,6 +5362,20 @@ import java.time.Instant;'''
         pk_java = self._to_lower_camel_case(pk_name)
         non_pk_cols = [c for c in columns if c['name'].upper() != pk_name
                        and c['name'].upper() != 'CREATED_AT']
+
+        if entity_class:
+            repaired_body = self._remove_unsupported_repository_method_names(body, entity_class, table_name, columns)
+            if repaired_body != body:
+                body = repaired_body
+                extra_imports += [
+                    'import org.springframework.data.jpa.repository.Query;',
+                    'import org.springframework.data.repository.query.Param;',
+                    'import java.util.List;',
+                ]
+                if 'Pageable' in body:
+                    extra_imports.append('import org.springframework.data.domain.Pageable;')
+                if 'Optional<' in body:
+                    extra_imports.append('import java.util.Optional;')
 
         def needs_big_decimal():
             return any(self._map_sql_type_to_java(c.get('type', '')) == 'BigDecimal'

@@ -753,7 +753,7 @@ class SemanticValidator:
                 driving_repo_name = self._derive_repository_name_from_table(driving_table)
                 driving_repo_var = self._lower_first(driving_repo_name)
                 if not re.search(
-                    rf"\b{re.escape(driving_repo_var)}\.(findPageForUpdateSkipLocked\w*|findAll)\s*\(",
+                    rf"\b{re.escape(driving_repo_var)}\.(findLocked\w*|findPageForUpdateSkipLocked\w*|findAll)\s*\(",
                     service_code,
                 ):
                     issues.append(
@@ -823,6 +823,7 @@ class SemanticValidator:
                 uses_stream_or_paging = (
                     "PageRequest" in service_code
                     or bool(re.search(r"\bStream<", service_code))
+                    or bool(re.search(r"\.findLocked\w*\s*\(", service_code))
                     or bool(re.search(r"\.findPageForUpdateSkipLocked\w*\s*\(", service_code))
                 )
                 if not uses_stream_or_paging:
@@ -849,7 +850,26 @@ class SemanticValidator:
                 expected_table = driving_table or str(next(iter((unit.get("operations_by_table") or {}).keys()), "")).upper()
                 expected_repo = self._derive_repository_name_from_table(expected_table) if expected_table else ""
                 repo_code = repositories.get(f"{expected_repo}.java", "") if expected_repo else ""
-                if "findPageForUpdateSkipLocked" not in repo_code:
+                
+                # Extract the actual skip locked method called in the service
+                skip_locked_match = re.search(
+                    rf"\b{re.escape(driving_repo_var)}\.((?:findLocked|findPageForUpdateSkipLocked)\w*)\s*\(",
+                    service_code
+                )
+                if skip_locked_match:
+                    called_method = skip_locked_match.group(1)
+                    if called_method not in repo_code:
+                        issues.append(
+                            SemanticIssue(
+                                component="repository",
+                                object_name=object_name,
+                                code="skip_locked_method_not_declared",
+                                message=f"{expected_repo} must declare {called_method}(...) for SKIP LOCKED on driving table {expected_table}",
+                                file_name=f"{expected_repo}.java" if expected_repo else None,
+                            )
+                        )
+                elif not re.search(r"\bfindLocked\w*\s*\(", repo_code):
+                    # Fallback to checking for base method if no specific call found
                     issues.append(
                         SemanticIssue(
                             component="repository",
@@ -1023,13 +1043,13 @@ class SemanticValidator:
                         )
                     )
                 if str(table_name).upper() in skip_locked_tables:
-                    if "findPageForUpdateSkipLocked" not in repository_code:
+                    if not re.search(r"\bfindLocked\w*\s*\([^;]*\bPageable\s+pageable\b", repository_code):
                         issues.append(
                             SemanticIssue(
                                 component="repository",
                                 object_name=object_name,
                                 code="missing_skip_locked_method",
-                                message=f"{repository_name} must declare findPageForUpdateSkipLocked(Pageable pageable)",
+                                message=f"{repository_name} must declare a native @Query findLocked...(Pageable pageable) method",
                                 file_name=f"{repository_name}.java",
                             )
                         )

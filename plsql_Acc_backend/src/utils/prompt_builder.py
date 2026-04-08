@@ -37,6 +37,14 @@ def build_prompt(sql_node: Any, examples: List[Dict[str, Any]]) -> str:
 
 Convert PL/SQL and SQL semantics into clean Java Spring Boot code.
 Use the examples as implementation patterns, not as text to copy blindly.
+Preserve the logic tree shape; do not flatten loops, conditions, or exception scopes.
+
+Repository rules:
+- SUM, COUNT, AVG, joins, FOR UPDATE, and SKIP LOCKED must use @Query.
+- FOR UPDATE / SKIP LOCKED must use nativeQuery = true.
+- Never create Spring Data derived names containing Join, Update, ForUpdate, or SkipLocked.
+- DML service logic should use repository.save(entity) for insert/update.
+- The service must call the exact repository method that is generated.
 
 Current semantic type: {semantic_type}
 

@@ -33,6 +33,8 @@ import logging
 from ..utils.logger import get_logger
 from ..utils.config import get_config_value
 from ..utils.naming import normalize_column_name, to_pascal_case
+from ..generator.deterministic_repository_generator import DeterministicRepositoryGenerator
+from ..generator.deterministic_service_generator import DeterministicServiceGenerator
 from src.converter.llm_engine_integration import inject_enhanced_prompts
 
 logger = get_logger(__name__)
@@ -845,6 +847,9 @@ class LLMConversionEngine:
         self.fallback_provider = self._create_fallback_provider()
         self.repair_provider = self._create_repair_provider()
         self.prompt_template = PromptTemplate()
+        package_name = config.get('output', {}).get('package_name', 'com.company.project')
+        self.repository_generator = DeterministicRepositoryGenerator(package_name)
+        self.service_generator = DeterministicServiceGenerator()
 
         # LCE-15 FIX: conversion_cache is now actually used (keyed by prompt hash)
         self._conversion_cache: Dict[str, str] = {}
@@ -1630,9 +1635,9 @@ ONLY OUTPUT JAVA CODE."""
 
     def _skip_locked_method_name(self, filters: List[Dict[str, str]]) -> str:
         if not filters:
-            return "findPageForUpdateSkipLocked"
+            return "findLockedRecords"
         suffix = self._method_suffix_from_columns([item.get("column", "") for item in filters])
-        return f"findPageForUpdateSkipLockedBy{suffix}" if suffix else "findPageForUpdateSkipLocked"
+        return f"findLockedRecordsBy{suffix}" if suffix else "findLockedRecords"
 
     def _aggregation_method_name(self, lookup_keys: List[str], sum_field: str = "Total") -> str:
         suffix = self._method_suffix_from_columns(lookup_keys)
@@ -1715,6 +1720,9 @@ ONLY OUTPUT JAVA CODE."""
 
         if spec.get('requires_skip_locked'):
             cursor_filters = list(spec.get('cursor_filters') or [])
+            # If no cursor_filters in spec, extract from raw PL/SQL
+            if not cursor_filters and spec.get('raw_plsql'):
+                cursor_filters = self._extract_cursor_filter_conditions(spec.get('raw_plsql'), table_name)
             method_name = self._skip_locked_method_name(cursor_filters)
             query_sql = f"SELECT * FROM {table_name.lower()}"
             method_params: List[str] = []
@@ -1739,11 +1747,20 @@ ONLY OUTPUT JAVA CODE."""
                 if where_clauses:
                     query_sql += " WHERE " + " AND ".join(where_clauses)
             query_sql += " FOR UPDATE SKIP LOCKED"
-            method_params.append("Pageable pageable")
-            custom_methods.append(
-                f"    @Query(value = \"{query_sql}\", nativeQuery = true)\n"
-                f"    Page<{entity_name}> {method_name}({', '.join(method_params)});"
+            normalized_params = []
+            for raw_param in method_params:
+                param_match = re.search(r'@Param\("([^"]+)"\)\s+([A-Za-z_][\w.<>\[\]]*)\s+([A-Za-z_]\w*)', raw_param)
+                if param_match:
+                    normalized_params.append((param_match.group(3), param_match.group(2), param_match.group(1)))
+            plan = self.repository_generator.generate_native_query_method(
+                sql=query_sql,
+                entity_name=entity_name,
+                params=normalized_params,
+                method_name=method_name,
+                pageable=True,
+                return_type=f"Page<{entity_name}>",
             )
+            custom_methods.append(plan.render())
 
         aggregation_columns = list(spec.get('aggregation_columns') or [])
         if aggregation_columns:
