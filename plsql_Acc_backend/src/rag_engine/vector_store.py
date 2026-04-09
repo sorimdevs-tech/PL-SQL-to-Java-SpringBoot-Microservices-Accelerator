@@ -119,6 +119,10 @@ class VectorStore:
         right_norm = math.sqrt(sum(b * b for b in right)) or 1.0
         return total / (left_norm * right_norm)
 
+    def supports_error_learning(self) -> bool:
+        """Static example store remains local; learned fixes are handled separately."""
+        return False
+
 
 _DEFAULT_STORE: Optional[VectorStore] = None
 

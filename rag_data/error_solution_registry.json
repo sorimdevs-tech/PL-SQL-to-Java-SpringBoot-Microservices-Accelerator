@@ -1,0 +1,21 @@
+{
+  "9fac12647fab3d5295a7da5cec61337b8281f16e5219c3dc2e3232212b96d9c4": {
+    "fingerprint": "9fac12647fab3d5295a7da5cec61337b8281f16e5219c3dc2e3232212b96d9c4",
+    "error_message": "manual smoke test cannot find symbol DemoRepository",
+    "error_type": "compilation",
+    "sql_pattern": "select",
+    "solution_summary": "Manual smoke test record for Pinecone connectivity.",
+    "solution_steps": [
+      "Insert a test record into the learned error store."
+    ],
+    "changed_files": [
+      "src/main/java/com/company/project/service/DemoService.java"
+    ],
+    "timestamp": "2026-04-09T07:22:44.911585+00:00",
+    "category": "dependency",
+    "code": "cannot find symbol",
+    "file": "DemoService.java",
+    "line": 1,
+    "build_tool": "manual-test"
+  }
+}

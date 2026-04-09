@@ -1,0 +1,43 @@
+{
+  "2e435960a2be6cb4bb1fa764596b51275803cf1af2deec5573075a34fcd95957": {
+    "fingerprint": "2e435960a2be6cb4bb1fa764596b51275803cf1af2deec5573075a34fcd95957",
+    "error_message": "ViewcourseUniversityService.java calls CourseRepository.getSumValueByCourseidAndFacultyidAndProfessorid(...) with 2 args, but repository declares getSumValueByCourseidAndFacultyidAndProfessorid(...) with [3] args",
+    "error_type": "semantic-validation",
+    "sql_pattern": "select,insert,update,delete,join,plsql_program_unit",
+    "solution_summary": "Semantic validation failure captured for viewCourse_university.",
+    "solution_steps": [
+      "Component: service",
+      "No automated build repair completed before pipeline abort."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T09:27:59.322111+00:00",
+    "category": "repository-mismatch",
+    "code": "repository_method_signature_mismatch",
+    "file": "ViewcourseUniversityService.java",
+    "line": 0,
+    "build_tool": "semantic-validator",
+    "component": "service",
+    "object_name": "viewCourse_university",
+    "severity": "error"
+  },
+  "4b6f0e2df24513e861b6d5426116bfcc39b6a8ec969ef30061caba2498a60dc9": {
+    "fingerprint": "4b6f0e2df24513e861b6d5426116bfcc39b6a8ec969ef30061caba2498a60dc9",
+    "error_message": "Conversion failed: ViewcourseUniversityService.java calls CourseRepository.getSumValueByCourseidAndFacultyidAndProfessorid(...) with 2 args, but repository declares getSumValueByCourseidAndFacultyidAndProfessorid(...) with [3] args",
+    "error_type": "webapp-job-failure",
+    "sql_pattern": "select,insert,join,plsql_program_unit",
+    "solution_summary": "FastAPI job failure captured for job 6cff6f4999e142ac89a0ada72a5fbdeb.",
+    "solution_steps": [
+      "Job source type: file",
+      "The pipeline aborted before returning a completed result."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T09:28:10.699488+00:00",
+    "category": "repository-mismatch",
+    "code": "ConversionError",
+    "file": "",
+    "line": 0,
+    "build_tool": "fastapi-webapp",
+    "job_id": "6cff6f4999e142ac89a0ada72a5fbdeb",
+    "source_type": "file"
+  }
+}

@@ -28,8 +28,11 @@ from src.generator.spring_boot_generator import SpringBootGenerator
 from src.generator.build_validator import BuildValidator
 from src.validator.test_generator import TestGenerator
 from src.validator.semantic_validator import SemanticValidator, SemanticValidationReport
+from src.validator.error_classifier import ErrorClassifier
 from src.analyzer.logic_tree_builder import build_logic_tree
 from src.rag_engine.rag_service import initialize_rag
+from src.rag_engine.error_solution_store import ErrorSolutionStore
+from src.rag_engine.cloud_vector_store import CloudVectorStore
 from src.utils.file_utils import FileExtractor
 from src.parser.sql_table_discovery import extract_create_table_columns
 from src.parser.discovery_analyzer import build_conversion_units, build_discovery_model
@@ -91,11 +94,18 @@ class PLSQLModernizationPipeline:
         self.semantic_validator = SemanticValidator(
             self.config.get('output', {}).get('package_name', 'com.company.project')
         )
+        self.error_classifier = ErrorClassifier()
         self.rag_service = initialize_rag(top_k=int(self.config.get("rag", {}).get("top_k", 3)))
+        self.error_solution_store = ErrorSolutionStore(
+            vector_store=CloudVectorStore(self.config.get("vector_db", {})),
+            config=self.config.get("vector_db", {}),
+        )
+        self.rag_service.set_error_solution_store(self.error_solution_store)
         self.generator.set_rag_service(self.rag_service)
         self.file_extractor = FileExtractor()
         self.repair_config = self.config.get('backup_llm', {}) or {}
         self._last_repair_result: Dict[str, Any] = {}
+        self._last_sql_context: str = ""
         
         # Initialize table metadata provider for entity schema synchronization
         self.table_metadata_provider = TableMetadataProvider()
@@ -144,6 +154,7 @@ class PLSQLModernizationPipeline:
             # Stage 2: Extract raw PL/SQL semantics and full object bodies
             logger.info("Stage 2: Extracting SQL semantics from raw PL/SQL...")
             semantic_model = await self.extract_conversion_semantics(plsql_files)
+            self._last_sql_context = self._build_sql_context(plsql_files, semantic_model)
             
             # SBG-30: Register procedure metadata for dynamic logic extraction
             logger.info("Stage 2b: Registering procedure metadata for dynamic Java generation...")
@@ -214,6 +225,7 @@ class PLSQLModernizationPipeline:
                     "; ".join(issue.message for issue in semantic_validation.issues[:3]),
                 )
             if not semantic_validation.passed:
+                self._store_semantic_validation_issues(semantic_validation)
                 # [BLM-1] Try to repair with backup LLM if enabled
                 if self.llm_engine.repair_provider:
                     logger.info("[BLM-1] Attempting backup LLM repair of %d failed services...", 
@@ -908,6 +920,7 @@ class PLSQLModernizationPipeline:
             )
             repair_payload = await self.llm_engine.repair_generated_project(context)
             changed_files = self._apply_repair_files(project_root, repair_payload.get('files', []))
+            self._store_error_solutions(current_build, repair_payload, changed_files)
             build_after = await self._run_generated_project_build(project_root)
             iteration = {
                 'attempt': attempt,
@@ -939,10 +952,12 @@ class PLSQLModernizationPipeline:
             return {
                 'success': False,
                 'command': None,
+                'build_tool': None,
                 'stdout': '',
                 'stderr': 'No supported build command found for generated project',
                 'combined_output': 'No supported build command found for generated project',
                 'error_files': [],
+                'errors': [],
             }
 
         pre_stdout = ""
@@ -966,14 +981,18 @@ class PLSQLModernizationPipeline:
         stdout = f"{pre_stdout}{result.stdout or ''}"
         stderr = f"{pre_stderr}{result.stderr or ''}"
         combined_output = (stdout + "\n" + stderr).strip()
+        build_tool = "gradle" if "gradle" in command[0].lower() else "maven"
+        errors = self.build_validator.parse_build_output(build_tool, combined_output)
         return {
             'success': result.returncode == 0,
             'returncode': result.returncode,
             'command': " ".join(command),
+            'build_tool': build_tool,
             'stdout': stdout,
             'stderr': stderr,
             'combined_output': combined_output[-20000:],
             'error_files': self._extract_build_error_files(combined_output, project_root),
+            'errors': [self._serialize_compilation_error(error) for error in errors],
         }
 
     def _resolve_build_command(self, project_root: Path) -> List[str]:
@@ -1071,10 +1090,150 @@ class PLSQLModernizationPipeline:
             'package_name': self.config.get('output', {}).get('package_name', 'com.company.project'),
             'build_command': build_result.get('command'),
             'build_output': build_result.get('combined_output', ''),
+            'classified_errors': build_result.get('errors', []),
+            'learned_solutions': self._get_learned_solutions(build_result),
             'project_summary': project_structure.get('project_structure', {}),
             'failing_files': files,
             'config_files': config_files,
         }
+
+    def _build_sql_context(self, plsql_files: Dict[str, str], semantic_model: Dict[str, Any]) -> str:
+        sql_fragments: List[str] = []
+        for unit in semantic_model.get("source_units", [])[:20]:
+            raw_plsql = unit.get("raw_plsql")
+            if raw_plsql:
+                sql_fragments.append(str(raw_plsql))
+        if not sql_fragments:
+            sql_fragments.extend(str(content) for content in (plsql_files or {}).values())
+        return "\n\n".join(sql_fragments)[:12000]
+
+    def _serialize_compilation_error(self, error: Any) -> Dict[str, Any]:
+        if isinstance(error, dict):
+            return error
+        return {
+            "file": getattr(error, "file", ""),
+            "line": getattr(error, "line", 0),
+            "column": getattr(error, "column", 0),
+            "message": getattr(error, "message", ""),
+            "code": getattr(error, "code", ""),
+            "error_type": getattr(error, "error_type", "compilation"),
+            "category": getattr(error, "category", "general"),
+            "build_tool": getattr(error, "build_tool", ""),
+        }
+
+    def _get_learned_solutions(self, build_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        learned: List[Dict[str, Any]] = []
+        top_k = int(self.config.get("vector_db", {}).get("top_k", 3) or 3)
+        for error in build_result.get("errors", [])[:5]:
+            error_message = str(error.get("message") or error.get("code") or "").strip()
+            if not error_message:
+                continue
+            matches = self.error_solution_store.retrieve_similar_errors(
+                error_message=error_message,
+                sql_context=self._last_sql_context,
+                top_k=top_k,
+                error_type=error.get("error_type"),
+            )
+            for match in matches:
+                learned.append(match)
+        return self.error_solution_store.deduplicate(learned)
+
+    def _store_error_solutions(
+        self,
+        build_result: Dict[str, Any],
+        repair_payload: Dict[str, Any],
+        changed_files: List[str],
+    ) -> None:
+        errors = build_result.get("errors", [])
+        if not errors:
+            return
+
+        stored_records = 0
+        for error in errors:
+            error_message = str(error.get("message") or error.get("code") or "").strip()
+            if not error_message:
+                continue
+            result = self.error_solution_store.store_error_solution(
+                error_message=error_message,
+                sql_context=self._last_sql_context,
+                error_type=error.get("error_type", "compilation"),
+                solution={
+                    "summary": repair_payload.get("summary", "") or error_message,
+                    "steps": [
+                        f"Apply project repair generated for build command: {build_result.get('command')}",
+                        (
+                            f"Update affected files: {', '.join(changed_files)}"
+                            if changed_files else
+                            "No files were changed during this repair attempt."
+                        ),
+                    ],
+                    "changed_files": changed_files,
+                },
+                metadata={
+                    "category": error.get("category", "general"),
+                    "code": error.get("code", ""),
+                    "file": error.get("file", ""),
+                    "line": error.get("line", 0),
+                    "build_tool": build_result.get("build_tool", ""),
+                },
+            )
+            if result.get("stored"):
+                stored_records += 1
+                logger.info(
+                    "Stored learned error solution fingerprint=%s via %s",
+                    result.get("fingerprint"),
+                    (result.get("vector_status") or {}).get("mode", "unknown"),
+                )
+        if stored_records == 0:
+            logger.info("No new learned error solutions were stored for this build attempt")
+
+    def _store_semantic_validation_issues(self, semantic_validation: SemanticValidationReport) -> None:
+        issues = [issue for issue in (semantic_validation.issues or []) if getattr(issue, "severity", "") == "error"]
+        if not issues:
+            return
+
+        stored_records = 0
+        for issue in issues:
+            classified = self.error_classifier.classify_error(
+                {
+                    "message": getattr(issue, "message", ""),
+                    "code": getattr(issue, "code", ""),
+                    "build_tool": "semantic-validator",
+                }
+            )
+            result = self.error_solution_store.store_error_solution(
+                error_message=getattr(issue, "message", ""),
+                sql_context=self._last_sql_context,
+                error_type="semantic-validation",
+                solution={
+                    "summary": f"Semantic validation failure captured for {getattr(issue, 'object_name', 'unknown object')}.",
+                    "steps": [
+                        f"Component: {getattr(issue, 'component', 'unknown')}",
+                        "No automated build repair completed before pipeline abort.",
+                    ],
+                    "changed_files": [],
+                },
+                metadata={
+                    "category": classified.get("category", "general"),
+                    "code": getattr(issue, "code", ""),
+                    "file": getattr(issue, "file_name", "") or "",
+                    "line": 0,
+                    "build_tool": "semantic-validator",
+                    "component": getattr(issue, "component", ""),
+                    "object_name": getattr(issue, "object_name", ""),
+                    "severity": getattr(issue, "severity", ""),
+                },
+            )
+            if result.get("stored"):
+                stored_records += 1
+                logger.info(
+                    "Stored semantic validation issue fingerprint=%s via %s",
+                    result.get("fingerprint"),
+                    (result.get("vector_status") or {}).get("mode", "unknown"),
+                )
+
+        if stored_records == 0:
+            logger.info("No new semantic validation issues were stored for this pipeline run")
 
     def _collect_project_source_files(self, project_root: Path) -> List[str]:
         candidates = []

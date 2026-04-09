@@ -10,15 +10,12 @@ This module provides build validation capabilities:
 
 import subprocess
 import os
-import sys
-import json
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
-from pathlib import Path
-import tempfile
-import shutil
+
+from ..validator.error_classifier import ErrorClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +28,9 @@ class CompilationError:
     column: int  # Column number
     message: str  # Error message
     code: str  # Error code (e.g., "cannot find symbol")
+    error_type: str = "compilation"
+    category: str = "general"
+    build_tool: str = ""
     
     def __str__(self):
         return f"{self.file}:{self.line}:{self.column}: {self.code} - {self.message}"
@@ -60,6 +60,9 @@ class BuildResult:
                     "column": e.column,
                     "message": e.message,
                     "code": e.code,
+                    "error_type": e.error_type,
+                    "category": e.category,
+                    "build_tool": e.build_tool,
                 }
                 for e in self.errors
             ],
@@ -84,6 +87,7 @@ class BuildValidator:
     
     def __init__(self, timeout_seconds: int = 180):
         self.timeout_seconds = timeout_seconds
+        self.error_classifier = ErrorClassifier()
         self._check_build_tools()
     
     def _check_build_tools(self):
@@ -169,7 +173,7 @@ class BuildValidator:
             
             stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
             
-            errors = self._parse_maven_errors(stderr or stdout)
+            errors = self.parse_build_output("maven", stderr or stdout)
             success = proc.returncode == 0 and not errors
             
             return BuildResult(
@@ -215,7 +219,7 @@ class BuildValidator:
             
             stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
             
-            errors = self._parse_gradle_errors(stderr or stdout)
+            errors = self.parse_build_output("gradle", stderr or stdout)
             success = proc.returncode == 0 and not errors
             
             return BuildResult(
@@ -240,6 +244,22 @@ class BuildValidator:
                 duration_seconds=self.timeout_seconds,
             )
     
+    def parse_build_output(self, build_tool: str, output: str) -> List[CompilationError]:
+        build_tool = (build_tool or "").lower()
+        if build_tool == "maven":
+            errors = self._parse_maven_errors(output)
+        elif build_tool == "gradle":
+            errors = self._parse_gradle_errors(output)
+        else:
+            errors = []
+
+        for error in errors:
+            classified = self.error_classifier.classify_error(error)
+            error.error_type = classified.get("error_type", error.error_type)
+            error.category = classified.get("category", error.category)
+            error.build_tool = build_tool
+        return errors
+
     def _parse_maven_errors(self, output: str) -> List[CompilationError]:
         """Parse Maven error output"""
         errors: List[CompilationError] = []

@@ -26,9 +26,12 @@ from pydantic import BaseModel, Field
 from main import PLSQLModernizationPipeline
 from src.converter.llm_engine import LLMConversionEngine
 from src.parser.discovery_analyzer import analyze_sql_source, build_discovery_model
+from src.rag_engine.cloud_vector_store import CloudVectorStore
+from src.rag_engine.error_solution_store import ErrorSolutionStore
 from src.utils.config import load_config
 from src.utils.file_utils import GitRepoPublisher
 from src.parser.sql_table_discovery import SQLDiscoveryParseError, extract_create_table_names
+from src.validator.error_classifier import ErrorClassifier
 
 
 def _utc_now() -> str:
@@ -869,6 +872,7 @@ class JobManager:
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.jobs: Dict[str, JobRecord] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
+        self.error_classifier = ErrorClassifier()
 
     def create_job(
         self,
@@ -970,6 +974,7 @@ class JobManager:
             job.status = "failed"
             job.error = str(exc)
             job.completed_at = _utc_now()
+            self._store_web_job_error(job=job, source_path=source_path, config_path=config_path, exc=exc)
 
         finally:
             try:
@@ -992,6 +997,64 @@ class JobManager:
                 log_file.close()
             except Exception:
                 pass
+
+    def _store_web_job_error(self, job: JobRecord, source_path: str, config_path: str, exc: Exception) -> None:
+        try:
+            loaded_config = load_config(config_path)
+            config = loaded_config.model_dump() if hasattr(loaded_config, "model_dump") else loaded_config.dict()
+            vector_cfg = config.get("vector_db", {})
+            sql_context = self._read_job_sql_context(source_path, job.source_type)
+            classified = self.error_classifier.classify_error(
+                {
+                    "message": str(exc),
+                    "code": type(exc).__name__,
+                    "build_tool": "fastapi-webapp",
+                }
+            )
+            store = ErrorSolutionStore(
+                vector_store=CloudVectorStore(vector_cfg),
+                config=vector_cfg,
+            )
+            result = store.store_error_solution(
+                error_message=str(exc),
+                sql_context=sql_context,
+                error_type="webapp-job-failure",
+                solution={
+                    "summary": f"FastAPI job failure captured for job {job.job_id}.",
+                    "steps": [
+                        f"Job source type: {job.source_type}",
+                        "The pipeline aborted before returning a completed result.",
+                    ],
+                    "changed_files": [],
+                },
+                metadata={
+                    "category": classified.get("category", "general"),
+                    "code": type(exc).__name__,
+                    "file": "",
+                    "line": 0,
+                    "build_tool": "fastapi-webapp",
+                    "job_id": job.job_id,
+                    "source_type": job.source_type,
+                },
+            )
+            logging.getLogger(__name__).info(
+                "Stored web job failure fingerprint=%s via %s",
+                result.get("fingerprint"),
+                (result.get("vector_status") or {}).get("mode", "unknown"),
+            )
+        except Exception as store_exc:
+            logging.getLogger(__name__).warning("Failed to store web job failure in Pinecone: %s", store_exc)
+
+    def _read_job_sql_context(self, source_path: str, source_type: str) -> str:
+        if source_type != "file":
+            return ""
+        try:
+            path = Path(source_path)
+            if path.is_file():
+                return path.read_text(encoding="utf-8", errors="ignore")[:12000]
+        except Exception:
+            return ""
+        return ""
 
     def start_job(self, job: JobRecord, source_path: str) -> None:
         """Start a job in the current event loop."""

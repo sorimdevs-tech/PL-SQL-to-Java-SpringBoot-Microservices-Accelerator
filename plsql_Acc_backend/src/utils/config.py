@@ -162,6 +162,23 @@ class LoggingConfig(BaseModel):
     backup_count: int = 5
 
 
+class VectorDBConfig(BaseModel):
+    """Cloud vector database configuration for learned error-solution pairs."""
+    enabled: bool = False
+    provider: str = "pinecone"
+    api_key: Optional[str] = None
+    environment: Optional[str] = None
+    index_name: str = "error-solutions"
+    namespace: str = "plsql-modernization"
+    dimensions: int = 384
+    metric: str = "cosine"
+    top_k: int = 3
+    qdrant_url: Optional[str] = None
+    qdrant_api_key: Optional[str] = None
+    collection_name: str = "error-solutions"
+    fallback_path: str = "./rag_data/error_solutions_fallback.json"
+
+
 class PlatformConfig(BaseModel):
     """Main platform configuration"""
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -174,6 +191,7 @@ class PlatformConfig(BaseModel):
     enterprise: EnterpriseConfig = Field(default_factory=EnterpriseConfig)
     templates: TemplatesConfig = Field(default_factory=TemplatesConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    vector_db: VectorDBConfig = Field(default_factory=VectorDBConfig)
 
 
 class ConfigManager:
@@ -260,6 +278,28 @@ class ConfigManager:
                 if api_key:
                     backup_llm_config['api_key'] = api_key
             config_data['backup_llm'] = backup_llm_config
+
+        vector_db_config = config_data.get('vector_db', {})
+        if isinstance(vector_db_config, dict):
+            vector_db_config['api_key'] = self._resolve_env_placeholder(vector_db_config.get('api_key'))
+            vector_db_config['qdrant_api_key'] = self._resolve_env_placeholder(vector_db_config.get('qdrant_api_key'))
+
+            if vector_db_config.get('enabled'):
+                if not vector_db_config.get('api_key'):
+                    vector_db_config['api_key'] = _first_env_value('PINECONE_API_KEY')
+                if not vector_db_config.get('environment'):
+                    vector_db_config['environment'] = _first_env_value('PINECONE_ENVIRONMENT', 'PINECONE_REGION')
+                if not vector_db_config.get('index_name'):
+                    vector_db_config['index_name'] = _first_env_value('PINECONE_INDEX_NAME') or 'error-solutions'
+                if not vector_db_config.get('qdrant_url'):
+                    vector_db_config['qdrant_url'] = _first_env_value('QDRANT_URL')
+                if not vector_db_config.get('qdrant_api_key'):
+                    vector_db_config['qdrant_api_key'] = _first_env_value('QDRANT_API_KEY')
+                if not vector_db_config.get('collection_name'):
+                    vector_db_config['collection_name'] = (
+                        _first_env_value('QDRANT_COLLECTION_NAME') or vector_db_config.get('index_name') or 'error-solutions'
+                    )
+            config_data['vector_db'] = vector_db_config
         
         # Load database connection string from environment
         db_config = config_data.get('database', {})
@@ -420,7 +460,12 @@ class ConfigManager:
             config_dict['llm']['api_key'] = "your-api-key-here"
         if 'backup_llm' in config_dict and 'api_key' in config_dict['backup_llm']:
             config_dict['backup_llm']['api_key'] = "your-api-key-here"
-        
+        if 'vector_db' in config_dict:
+            if 'api_key' in config_dict['vector_db']:
+                config_dict['vector_db']['api_key'] = "your-api-key-here"
+            if 'qdrant_api_key' in config_dict['vector_db']:
+                config_dict['vector_db']['qdrant_api_key'] = "your-api-key-here"
+
         with open(save_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
 

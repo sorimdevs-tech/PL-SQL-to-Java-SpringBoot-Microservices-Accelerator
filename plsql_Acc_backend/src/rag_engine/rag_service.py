@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from .error_solution_store import ErrorSolutionStore
 from .retriever import Retriever
 from .vector_store import VectorStore
 
@@ -12,9 +13,15 @@ logger = logging.getLogger(__name__)
 
 
 class RAGService:
-    def __init__(self, vector_store: Optional[VectorStore] = None, top_k: int = 3):
+    def __init__(
+        self,
+        vector_store: Optional[VectorStore] = None,
+        top_k: int = 3,
+        error_solution_store: Optional[ErrorSolutionStore] = None,
+    ):
         self.vector_store = vector_store or VectorStore()
         self.retriever = Retriever(self.vector_store)
+        self.error_solution_store = error_solution_store
         self.top_k = top_k
         self.initialized = False
 
@@ -35,6 +42,25 @@ class RAGService:
         if not query:
             return []
         return self.retriever.retrieve(str(query), str(semantic_type), top_k or self.top_k)
+
+    def set_error_solution_store(self, store: Optional[ErrorSolutionStore]) -> None:
+        self.error_solution_store = store
+
+    def get_error_solutions(
+        self,
+        error_message: str,
+        sql_context: str = "",
+        top_k: Optional[int] = None,
+        error_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not self.error_solution_store:
+            return []
+        return self.error_solution_store.retrieve_similar_errors(
+            error_message=error_message,
+            sql_context=sql_context,
+            top_k=top_k or self.top_k,
+            error_type=error_type,
+        )
 
     def _get_metadata(self, sql_node: Any) -> Dict[str, Any]:
         if isinstance(sql_node, dict):
