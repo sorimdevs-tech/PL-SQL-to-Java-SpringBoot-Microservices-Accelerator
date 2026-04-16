@@ -39,5 +39,224 @@
     "build_tool": "fastapi-webapp",
     "job_id": "6cff6f4999e142ac89a0ada72a5fbdeb",
     "source_type": "file"
+  },
+  "269f829075768146819f05f618b027079b5621beac1e1490debedde310235a90": {
+    "fingerprint": "269f829075768146819f05f618b027079b5621beac1e1490debedde310235a90",
+    "error_message": "Conversion failed: ViewcourseUniversityService.java calls CourseRepository.getSumValueByCourseidAndFacultyidAndProfessorid(...) with 2 args, but repository declares getSumValueByCourseidAndFacultyidAndProfessorid(...) with [3] args",
+    "error_type": "webapp-job-failure",
+    "sql_pattern": "select,join",
+    "solution_summary": "x",
+    "solution_steps": [],
+    "changed_files": [],
+    "timestamp": "2026-04-09T11:30:39.152197+00:00",
+    "category": "repository-mismatch",
+    "code": "ConversionError"
+  },
+  "935f4d3781ba906b700b51be10aefd9bc50fa3c73e4ac99d2d7e7036b20658ed": {
+    "fingerprint": "935f4d3781ba906b700b51be10aefd9bc50fa3c73e4ac99d2d7e7036b20658ed",
+    "error_message": "StudentaccountUniversityService.java calls StudentRepository.findByStudentid() but that method is not declared",
+    "error_type": "semantic-validation",
+    "sql_pattern": "select,insert,update,delete,join,plsql_program_unit",
+    "solution_summary": "Semantic validation failure captured for studentAccount_university.",
+    "solution_steps": [
+      "Component: service",
+      "No automated build repair completed before pipeline abort."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T11:35:31.990043+00:00",
+    "category": "general",
+    "code": "missing_repository_method",
+    "file": "StudentaccountUniversityService.java",
+    "line": 0,
+    "build_tool": "semantic-validator",
+    "component": "service",
+    "object_name": "studentAccount_university",
+    "severity": "error"
+  },
+  "510cdd74965b0c4a249b34f752d9b119f5a6fbb8ed1e131003c200a1c286ed12": {
+    "fingerprint": "510cdd74965b0c4a249b34f752d9b119f5a6fbb8ed1e131003c200a1c286ed12",
+    "error_message": "ViewstudentUniversityService.java calls StudentRepository.findByStudentid() but that method is not declared",
+    "error_type": "semantic-validation",
+    "sql_pattern": "select,insert,update,delete,join,plsql_program_unit",
+    "solution_summary": "Semantic validation failure captured for viewStudent_university.",
+    "solution_steps": [
+      "Component: service",
+      "No automated build repair completed before pipeline abort."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T11:35:35.891286+00:00",
+    "category": "general",
+    "code": "missing_repository_method",
+    "file": "ViewstudentUniversityService.java",
+    "line": 0,
+    "build_tool": "semantic-validator",
+    "component": "service",
+    "object_name": "viewStudent_university",
+    "severity": "error"
+  },
+  "7eee27ab20f26c28ec503fe05c556eb7dc5d314543b6a34ecaf6978dc8cb2d49": {
+    "fingerprint": "7eee27ab20f26c28ec503fe05c556eb7dc5d314543b6a34ecaf6978dc8cb2d49",
+    "error_message": "StudentRepository must declare findByStudentid(...) derived from lookup_keys",
+    "error_type": "semantic-validation",
+    "sql_pattern": "select,insert,update,delete,join,plsql_program_unit",
+    "solution_summary": "Semantic validation failure captured for studentAccount_university.",
+    "solution_steps": [
+      "Component: repository",
+      "No automated build repair completed before pipeline abort."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T11:35:36.370135+00:00",
+    "category": "general",
+    "code": "missing_lookup_repository_method",
+    "file": "StudentRepository.java",
+    "line": 0,
+    "build_tool": "semantic-validator",
+    "component": "repository",
+    "object_name": "studentAccount_university",
+    "severity": "error"
+  },
+  "32a0a444280561e027c49673d11f8ee2b047e7caedc562e01cfe4f9bc51c50f7": {
+    "fingerprint": "32a0a444280561e027c49673d11f8ee2b047e7caedc562e01cfe4f9bc51c50f7",
+    "error_message": "Conversion failed: ViewcourseUniversityService.java calls CourseRepository.getSumValueByCourseidAndFacultyidAndProfessorid(...) with 2 args, but repository declares getSumValueByCourseidAndFacultyidAndProfessorid(...) with [3] args; StudentaccountUniversityService.java calls StudentRepository.findByStudentid() but that method is not declared; ViewstudentUniversityService.java calls StudentRepository.findByStudentid() but that method is not declared; StudentRepository must declare findByStudentid(...) derived from lookup_keys; StudentRepository must declare findByStudentid(...) derived from lookup_keys; StudentRepository must declare findByStudentid(...) derived from lookup_keys",
+    "error_type": "webapp-job-failure",
+    "sql_pattern": "select,insert,join,plsql_program_unit",
+    "solution_summary": "FastAPI job failure captured for job dd63fffd59ec4d8087edca92d26a3a24.",
+    "solution_steps": [
+      "Job source type: file",
+      "The pipeline aborted before returning a completed result."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T11:35:39.300453+00:00",
+    "category": "repository-mismatch",
+    "code": "ConversionError",
+    "file": "",
+    "line": 0,
+    "build_tool": "fastapi-webapp",
+    "job_id": "dd63fffd59ec4d8087edca92d26a3a24",
+    "source_type": "file"
+  },
+  "063d6cf2fa99c35184aedcc8db349b0dc1f56c36c9d2248ae8b9516fe7df6da9": {
+    "fingerprint": "063d6cf2fa99c35184aedcc8db349b0dc1f56c36c9d2248ae8b9516fe7df6da9",
+    "error_message": "AppointmentRepository uses LocalDateTime without importing it",
+    "error_type": "semantic-validation",
+    "sql_pattern": "select,insert,update,delete,join,plsql_program_unit",
+    "solution_summary": "Semantic validation failure captured for AppointmentRepository.",
+    "solution_steps": [
+      "Component: repository",
+      "No automated build repair completed before pipeline abort."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T12:02:33.609901+00:00",
+    "category": "general",
+    "code": "missing_localdatetime_import",
+    "file": "AppointmentRepository.java",
+    "line": 0,
+    "build_tool": "semantic-validator",
+    "component": "repository",
+    "object_name": "AppointmentRepository",
+    "severity": "error"
+  },
+  "e1c900fea2e431f3687020104951d817a751895963778c40060ed99ec8ac568f": {
+    "fingerprint": "e1c900fea2e431f3687020104951d817a751895963778c40060ed99ec8ac568f",
+    "error_message": "BookappointmentHospitalService.java calls AppointmentRepository.getSumValueByApptdateAndCardidAndDoctorid(...) with 2 args, but repository declares getSumValueByApptdateAndCardidAndDoctorid(...) with [3] args",
+    "error_type": "semantic-validation",
+    "sql_pattern": "select,insert,update,delete,join,plsql_program_unit",
+    "solution_summary": "Semantic validation failure captured for bookAppointment_hospital.",
+    "solution_steps": [
+      "Component: service",
+      "No automated build repair completed before pipeline abort."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T12:02:35.510439+00:00",
+    "category": "repository-mismatch",
+    "code": "repository_method_signature_mismatch",
+    "file": "BookappointmentHospitalService.java",
+    "line": 0,
+    "build_tool": "semantic-validator",
+    "component": "service",
+    "object_name": "bookAppointment_hospital",
+    "severity": "error"
+  },
+  "63d6e53a4138767e7471177377cb3b0d32525a32187a52071c6f02c37e9240a8": {
+    "fingerprint": "63d6e53a4138767e7471177377cb3b0d32525a32187a52071c6f02c37e9240a8",
+    "error_message": "Conversion failed: AppointmentRepository uses LocalDateTime without importing it; BookappointmentHospitalService.java calls AppointmentRepository.getSumValueByApptdateAndCardidAndDoctorid(...) with 2 args, but repository declares getSumValueByApptdateAndCardidAndDoctorid(...) with [3] args",
+    "error_type": "webapp-job-failure",
+    "sql_pattern": "select,insert,join,plsql_program_unit",
+    "solution_summary": "FastAPI job failure captured for job 0f3f54f48dc04b01b8da5cefe3c2a2bd.",
+    "solution_steps": [
+      "Job source type: file",
+      "The pipeline aborted before returning a completed result."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-09T12:02:38.349343+00:00",
+    "category": "repository-mismatch",
+    "code": "ConversionError",
+    "file": "",
+    "line": 0,
+    "build_tool": "fastapi-webapp",
+    "job_id": "0f3f54f48dc04b01b8da5cefe3c2a2bd",
+    "source_type": "file"
+  },
+  "4e06d4a8b21a93f2f0c9f60580fe0806aa162ced7963165613c6165d926c6e3f": {
+    "fingerprint": "4e06d4a8b21a93f2f0c9f60580fe0806aa162ced7963165613c6165d926c6e3f",
+    "error_message": "AppointmentRepository uses LocalDateTime without importing it",
+    "error_type": "semantic-validation",
+    "sql_pattern": "select,insert,update,delete,join,plsql_program_unit",
+    "solution_summary": "Semantic validation failure captured for AppointmentRepository.",
+    "solution_steps": [
+      "Component: repository",
+      "No automated build repair completed before pipeline abort."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-10T11:37:02.238073+00:00",
+    "category": "general",
+    "code": "missing_localdatetime_import",
+    "file": "AppointmentRepository.java",
+    "line": 0,
+    "build_tool": "semantic-validator",
+    "component": "repository",
+    "object_name": "AppointmentRepository",
+    "severity": "error"
+  },
+  "7a2cefa18b978d3b7f4db29b5d3476d6cf87a7810b3cd4a5e6bd856df00b6e02": {
+    "fingerprint": "7a2cefa18b978d3b7f4db29b5d3476d6cf87a7810b3cd4a5e6bd856df00b6e02",
+    "error_message": "BookappointmentHospitalService.java calls AppointmentRepository.getSumValueByApptdateAndCardidAndDoctorid(...) with 2 args, but repository declares getSumValueByApptdateAndCardidAndDoctorid(...) with [3] args",
+    "error_type": "semantic-validation",
+    "sql_pattern": "select,insert,update,delete,join,plsql_program_unit",
+    "solution_summary": "Semantic validation failure captured for bookAppointment_hospital.",
+    "solution_steps": [
+      "Component: service",
+      "No automated build repair completed before pipeline abort."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-10T11:37:03.989086+00:00",
+    "category": "repository-mismatch",
+    "code": "repository_method_signature_mismatch",
+    "file": "BookappointmentHospitalService.java",
+    "line": 0,
+    "build_tool": "semantic-validator",
+    "component": "service",
+    "object_name": "bookAppointment_hospital",
+    "severity": "error"
+  },
+  "ee75d6690091cdeb87f7aeaab80d349fced649f5e08ed519018196aff0c23bfd": {
+    "fingerprint": "ee75d6690091cdeb87f7aeaab80d349fced649f5e08ed519018196aff0c23bfd",
+    "error_message": "Conversion failed: AppointmentRepository uses LocalDateTime without importing it; BookappointmentHospitalService.java calls AppointmentRepository.getSumValueByApptdateAndCardidAndDoctorid(...) with 2 args, but repository declares getSumValueByApptdateAndCardidAndDoctorid(...) with [3] args",
+    "error_type": "webapp-job-failure",
+    "sql_pattern": "select,insert,join,plsql_program_unit",
+    "solution_summary": "FastAPI job failure captured for job 1bcd1a426c394a8183a21f67fe58bf16.",
+    "solution_steps": [
+      "Job source type: file",
+      "The pipeline aborted before returning a completed result."
+    ],
+    "changed_files": [],
+    "timestamp": "2026-04-10T11:37:07.224381+00:00",
+    "category": "repository-mismatch",
+    "code": "ConversionError",
+    "file": "",
+    "line": 0,
+    "build_tool": "fastapi-webapp",
+    "job_id": "1bcd1a426c394a8183a21f67fe58bf16",
+    "source_type": "file"
   }
 }

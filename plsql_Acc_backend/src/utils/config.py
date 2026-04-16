@@ -209,9 +209,20 @@ class ConfigManager:
         self._load_dotenv()
 
     def _load_dotenv(self):
-        """Load .env from project root if present."""
-        env_path = self.config_path.parent / ".env"
-        load_dotenv(dotenv_path=env_path, override=False)
+        """Load .env from the common backend locations if present."""
+        candidate_paths = [
+            self.config_path.parent / ".env",
+            self.config_path.parent / "src" / ".env",
+            Path.cwd() / ".env",
+            Path.cwd() / "src" / ".env",
+        ]
+        seen = set()
+        for env_path in candidate_paths:
+            resolved = env_path.resolve()
+            if resolved in seen or not resolved.exists():
+                continue
+            seen.add(resolved)
+            load_dotenv(dotenv_path=resolved, override=False)
         
     def load_config(self) -> PlatformConfig:
         """
@@ -283,6 +294,11 @@ class ConfigManager:
         if isinstance(vector_db_config, dict):
             vector_db_config['api_key'] = self._resolve_env_placeholder(vector_db_config.get('api_key'))
             vector_db_config['qdrant_api_key'] = self._resolve_env_placeholder(vector_db_config.get('qdrant_api_key'))
+            fallback_path = vector_db_config.get('fallback_path')
+            if isinstance(fallback_path, str) and fallback_path.strip():
+                fallback_path_obj = Path(fallback_path)
+                if not fallback_path_obj.is_absolute():
+                    vector_db_config['fallback_path'] = str((self.config_path.parent / fallback_path_obj).resolve())
 
             if vector_db_config.get('enabled'):
                 if not vector_db_config.get('api_key'):

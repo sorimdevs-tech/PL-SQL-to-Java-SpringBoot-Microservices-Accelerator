@@ -162,6 +162,9 @@ class CloudVectorStore:
     def has_vector(self, vector_id: str) -> bool:
         return vector_id in self._records
 
+    def uses_cloud_backend(self) -> bool:
+        return self.enabled and self._index is not None
+
     def _prepare_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         values = item.get("values")
         text = item.get("text") or ""

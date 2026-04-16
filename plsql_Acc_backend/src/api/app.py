@@ -1037,10 +1037,14 @@ class JobManager:
                     "source_type": job.source_type,
                 },
             )
+            vector_status = result.get("vector_status") or {}
+            mode = vector_status.get("mode", "unknown")
             logging.getLogger(__name__).info(
-                "Stored web job failure fingerprint=%s via %s",
+                "Stored web job failure fingerprint=%s via %s (stored=%s, reason=%s)",
                 result.get("fingerprint"),
-                (result.get("vector_status") or {}).get("mode", "unknown"),
+                mode,
+                result.get("stored"),
+                result.get("reason", ""),
             )
         except Exception as store_exc:
             logging.getLogger(__name__).warning("Failed to store web job failure in Pinecone: %s", store_exc)

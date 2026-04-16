@@ -98,12 +98,12 @@
     "provider": "pinecone",
     "api_key": "${PINECONE_API_KEY}",
     "environment": "${PINECONE_ENVIRONMENT}",
-    "index_name": "error-solutions",
+    "index_name": "plsql-java",
     "namespace": "plsql-modernization",
     "dimensions": 384,
     "metric": "cosine",
     "top_k": 3,
-    "collection_name": "error-solutions",
+    "collection_name": "plsql-java",
     "fallback_path": "./rag_data/error_solutions_fallback.json"
   }
 }
